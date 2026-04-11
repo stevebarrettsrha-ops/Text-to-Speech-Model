@@ -663,7 +663,7 @@ async function runScript() {
     const bel = document.getElementById('block-'+i);
     if (bel) { bel.classList.add('playing-'+b.speaker); bel.scrollIntoView({behavior:'smooth',block:'nearest'}); }
     if (cloudSel[b.speaker]) {
-      await sayViaAudioElement(b.text, spd, cloudSel[b.speaker]);
+      await sayViaAudioElement(b.text, spd, cloudSel[b.speaker], vol);
     } else {
       await say(b.text, sel[b.speaker], spd, vol);
     }
@@ -744,30 +744,51 @@ function splitTextForTTS(text, maxLen) {
   return chunks;
 }
 
-function playAudioElement(url, speed) {
+function playAudioElement(url, speed, volume) {
   return new Promise((resolve, reject) => {
     const a = document.createElement('audio');
     currentDlAudio = a;
     a.src = url;
     a.playbackRate = Math.max(0.25, Math.min(4, speed));
+    if (volume != null) a.volume = Math.max(0, Math.min(1, volume));
     a.onended = () => { currentDlAudio = null; resolve(); };
     a.onerror = () => { currentDlAudio = null; reject(new Error('Audio element failed')); };
     a.play().catch(e => { currentDlAudio = null; reject(e); });
   });
 }
 
-async function sayViaAudioElement(text, speed, cloudVoiceId) {
+async function sayViaAudioElement(text, speed, cloudVoiceId, volume) {
   const chunks = splitTextForTTS(text, 200);
   for (const chunk of chunks) {
     if (stopReq) break;
     const url = cloudVoiceId
       ? 'https://api.streamelements.com/kappa/v2/speech?voice=' + cloudVoiceId + '&text=' + encodeURIComponent(chunk)
       : 'https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=' + encodeURIComponent(chunk);
-    await playAudioElement(url, speed);
+    await playAudioElement(url, speed, volume);
   }
 }
 
 /* ── DOWNLOAD AUDIO ── */
+
+/* Map each speaker to a cloud voice for recording (browser voices can't be captured) */
+function pickDownloadVoices() {
+  const result = {};
+  const used = new Set();
+  for (const spk of ['s1', 's2']) {
+    if (cloudSel[spk]) { result[spk] = cloudSel[spk]; used.add(cloudSel[spk]); continue; }
+    const voice = sel[spk];
+    const cat = voice ? matchVoice(voice) : null;
+    const gender = cat ? cat.gender : (spk === 's1' ? 'female' : 'male');
+    const accent = cat ? cat.accent : null;
+    const candidates = CLOUD_VOICES.filter(cv => cv.gender === gender && !used.has(cv.id));
+    const match = (accent ? candidates.find(cv => cv.accent === accent) : null)
+               || candidates[0]
+               || CLOUD_VOICES.find(cv => !used.has(cv.id));
+    if (match) { result[spk] = match.id; used.add(match.id); } else { result[spk] = null; }
+  }
+  return result;
+}
+
 async function generateAndDownload() {
   if (isRunning) return;
   if (!blocks.length) { pill('Add some dialog first.', false); return; }
@@ -829,11 +850,14 @@ async function generateAndDownload() {
   runBtn.classList.add('running');
   dlBtn.classList.add('running');
   stopBtn.classList.add('visible');
-  pill('Recording…', true);
-
   const spd   = parseFloat(document.getElementById('spd-sl').value);
   const vol   = parseFloat(document.getElementById('vol-sl').value);
   const pause = parseFloat(document.getElementById('pause-sl').value) * 1000;
+
+  /* Map browser voices to cloud equivalents for recording */
+  const dlVoices = pickDownloadVoices();
+  const hasSub = (!cloudSel.s1 && dlVoices.s1) || (!cloudSel.s2 && dlVoices.s2);
+  pill(hasSub ? 'Recording (using cloud voices)…' : 'Recording…', true);
 
   for (let i = 0; i < blocks.length; i++) {
     if (stopReq) break;
@@ -842,8 +866,12 @@ async function generateAndDownload() {
     document.querySelectorAll('.dialog-block').forEach(e => e.classList.remove('playing-s1', 'playing-s2'));
     const bel = document.getElementById('block-' + i);
     if (bel) { bel.classList.add('playing-' + b.speaker); bel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
-    try { await sayViaAudioElement(b.text, spd, cloudSel[b.speaker] || undefined); }
-    catch (_) { await say(b.text, sel[b.speaker], spd, vol); }
+    try {
+      await sayViaAudioElement(b.text, spd, dlVoices[b.speaker], vol);
+    } catch (_) {
+      /* Cloud voice failed — fall back to Google Translate TTS (still capturable via <audio>) */
+      try { await sayViaAudioElement(b.text, spd, null, vol); } catch (__) { /* skip block */ }
+    }
     await wait(pause);
   }
 
