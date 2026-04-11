@@ -541,7 +541,7 @@ function previewCloudVoice(voiceId, label) {
   synth.cancel();
   if (currentDlAudio) { currentDlAudio.pause(); currentDlAudio = null; }
   const cleanLabel = label.replace(/[()]/g, '').trim();
-  const url = '/api/tts?voice=' + encodeURIComponent(voiceId) + '&text=' + encodeURIComponent("Hi, I'm " + cleanLabel + '.');
+  const url = 'https://api.streamelements.com/kappa/v2/speech?voice=' + voiceId + '&text=' + encodeURIComponent("Hi, I'm " + cleanLabel + '.');
   const a = new Audio();
   let handled = false;
   currentDlAudio = a;
@@ -551,7 +551,7 @@ function previewCloudVoice(voiceId, label) {
     handled = true;
     currentDlAudio = null;
     /* Fallback: try Google Translate TTS */
-    const gUrl = '/api/tts?voice=_google&text=' + encodeURIComponent("Hi, I'm " + cleanLabel + '.');
+    const gUrl = 'https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=' + encodeURIComponent("Hi, I'm " + cleanLabel + '.');
     const b = new Audio();
     currentDlAudio = b;
     b.onended = () => { currentDlAudio = null; };
@@ -798,7 +798,9 @@ async function sayViaAudioElement(text, speed, cloudVoiceId, volume) {
   const chunks = splitTextForTTS(text, 200);
   for (const chunk of chunks) {
     if (stopReq) break;
-    const url = '/api/tts?voice=' + encodeURIComponent(cloudVoiceId || '_google') + '&text=' + encodeURIComponent(chunk);
+    const url = cloudVoiceId
+      ? 'https://api.streamelements.com/kappa/v2/speech?voice=' + cloudVoiceId + '&text=' + encodeURIComponent(chunk)
+      : 'https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=' + encodeURIComponent(chunk);
     await playAudioElement(url, speed, volume);
   }
 }
@@ -905,10 +907,21 @@ async function downloadViaFetch(dlVoices, spd, pause) {
 
       for (const chunk of textChunks) {
         if (stopReq) break;
-        const ttsUrl = '/api/tts?voice=' + encodeURIComponent(voiceId || 'Brian') + '&text=' + encodeURIComponent(chunk);
-        const resp = await fetch(ttsUrl);
-        if (!resp.ok) throw new Error('TTS API error ' + resp.status);
-        const arrBuf = await resp.arrayBuffer();
+        const encodedChunk = encodeURIComponent(chunk);
+        const seUrl = 'https://api.streamelements.com/kappa/v2/speech?voice=' + (voiceId || 'Brian') + '&text=' + encodedChunk;
+        const gtUrl = 'https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=' + encodedChunk;
+        const urls = voiceId ? [seUrl, gtUrl] : [gtUrl, seUrl];
+
+        let arrBuf = null;
+        for (const url of urls) {
+          try {
+            const resp = await fetch(url);
+            if (!resp.ok) continue;
+            arrBuf = await resp.arrayBuffer();
+            break;
+          } catch (_) { continue; }
+        }
+        if (!arrBuf) throw new Error('TTS APIs unavailable');
         const audioBuf = await actx.decodeAudioData(arrBuf.slice(0));
         audioBuffers.push(audioBuf);
       }
