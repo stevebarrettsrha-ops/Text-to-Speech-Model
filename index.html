@@ -107,6 +107,7 @@ body{font-family:var(--sans);background:var(--bg);color:var(--text);display:flex
 .vc-name{font-size:12.5px;font-weight:500;color:var(--text);}
 .vc-sub{font-size:10.5px;color:var(--muted);margin-top:1px;}
 .vc-badge{font-size:9.5px;font-weight:600;padding:2px 6px;border-radius:99px;background:var(--green-bg);color:var(--green);flex-shrink:0;}
+.vc-badge.cloud{background:rgba(6,182,212,0.12);color:#06b6d4;}
 .vc-playing{width:14px;height:14px;flex-shrink:0;}
 
 /* No voices warning */
@@ -332,6 +333,7 @@ let currentDlAudio = null;
 
 /* Selected voice objects per speaker */
 let sel = { s1: null, s2: null };
+let cloudSel = { s1: null, s2: null }; /* null = browser voice, string = cloud voice ID */
 
 /* ── AVATAR COLORS ── */
 const COLORS = ['#4f46e5','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#ec4899','#0ea5e9','#f97316','#84cc16'];
@@ -371,6 +373,24 @@ const NATURAL_CATALOG = [
   { match:'microsoft emma',   label:'Emma',   gender:'female', accent:'British',   quality:'Neural' },
 ];
 
+/* ── CLOUD VOICES (StreamElements / Amazon Polly — free, no key) ── */
+const CLOUD_VOICES = [
+  { id:'Amy',      label:'Amy',      gender:'female', accent:'British',    quality:'Cloud' },
+  { id:'Emma',     label:'Emma (Cloud)', gender:'female', accent:'British', quality:'Cloud' },
+  { id:'Joanna',   label:'Joanna',   gender:'female', accent:'American',   quality:'Cloud' },
+  { id:'Salli',    label:'Salli',    gender:'female', accent:'American',   quality:'Cloud' },
+  { id:'Kendra',   label:'Kendra',   gender:'female', accent:'American',   quality:'Cloud' },
+  { id:'Kimberly', label:'Kimberly', gender:'female', accent:'American',   quality:'Cloud' },
+  { id:'Nicole',   label:'Nicole',   gender:'female', accent:'Australian', quality:'Cloud' },
+  { id:'Aditi',    label:'Aditi',    gender:'female', accent:'Indian',     quality:'Cloud' },
+  { id:'Raveena',  label:'Raveena',  gender:'female', accent:'Indian',     quality:'Cloud' },
+  { id:'Brian',    label:'Brian',    gender:'male',   accent:'British',    quality:'Cloud' },
+  { id:'Matthew',  label:'Matthew',  gender:'male',   accent:'American',   quality:'Cloud' },
+  { id:'Joey',     label:'Joey',     gender:'male',   accent:'American',   quality:'Cloud' },
+  { id:'Russell',  label:'Russell',  gender:'male',   accent:'Australian', quality:'Cloud' },
+  { id:'Geraint',  label:'Geraint',  gender:'male',   accent:'Welsh',      quality:'Cloud' },
+];
+
 function matchVoice(v) {
   const n = v.name.toLowerCase();
   return NATURAL_CATALOG.find(c => n.includes(c.match));
@@ -379,14 +399,18 @@ function matchVoice(v) {
 /* ── POPULATE VOICE CARDS ── */
 function populateVoices() {
   allVoices = synth.getVoices();
-  if (!allVoices.length) return;
 
-  /* Find voices that match our natural catalog */
+  /* Find browser voices that match our natural catalog */
   const matched = [];
-  allVoices.forEach(v => {
-    const cat = matchVoice(v);
-    if (cat) matched.push({ voice: v, ...cat });
-  });
+  if (allVoices.length) {
+    allVoices.forEach(v => {
+      const cat = matchVoice(v);
+      if (cat) matched.push({ type: 'browser', voice: v, ...cat });
+    });
+  }
+
+  /* Append cloud voices (always available, no browser dependency) */
+  CLOUD_VOICES.forEach(cv => matched.push({ type: 'cloud', voiceId: cv.id, ...cv }));
 
   const females = matched.filter(m => m.gender === 'female');
   const males   = matched.filter(m => m.gender === 'male');
@@ -397,17 +421,6 @@ function populateVoices() {
   /* Update status labels */
   document.getElementById('s1-voice-status').textContent = females.length ? `${females.length} voices` : '';
   document.getElementById('s2-voice-status').textContent = males.length   ? `${males.length} voices`   : '';
-
-  /* Show warning if no natural voices found */
-  if (!matched.length) {
-    ['s1-cards','s2-cards'].forEach(id => {
-      document.getElementById(id).innerHTML = `
-        <div class="no-voices-warn">
-          No natural voices found on this browser.<br><br>
-          Open this file in <strong>Google Chrome</strong> for free neural voices (Google UK Female, Google UK Male, etc).
-        </div>`;
-    });
-  }
 }
 
 function renderVoiceCards(containerId, voiceList, spk, dotColor) {
@@ -415,7 +428,7 @@ function renderVoiceCards(containerId, voiceList, spk, dotColor) {
   container.innerHTML = '';
 
   if (!voiceList.length) {
-    container.innerHTML = `<div class="no-voices-warn">No ${spk==='s1'?'female':'male'} neural voices found.<br>Try opening in <strong>Google Chrome</strong>.</div>`;
+    container.innerHTML = `<div class="no-voices-warn">No voices available.</div>`;
     return;
   }
 
@@ -427,6 +440,7 @@ function renderVoiceCards(containerId, voiceList, spk, dotColor) {
 
     const color = avatarColor(i);
     const initials = m.label.split(' ').slice(0,2).map(w=>w[0]).join('');
+    const isCloud = m.type === 'cloud';
 
     card.innerHTML = `
       <div class="vc-avatar" style="background:${color}">${initials}</div>
@@ -434,29 +448,49 @@ function renderVoiceCards(containerId, voiceList, spk, dotColor) {
         <div class="vc-name">${m.label}</div>
         <div class="vc-sub">${m.gender === 'female' ? '♀' : '♂'} ${m.accent}</div>
       </div>
-      <div class="vc-badge">${m.quality}</div>
+      <div class="vc-badge${isCloud ? ' cloud' : ''}">${m.quality}</div>
     `;
 
     card.addEventListener('click', () => {
       container.querySelectorAll('.voice-card').forEach(c => c.classList.remove('selected'));
       card.classList.add('selected');
-      sel[spk] = m.voice;
-      /* Preview the voice on click */
-      previewVoice(m.voice, m.label);
+      if (isCloud) {
+        sel[spk] = null; cloudSel[spk] = m.voiceId;
+        previewCloudVoice(m.voiceId, m.label);
+      } else {
+        cloudSel[spk] = null; sel[spk] = m.voice;
+        previewVoice(m.voice, m.label);
+      }
     });
 
     container.appendChild(card);
 
     /* Auto-select first */
-    if (i === 0) sel[spk] = m.voice;
+    if (i === 0) {
+      if (isCloud) { sel[spk] = null; cloudSel[spk] = m.voiceId; }
+      else         { cloudSel[spk] = null; sel[spk] = m.voice; }
+    }
   });
 }
 
 function previewVoice(voice, label) {
   synth.cancel();
+  if (currentDlAudio) { currentDlAudio.pause(); currentDlAudio = null; }
   const u = new SpeechSynthesisUtterance(`Hi, I'm ${label}.`);
   u.voice = voice; u.rate = 1; u.volume = 1;
   synth.speak(u);
+}
+
+function previewCloudVoice(voiceId, label) {
+  synth.cancel();
+  if (currentDlAudio) { currentDlAudio.pause(); currentDlAudio = null; }
+  const url = 'https://api.streamelements.com/kappa/v2/speech?voice=' + voiceId + '&text=' + encodeURIComponent("Hi, I'm " + label + '.');
+  const a = document.createElement('audio');
+  currentDlAudio = a;
+  a.src = url;
+  a.onended = () => { currentDlAudio = null; };
+  a.onerror = () => { currentDlAudio = null; };
+  a.play().catch(() => { currentDlAudio = null; });
 }
 
 synth.onvoiceschanged = populateVoices;
@@ -582,7 +616,11 @@ async function runScript() {
     document.querySelectorAll('.dialog-block').forEach(e=>e.classList.remove('playing-s1','playing-s2'));
     const bel = document.getElementById('block-'+i);
     if (bel) { bel.classList.add('playing-'+b.speaker); bel.scrollIntoView({behavior:'smooth',block:'nearest'}); }
-    await say(b.text, sel[b.speaker], spd, vol);
+    if (cloudSel[b.speaker]) {
+      await sayViaAudioElement(b.text, spd, cloudSel[b.speaker]);
+    } else {
+      await say(b.text, sel[b.speaker], spd, vol);
+    }
     await wait(pause);
   }
 
@@ -672,11 +710,13 @@ function playAudioElement(url, speed) {
   });
 }
 
-async function sayViaAudioElement(text, speed) {
+async function sayViaAudioElement(text, speed, cloudVoiceId) {
   const chunks = splitTextForTTS(text, 200);
   for (const chunk of chunks) {
     if (stopReq) break;
-    const url = 'https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=' + encodeURIComponent(chunk);
+    const url = cloudVoiceId
+      ? 'https://api.streamelements.com/kappa/v2/speech?voice=' + cloudVoiceId + '&text=' + encodeURIComponent(chunk)
+      : 'https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=' + encodeURIComponent(chunk);
     await playAudioElement(url, speed);
   }
 }
@@ -756,7 +796,7 @@ async function generateAndDownload() {
     document.querySelectorAll('.dialog-block').forEach(e => e.classList.remove('playing-s1', 'playing-s2'));
     const bel = document.getElementById('block-' + i);
     if (bel) { bel.classList.add('playing-' + b.speaker); bel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
-    try { await sayViaAudioElement(b.text, spd); }
+    try { await sayViaAudioElement(b.text, spd, cloudSel[b.speaker] || undefined); }
     catch (_) { await say(b.text, sel[b.speaker], spd, vol); }
     await wait(pause);
   }
