@@ -336,7 +336,6 @@ let cloudSel = { s1: null, s2: null }; /* null = browser voice, string = cloud v
 /* ── AVATAR COLORS ── */
 const COLORS = ['#4f46e5','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#ec4899','#0ea5e9','#f97316','#84cc16'];
 const avatarColor = i => COLORS[i % COLORS.length];
-const voiceData = { s1: [], s2: [] };
 
 /* ── NATURAL VOICE CATALOG ──
    Priority list of the most natural-sounding, free, browser-native voices.
@@ -466,7 +465,6 @@ function populateVoices() {
 }
 
 function renderVoiceDropdown(containerId, voiceList, spk) {
-  voiceData[spk] = voiceList;
   const container = document.getElementById(containerId);
   container.innerHTML = '';
 
@@ -544,9 +542,12 @@ function previewCloudVoice(voiceId, label) {
   const cleanLabel = label.replace(/[()]/g, '').trim();
   const url = 'https://api.streamelements.com/kappa/v2/speech?voice=' + voiceId + '&text=' + encodeURIComponent("Hi, I'm " + cleanLabel + '.');
   const a = new Audio();
+  let handled = false;
   currentDlAudio = a;
   a.onended = () => { currentDlAudio = null; };
   a.onerror = () => {
+    if (handled) return;
+    handled = true;
     currentDlAudio = null;
     /* Fallback: try Google Translate TTS */
     const gUrl = 'https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=' + encodeURIComponent("Hi, I'm " + cleanLabel + '.');
@@ -559,6 +560,8 @@ function previewCloudVoice(voiceId, label) {
   };
   a.src = url;
   a.play().catch(() => {
+    if (handled) return;
+    handled = true;
     currentDlAudio = null;
     pill('Cloud voice unavailable.', false);
     setTimeout(() => pill('', false), 3000);
@@ -862,80 +865,82 @@ async function generateAndDownload() {
 /* ── APPROACH 1: Fetch audio directly and build MP3 offline ── */
 async function downloadViaFetch(dlVoices, spd, pause) {
   const actx = new (window.AudioContext || window.webkitAudioContext)();
-  const audioBuffers = [];
-  let blockCount = 0;
+  try {
+    const audioBuffers = [];
+    let blockCount = 0;
 
-  for (let i = 0; i < blocks.length; i++) {
-    if (stopReq) break;
-    const b = blocks[i];
-    if (!b.text.trim()) continue;
-    blockCount++;
-
-    document.querySelectorAll('.dialog-block').forEach(e => e.classList.remove('playing-s1', 'playing-s2'));
-    const bel = document.getElementById('block-' + i);
-    if (bel) { bel.classList.add('playing-' + b.speaker); bel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
-    pill('Fetching audio ' + blockCount + '…', true);
-
-    const voiceId = dlVoices[b.speaker];
-    const textChunks = splitTextForTTS(b.text, 200);
-
-    for (const chunk of textChunks) {
+    for (let i = 0; i < blocks.length; i++) {
       if (stopReq) break;
-      const url = voiceId
-        ? 'https://api.streamelements.com/kappa/v2/speech?voice=' + voiceId + '&text=' + encodeURIComponent(chunk)
-        : 'https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=' + encodeURIComponent(chunk);
-      const resp = await fetch(url);
-      if (!resp.ok) throw new Error('TTS API error ' + resp.status);
-      const arrBuf = await resp.arrayBuffer();
-      const audioBuf = await actx.decodeAudioData(arrBuf.slice(0));
-      audioBuffers.push(audioBuf);
+      const b = blocks[i];
+      if (!b.text.trim()) continue;
+      blockCount++;
+
+      document.querySelectorAll('.dialog-block').forEach(e => e.classList.remove('playing-s1', 'playing-s2'));
+      const bel = document.getElementById('block-' + i);
+      if (bel) { bel.classList.add('playing-' + b.speaker); bel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+      pill('Fetching audio ' + blockCount + '…', true);
+
+      const voiceId = dlVoices[b.speaker];
+      const textChunks = splitTextForTTS(b.text, 200);
+
+      for (const chunk of textChunks) {
+        if (stopReq) break;
+        const url = voiceId
+          ? 'https://api.streamelements.com/kappa/v2/speech?voice=' + voiceId + '&text=' + encodeURIComponent(chunk)
+          : 'https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=' + encodeURIComponent(chunk);
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error('TTS API error ' + resp.status);
+        const arrBuf = await resp.arrayBuffer();
+        const audioBuf = await actx.decodeAudioData(arrBuf.slice(0));
+        audioBuffers.push(audioBuf);
+      }
+
+      /* Add silence gap between blocks */
+      if (pause > 0 && i < blocks.length - 1) {
+        const silLen = Math.max(1, Math.ceil(actx.sampleRate * pause / 1000));
+        const silBuf = actx.createBuffer(1, silLen, actx.sampleRate);
+        audioBuffers.push(silBuf);
+      }
     }
 
-    /* Add silence gap between blocks */
-    if (pause > 0 && i < blocks.length - 1) {
-      const silLen = Math.max(1, Math.ceil(actx.sampleRate * pause / 1000));
-      const silBuf = actx.createBuffer(1, silLen, actx.sampleRate);
-      audioBuffers.push(silBuf);
+    if (stopReq || !audioBuffers.length) {
+      pill(stopReq ? 'Stopped.' : 'No audio.', false);
+      setTimeout(() => pill('', false), 2500);
+      return;
     }
-  }
 
-  if (stopReq || !audioBuffers.length) {
+    pill('Converting to MP3…', true);
+
+    /* Concatenate all audio buffers */
+    const sampleRate = audioBuffers[0].sampleRate;
+    let totalLength = 0;
+    for (const buf of audioBuffers) totalLength += buf.length;
+
+    const concat = actx.createBuffer(1, totalLength, sampleRate);
+    const channel = concat.getChannelData(0);
+    let offset = 0;
+    for (const buf of audioBuffers) {
+      channel.set(buf.getChannelData(0), offset);
+      offset += buf.length;
+    }
+
+    /* Apply speed adjustment */
+    let outputBuf = concat;
+    if (spd !== 1) {
+      const newLen = Math.max(1, Math.ceil(totalLength / spd));
+      const offCtx = new OfflineAudioContext(1, newLen, sampleRate);
+      const src = offCtx.createBufferSource();
+      src.buffer = concat;
+      src.playbackRate.value = spd;
+      src.connect(offCtx.destination);
+      src.start();
+      outputBuf = await offCtx.startRendering();
+    }
+
+    encodeAndDownloadMp3(outputBuf);
+  } finally {
     actx.close();
-    pill(stopReq ? 'Stopped.' : 'No audio.', false);
-    setTimeout(() => pill('', false), 2500);
-    return;
   }
-
-  pill('Converting to MP3…', true);
-
-  /* Concatenate all audio buffers */
-  const sampleRate = audioBuffers[0].sampleRate;
-  let totalLength = 0;
-  for (const buf of audioBuffers) totalLength += buf.length;
-
-  const concat = actx.createBuffer(1, totalLength, sampleRate);
-  const channel = concat.getChannelData(0);
-  let offset = 0;
-  for (const buf of audioBuffers) {
-    channel.set(buf.getChannelData(0), offset);
-    offset += buf.length;
-  }
-
-  /* Apply speed adjustment */
-  let outputBuf = concat;
-  if (spd !== 1) {
-    const newLen = Math.max(1, Math.ceil(totalLength / spd));
-    const offCtx = new OfflineAudioContext(1, newLen, sampleRate);
-    const src = offCtx.createBufferSource();
-    src.buffer = concat;
-    src.playbackRate.value = spd;
-    src.connect(offCtx.destination);
-    src.start();
-    outputBuf = await offCtx.startRendering();
-  }
-
-  actx.close();
-  encodeAndDownloadMp3(outputBuf);
 }
 
 /* ── APPROACH 2: Capture tab audio via getDisplayMedia ── */
@@ -972,7 +977,7 @@ async function downloadViaCapture(dlVoices, spd, pause) {
   const chunks = [];
   recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
 
-  await new Promise(async (resolveCapture, rejectCapture) => {
+  await new Promise((resolveCapture, rejectCapture) => {
     recorder.onstop = async () => {
       stream.getTracks().forEach(t => t.stop());
       activeRecorder = null;
@@ -1013,35 +1018,44 @@ async function downloadViaCapture(dlVoices, spd, pause) {
       resolveCapture();
     };
 
-    activeRecorder = recorder;
-    activeStream = stream;
-    recorder.start(250);
+    async function runCapture() {
+      activeRecorder = recorder;
+      activeStream = stream;
+      recorder.start(250);
 
-    const vol = parseFloat(document.getElementById('vol-sl').value);
-    pill('Recording…', true);
+      const vol = parseFloat(document.getElementById('vol-sl').value);
+      pill('Recording…', true);
 
-    for (let i = 0; i < blocks.length; i++) {
-      if (stopReq) break;
-      const b = blocks[i];
-      if (!b.text.trim()) continue;
-      document.querySelectorAll('.dialog-block').forEach(e => e.classList.remove('playing-s1', 'playing-s2'));
-      const bel = document.getElementById('block-' + i);
-      if (bel) { bel.classList.add('playing-' + b.speaker); bel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
-      try {
-        await sayViaAudioElement(b.text, spd, dlVoices[b.speaker], vol);
-      } catch (_) {
-        try { await sayViaAudioElement(b.text, spd, null, vol); } catch (__) { /* skip */ }
+      for (let i = 0; i < blocks.length; i++) {
+        if (stopReq) break;
+        const b = blocks[i];
+        if (!b.text.trim()) continue;
+        document.querySelectorAll('.dialog-block').forEach(e => e.classList.remove('playing-s1', 'playing-s2'));
+        const bel = document.getElementById('block-' + i);
+        if (bel) { bel.classList.add('playing-' + b.speaker); bel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+        try {
+          await sayViaAudioElement(b.text, spd, dlVoices[b.speaker], vol);
+        } catch (_) {
+          try { await sayViaAudioElement(b.text, spd, null, vol); } catch (__) { /* skip */ }
+        }
+        await wait(pause);
       }
-      await wait(pause);
+
+      await wait(300);
+      if (recorder.state === 'recording') {
+        pill('Preparing download…', true);
+        recorder.stop();
+      } else {
+        resolveCapture();
+      }
     }
 
-    await wait(300);
-    if (recorder.state === 'recording') {
-      pill('Preparing download…', true);
-      recorder.stop();
-    } else {
-      resolveCapture();
-    }
+    runCapture().catch(err => {
+      stream.getTracks().forEach(t => t.stop());
+      activeRecorder = null;
+      activeStream = null;
+      rejectCapture(err);
+    });
   });
 }
 
