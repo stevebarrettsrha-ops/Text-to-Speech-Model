@@ -836,66 +836,14 @@ async function generateAndDownload() {
   const chunks = [];
   recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
 
-  activeRecorder = recorder;
-  activeStream = stream;
-
-  /* Start recording – timeslice for reliable data collection */
-  recorder.start(250);
-
-  /* Play the script */
-  isRunning = true; stopReq = false;
-  const runBtn = document.getElementById('run-btn');
-  const dlBtn  = document.getElementById('dl-btn');
-  const stopBtn = document.getElementById('stop-btn');
-  runBtn.classList.add('running');
-  dlBtn.classList.add('running');
-  stopBtn.classList.add('visible');
-  const spd   = parseFloat(document.getElementById('spd-sl').value);
-  const vol   = parseFloat(document.getElementById('vol-sl').value);
-  const pause = parseFloat(document.getElementById('pause-sl').value) * 1000;
-
-  /* Map browser voices to cloud equivalents for recording */
-  const dlVoices = pickDownloadVoices();
-  const hasSub = (!cloudSel.s1 && dlVoices.s1) || (!cloudSel.s2 && dlVoices.s2);
-  pill(hasSub ? 'Recording (using cloud voices)…' : 'Recording…', true);
-
-  for (let i = 0; i < blocks.length; i++) {
-    if (stopReq) break;
-    const b = blocks[i];
-    if (!b.text.trim()) continue;
-    document.querySelectorAll('.dialog-block').forEach(e => e.classList.remove('playing-s1', 'playing-s2'));
-    const bel = document.getElementById('block-' + i);
-    if (bel) { bel.classList.add('playing-' + b.speaker); bel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
-    try {
-      await sayViaAudioElement(b.text, spd, dlVoices[b.speaker], vol);
-    } catch (_) {
-      /* Cloud voice failed — fall back to Google Translate TTS (still capturable via <audio>) */
-      try { await sayViaAudioElement(b.text, spd, null, vol); } catch (__) { /* skip block */ }
-    }
-    await wait(pause);
-  }
-
-  /* Clean up playback state */
-  document.querySelectorAll('.dialog-block').forEach(e => e.classList.remove('playing-s1', 'playing-s2'));
-  isRunning = false;
-  runBtn.classList.remove('running');
-  dlBtn.classList.remove('running');
-  stopBtn.classList.remove('visible');
-
-  /* Brief tail to capture any remaining audio */
-  await wait(300);
-
-  /* Stop recording and trigger download */
-  const wasStopped = stopReq;
-  pill('Preparing download…', true);
-
+  /* onstop must be registered BEFORE starting — stopAll() can trigger it mid-loop */
   recorder.onstop = async () => {
     stream.getTracks().forEach(t => t.stop());
     activeRecorder = null;
     activeStream = null;
 
-    if (!chunks.length || wasStopped) {
-      pill(wasStopped ? 'Stopped.' : 'No audio captured.', false);
+    if (!chunks.length || stopReq) {
+      pill(stopReq ? 'Stopped.' : 'No audio captured.', false);
       setTimeout(() => pill('', false), 2500);
       return;
     }
@@ -959,7 +907,60 @@ async function generateAndDownload() {
     setTimeout(() => pill('', false), 2800);
   };
 
-  recorder.stop();
+  activeRecorder = recorder;
+  activeStream = stream;
+
+  /* Start recording – timeslice for reliable data collection */
+  recorder.start(250);
+
+  /* Play the script */
+  isRunning = true; stopReq = false;
+  const runBtn = document.getElementById('run-btn');
+  const dlBtn  = document.getElementById('dl-btn');
+  const stopBtn = document.getElementById('stop-btn');
+  runBtn.classList.add('running');
+  dlBtn.classList.add('running');
+  stopBtn.classList.add('visible');
+  const spd   = parseFloat(document.getElementById('spd-sl').value);
+  const vol   = parseFloat(document.getElementById('vol-sl').value);
+  const pause = parseFloat(document.getElementById('pause-sl').value) * 1000;
+
+  /* Map browser voices to cloud equivalents for recording */
+  const dlVoices = pickDownloadVoices();
+  const hasSub = (!cloudSel.s1 && dlVoices.s1) || (!cloudSel.s2 && dlVoices.s2);
+  pill(hasSub ? 'Recording (using cloud voices)…' : 'Recording…', true);
+
+  for (let i = 0; i < blocks.length; i++) {
+    if (stopReq) break;
+    const b = blocks[i];
+    if (!b.text.trim()) continue;
+    document.querySelectorAll('.dialog-block').forEach(e => e.classList.remove('playing-s1', 'playing-s2'));
+    const bel = document.getElementById('block-' + i);
+    if (bel) { bel.classList.add('playing-' + b.speaker); bel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+    try {
+      await sayViaAudioElement(b.text, spd, dlVoices[b.speaker], vol);
+    } catch (_) {
+      /* Cloud voice failed — fall back to Google Translate TTS (still capturable via <audio>) */
+      try { await sayViaAudioElement(b.text, spd, null, vol); } catch (__) { /* skip block */ }
+    }
+    await wait(pause);
+  }
+
+  /* Clean up playback state */
+  document.querySelectorAll('.dialog-block').forEach(e => e.classList.remove('playing-s1', 'playing-s2'));
+  isRunning = false;
+  runBtn.classList.remove('running');
+  dlBtn.classList.remove('running');
+  stopBtn.classList.remove('visible');
+
+  /* Brief tail to capture any remaining audio */
+  await wait(300);
+
+  /* Stop recording — guard against stopAll() having already stopped it */
+  if (recorder.state === 'recording') {
+    pill('Preparing download…', true);
+    recorder.stop();
+  }
 }
 
 document.addEventListener('keydown',e=>{
