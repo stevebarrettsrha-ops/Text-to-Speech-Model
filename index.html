@@ -97,18 +97,16 @@ body{font-family:var(--sans);background:var(--bg);color:var(--text);display:flex
 .si{width:100%;background:var(--panel2);border:1px solid var(--border2);border-radius:7px;color:var(--text);font-family:var(--sans);font-size:12.5px;padding:7px 9px;outline:none;transition:border-color .15s;}
 .si:focus{border-color:#555;}
 
-/* Voice card selector */
-.voice-cards{display:flex;flex-direction:column;gap:5px;margin-top:4px;}
-.voice-card{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:8px;border:1px solid var(--border2);background:var(--panel2);cursor:pointer;transition:all .15s;}
-.voice-card:hover{border-color:#555;}
-.voice-card.selected{border-color:var(--accent);background:rgba(79,70,229,0.1);}
-.vc-avatar{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;color:#fff;font-weight:600;}
-.vc-info{flex:1;min-width:0;}
-.vc-name{font-size:12.5px;font-weight:500;color:var(--text);}
-.vc-sub{font-size:10.5px;color:var(--muted);margin-top:1px;}
-.vc-badge{font-size:9.5px;font-weight:600;padding:2px 6px;border-radius:99px;background:var(--green-bg);color:var(--green);flex-shrink:0;}
-.vc-badge.cloud{background:rgba(6,182,212,0.12);color:#06b6d4;}
-.vc-playing{width:14px;height:14px;flex-shrink:0;}
+/* Voice dropdown selector */
+.voice-cards{margin-top:4px;}
+.voice-select-wrap{display:flex;gap:6px;align-items:center;}
+.voice-select{flex:1;min-width:0;background:var(--panel2);border:1px solid var(--border2);border-radius:7px;color:var(--text);font-family:var(--sans);font-size:12px;padding:8px 28px 8px 10px;outline:none;cursor:pointer;appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 8px center;transition:border-color .15s;}
+.voice-select:focus{border-color:#555;}
+.voice-select option{background:var(--panel);color:var(--text);padding:4px 0;}
+.voice-select optgroup{color:var(--muted);font-style:normal;font-weight:600;font-size:11px;}
+.voice-preview-btn{width:34px;height:34px;border-radius:7px;border:1px solid var(--border2);background:var(--panel2);color:var(--muted);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .15s;flex-shrink:0;}
+.voice-preview-btn:hover{border-color:#555;color:var(--text);background:var(--border);}
+.voice-preview-btn svg{width:14px;height:14px;}
 
 /* No voices warning */
 .no-voices-warn{font-size:12px;color:#fbbf24;background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.25);border-radius:8px;padding:10px 12px;line-height:1.6;margin-top:6px;}
@@ -338,6 +336,7 @@ let cloudSel = { s1: null, s2: null }; /* null = browser voice, string = cloud v
 /* ── AVATAR COLORS ── */
 const COLORS = ['#4f46e5','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#ec4899','#0ea5e9','#f97316','#84cc16'];
 const avatarColor = i => COLORS[i % COLORS.length];
+const voiceData = { s1: [], s2: [] };
 
 /* ── NATURAL VOICE CATALOG ──
    Priority list of the most natural-sounding, free, browser-native voices.
@@ -461,15 +460,16 @@ function populateVoices() {
   const females = matched.filter(m => m.gender === 'female');
   const males   = matched.filter(m => m.gender === 'male');
 
-  renderVoiceCards('s1-cards', females, 's1', '#d4a017');
-  renderVoiceCards('s2-cards', males,   's2', '#9b59b6');
+  renderVoiceDropdown('s1-cards', females, 's1');
+  renderVoiceDropdown('s2-cards', males,   's2');
 
   /* Update status labels */
   document.getElementById('s1-voice-status').textContent = females.length ? `${females.length} voices` : '';
   document.getElementById('s2-voice-status').textContent = males.length   ? `${males.length} voices`   : '';
 }
 
-function renderVoiceCards(containerId, voiceList, spk, dotColor) {
+function renderVoiceDropdown(containerId, voiceList, spk) {
+  voiceData[spk] = voiceList;
   const container = document.getElementById(containerId);
   container.innerHTML = '';
 
@@ -478,45 +478,59 @@ function renderVoiceCards(containerId, voiceList, spk, dotColor) {
     return;
   }
 
+  /* Group voices by quality/source */
+  const groups = {};
   voiceList.forEach((m, i) => {
-    const card = document.createElement('div');
-    card.className = 'voice-card' + (i === 0 ? ' selected' : '');
-    card.dataset.spk = spk;
-    card.dataset.idx = i;
-
-    const color = avatarColor(i);
-    const initials = m.label.split(' ').slice(0,2).map(w=>w[0]).join('');
-    const isCloud = m.type === 'cloud';
-
-    card.innerHTML = `
-      <div class="vc-avatar" style="background:${color}">${initials}</div>
-      <div class="vc-info">
-        <div class="vc-name">${m.label}</div>
-        <div class="vc-sub">${m.gender === 'female' ? '♀' : '♂'} ${m.accent}</div>
-      </div>
-      <div class="vc-badge${isCloud ? ' cloud' : ''}">${m.quality}</div>
-    `;
-
-    card.addEventListener('click', () => {
-      container.querySelectorAll('.voice-card').forEach(c => c.classList.remove('selected'));
-      card.classList.add('selected');
-      if (isCloud) {
-        sel[spk] = null; cloudSel[spk] = m.voiceId;
-        previewCloudVoice(m.voiceId, m.label);
-      } else {
-        cloudSel[spk] = null; sel[spk] = m.voice;
-        previewVoice(m.voice, m.label);
-      }
-    });
-
-    container.appendChild(card);
-
-    /* Auto-select first */
-    if (i === 0) {
-      if (isCloud) { sel[spk] = null; cloudSel[spk] = m.voiceId; }
-      else         { cloudSel[spk] = null; sel[spk] = m.voice; }
-    }
+    const key = m.type === 'cloud' ? 'Cloud' : m.quality;
+    if (!groups[key]) groups[key] = [];
+    groups[key].push({ ...m, idx: i });
   });
+
+  const wrap = document.createElement('div');
+  wrap.className = 'voice-select-wrap';
+
+  const select = document.createElement('select');
+  select.className = 'voice-select';
+  select.id = 'vsel-' + spk;
+
+  const order = ['Neural', 'Enhanced', 'Cloud', 'Standard'];
+  for (const grp of order) {
+    if (!groups[grp]) continue;
+    const optgroup = document.createElement('optgroup');
+    optgroup.label = grp + ' voices';
+    groups[grp].forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.idx;
+      opt.textContent = m.label + ' \u2014 ' + m.accent;
+      optgroup.appendChild(opt);
+    });
+    select.appendChild(optgroup);
+  }
+
+  function applySelection() {
+    const m = voiceList[parseInt(select.value)];
+    if (m.type === 'cloud') { sel[spk] = null; cloudSel[spk] = m.voiceId; }
+    else                    { cloudSel[spk] = null; sel[spk] = m.voice; }
+  }
+
+  select.addEventListener('change', applySelection);
+
+  const prevBtn = document.createElement('button');
+  prevBtn.className = 'voice-preview-btn';
+  prevBtn.title = 'Preview voice';
+  prevBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="6,3 20,12 6,21"/></svg>';
+  prevBtn.addEventListener('click', () => {
+    const m = voiceList[parseInt(select.value)];
+    if (m.type === 'cloud') previewCloudVoice(m.voiceId, m.label);
+    else previewVoice(m.voice, m.label);
+  });
+
+  wrap.appendChild(select);
+  wrap.appendChild(prevBtn);
+  container.appendChild(wrap);
+
+  /* Auto-select first voice */
+  applySelection();
 }
 
 function previewVoice(voice, label) {
