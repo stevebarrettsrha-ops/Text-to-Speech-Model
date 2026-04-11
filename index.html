@@ -457,15 +457,12 @@ function populateVoices() {
   /* Append cloud voices (always available, no browser dependency) */
   CLOUD_VOICES.forEach(cv => matched.push({ type: 'cloud', voiceId: cv.id, ...cv }));
 
-  const females = matched.filter(m => m.gender === 'female');
-  const males   = matched.filter(m => m.gender === 'male');
-
-  renderVoiceDropdown('s1-cards', females, 's1');
-  renderVoiceDropdown('s2-cards', males,   's2');
+  renderVoiceDropdown('s1-cards', matched, 's1');
+  renderVoiceDropdown('s2-cards', matched, 's2');
 
   /* Update status labels */
-  document.getElementById('s1-voice-status').textContent = females.length ? `${females.length} voices` : '';
-  document.getElementById('s2-voice-status').textContent = males.length   ? `${males.length} voices`   : '';
+  document.getElementById('s1-voice-status').textContent = matched.length ? `${matched.length} voices` : '';
+  document.getElementById('s2-voice-status').textContent = matched.length ? `${matched.length} voices` : '';
 }
 
 function renderVoiceDropdown(containerId, voiceList, spk) {
@@ -501,7 +498,7 @@ function renderVoiceDropdown(containerId, voiceList, spk) {
     groups[grp].forEach(m => {
       const opt = document.createElement('option');
       opt.value = m.idx;
-      opt.textContent = m.label + ' \u2014 ' + m.accent;
+      opt.textContent = m.label + ' \u2014 ' + (m.gender === 'female' ? '\u2640' : '\u2642') + ' ' + m.accent;
       optgroup.appendChild(opt);
     });
     select.appendChild(optgroup);
@@ -544,13 +541,28 @@ function previewVoice(voice, label) {
 function previewCloudVoice(voiceId, label) {
   synth.cancel();
   if (currentDlAudio) { currentDlAudio.pause(); currentDlAudio = null; }
-  const url = 'https://api.streamelements.com/kappa/v2/speech?voice=' + voiceId + '&text=' + encodeURIComponent("Hi, I'm " + label + '.');
-  const a = document.createElement('audio');
+  const cleanLabel = label.replace(/[()]/g, '').trim();
+  const url = 'https://api.streamelements.com/kappa/v2/speech?voice=' + voiceId + '&text=' + encodeURIComponent("Hi, I'm " + cleanLabel + '.');
+  const a = new Audio();
   currentDlAudio = a;
-  a.src = url;
   a.onended = () => { currentDlAudio = null; };
-  a.onerror = () => { currentDlAudio = null; };
-  a.play().catch(() => { currentDlAudio = null; });
+  a.onerror = () => {
+    currentDlAudio = null;
+    /* Fallback: try Google Translate TTS */
+    const gUrl = 'https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=' + encodeURIComponent("Hi, I'm " + cleanLabel + '.');
+    const b = new Audio();
+    currentDlAudio = b;
+    b.onended = () => { currentDlAudio = null; };
+    b.onerror = () => { currentDlAudio = null; pill('Cloud voice unavailable.', false); setTimeout(() => pill('', false), 3000); };
+    b.src = gUrl;
+    b.play().catch(() => { currentDlAudio = null; pill('Cloud voice unavailable.', false); setTimeout(() => pill('', false), 3000); });
+  };
+  a.src = url;
+  a.play().catch(() => {
+    currentDlAudio = null;
+    pill('Cloud voice unavailable.', false);
+    setTimeout(() => pill('', false), 3000);
+  });
 }
 
 synth.onvoiceschanged = populateVoices;
@@ -677,7 +689,12 @@ async function runScript() {
     const bel = document.getElementById('block-'+i);
     if (bel) { bel.classList.add('playing-'+b.speaker); bel.scrollIntoView({behavior:'smooth',block:'nearest'}); }
     if (cloudSel[b.speaker]) {
-      await sayViaAudioElement(b.text, spd, cloudSel[b.speaker], vol);
+      try { await sayViaAudioElement(b.text, spd, cloudSel[b.speaker], vol); }
+      catch (_) {
+        /* Cloud failed — fall back to Google TTS, then browser voice */
+        try { await sayViaAudioElement(b.text, spd, null, vol); }
+        catch (__) { await say(b.text, sel[b.speaker], spd, vol); }
+      }
     } else {
       await say(b.text, sel[b.speaker], spd, vol);
     }
@@ -760,14 +777,16 @@ function splitTextForTTS(text, maxLen) {
 
 function playAudioElement(url, speed, volume) {
   return new Promise((resolve, reject) => {
-    const a = document.createElement('audio');
+    const a = new Audio();
     currentDlAudio = a;
-    a.src = url;
     a.playbackRate = Math.max(0.25, Math.min(4, speed));
     if (volume != null) a.volume = Math.max(0, Math.min(1, volume));
-    a.onended = () => { currentDlAudio = null; resolve(); };
-    a.onerror = () => { currentDlAudio = null; reject(new Error('Audio element failed')); };
-    a.play().catch(e => { currentDlAudio = null; reject(e); });
+    /* Timeout if audio never starts playing */
+    const timeout = setTimeout(() => { a.pause(); currentDlAudio = null; reject(new Error('Audio load timeout')); }, 15000);
+    a.onended = () => { clearTimeout(timeout); currentDlAudio = null; resolve(); };
+    a.onerror = () => { clearTimeout(timeout); currentDlAudio = null; reject(new Error('Audio element failed')); };
+    a.src = url;
+    a.play().catch(e => { clearTimeout(timeout); currentDlAudio = null; reject(e); });
   });
 }
 
