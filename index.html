@@ -135,6 +135,12 @@ input[type=range].mslider{width:100%;accent-color:var(--accent);height:3px;}
 .spill.on{display:block;}
 .spill.live{border-color:var(--accent);color:#a5b4fc;}
 
+/* Download button */
+.dl-btn{font-family:var(--sans);font-size:13px;font-weight:600;padding:8px 18px;border-radius:8px;border:1px solid var(--border2);background:transparent;color:var(--text);cursor:pointer;display:flex;align-items:center;gap:6px;transition:all .15s;white-space:nowrap;}
+.dl-btn:hover{background:var(--panel2);border-color:#555;}
+.dl-btn:active{transform:scale(.97);}
+.dl-btn.running{color:var(--muted);cursor:default;border-color:var(--border);}
+
 #nosup{display:none;padding:9px 14px;background:#3a1a1a;color:#f87171;font-size:12px;border-bottom:1px solid #552222;flex-shrink:0;}
 
 /* Chrome hint banner */
@@ -301,6 +307,10 @@ input[type=range].mslider{width:100%;accent-color:var(--accent);height:3px;}
   <div class="sp"></div>
   <div class="spill" id="spill"></div>
   <button class="stop-btn" id="stop-btn" onclick="stopAll()">&#9632; Stop</button>
+  <button class="dl-btn" id="dl-btn" onclick="generateAndDownload()">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+    Download
+  </button>
   <button class="run-btn" id="run-btn" onclick="runScript()">
     Run <span class="kb">Ctrl ↵</span>
   </button>
@@ -315,6 +325,8 @@ let blocks = [];
 let isRunning = false;
 let stopReq = false;
 let mode = 'multi';
+let activeRecorder = null;
+let activeStream = null;
 
 /* Selected voice objects per speaker */
 let sel = { s1: null, s2: null };
@@ -593,14 +605,135 @@ function wait(ms){return new Promise(r=>setTimeout(r,ms));}
 function stopAll() {
   stopReq=true; synth.cancel(); isRunning=false;
   document.getElementById('run-btn').classList.remove('running');
+  document.getElementById('dl-btn').classList.remove('running');
   document.getElementById('stop-btn').classList.remove('visible');
   document.querySelectorAll('.dialog-block').forEach(e=>e.classList.remove('playing-s1','playing-s2'));
+  if (activeRecorder && activeRecorder.state === 'recording') activeRecorder.stop();
+  if (activeStream) { activeStream.getTracks().forEach(t=>t.stop()); activeStream=null; }
   pill('Stopped.',false); setTimeout(()=>pill('',false),2000);
 }
 
 function pill(msg,live){
   const p=document.getElementById('spill');
   p.textContent=msg; p.classList.toggle('on',!!msg); p.classList.toggle('live',!!live);
+}
+
+/* ── DOWNLOAD AUDIO ── */
+async function generateAndDownload() {
+  if (isRunning) return;
+  if (!blocks.length) { pill('Add some dialog first.', false); return; }
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    pill('Download requires Chrome or Edge.', false);
+    setTimeout(() => pill('', false), 3500);
+    return;
+  }
+
+  pill('Share this tab to capture audio…', true);
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: true,
+      preferCurrentTab: true,
+      selfBrowserSurface: 'include'
+    });
+  } catch (e) {
+    pill('Audio capture cancelled.', false);
+    setTimeout(() => pill('', false), 2500);
+    return;
+  }
+
+  /* Stop video track — we only need audio */
+  stream.getVideoTracks().forEach(t => t.stop());
+
+  const audioTracks = stream.getAudioTracks();
+  if (!audioTracks.length) {
+    pill('No audio track — enable "Share tab audio".', false);
+    stream.getTracks().forEach(t => t.stop());
+    setTimeout(() => pill('', false), 4000);
+    return;
+  }
+
+  /* If user stops sharing via browser UI */
+  audioTracks[0].onended = () => { if (isRunning) stopAll(); };
+
+  /* Set up MediaRecorder */
+  const audioStream = new MediaStream(audioTracks);
+  const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+    ? 'audio/webm;codecs=opus' : 'audio/webm';
+  const recorder = new MediaRecorder(audioStream, { mimeType: mime });
+  const chunks = [];
+  recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+
+  activeRecorder = recorder;
+  activeStream = stream;
+
+  /* Start recording */
+  recorder.start();
+
+  /* Play the script (reuse playback logic) */
+  isRunning = true; stopReq = false;
+  const runBtn = document.getElementById('run-btn');
+  const dlBtn  = document.getElementById('dl-btn');
+  const stopBtn = document.getElementById('stop-btn');
+  runBtn.classList.add('running');
+  dlBtn.classList.add('running');
+  stopBtn.classList.add('visible');
+  pill('Recording…', true);
+
+  const spd   = parseFloat(document.getElementById('spd-sl').value);
+  const vol   = parseFloat(document.getElementById('vol-sl').value);
+  const pause = parseFloat(document.getElementById('pause-sl').value) * 1000;
+
+  for (let i = 0; i < blocks.length; i++) {
+    if (stopReq) break;
+    const b = blocks[i];
+    if (!b.text.trim()) continue;
+    document.querySelectorAll('.dialog-block').forEach(e => e.classList.remove('playing-s1', 'playing-s2'));
+    const bel = document.getElementById('block-' + i);
+    if (bel) { bel.classList.add('playing-' + b.speaker); bel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+    await say(b.text, sel[b.speaker], spd, vol);
+    await wait(pause);
+  }
+
+  /* Clean up playback state */
+  document.querySelectorAll('.dialog-block').forEach(e => e.classList.remove('playing-s1', 'playing-s2'));
+  isRunning = false;
+  runBtn.classList.remove('running');
+  dlBtn.classList.remove('running');
+  stopBtn.classList.remove('visible');
+
+  /* Stop recording and trigger download */
+  const wasStopped = stopReq;
+  pill('Preparing download…', true);
+
+  recorder.onstop = () => {
+    stream.getTracks().forEach(t => t.stop());
+    activeRecorder = null;
+    activeStream = null;
+
+    if (!chunks.length || wasStopped) {
+      pill(wasStopped ? 'Stopped.' : 'No audio captured.', false);
+      setTimeout(() => pill('', false), 2500);
+      return;
+    }
+
+    const blob = new Blob(chunks, { type: mime });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url;
+    a.download = 'script-audio.webm';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    pill('Downloaded!', false);
+    setTimeout(() => pill('', false), 2800);
+  };
+
+  recorder.stop();
 }
 
 document.addEventListener('keydown',e=>{
