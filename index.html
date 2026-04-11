@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Script Builder — Natural Voices</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -618,6 +619,28 @@ function pill(msg,live){
   p.textContent=msg; p.classList.toggle('on',!!msg); p.classList.toggle('live',!!live);
 }
 
+/* ── DOWNLOAD HELPERS ── */
+function floatTo16(float32) {
+  const len = float32.length;
+  const int16 = new Int16Array(len);
+  for (let i = 0; i < len; i++) {
+    const s = Math.max(-1, Math.min(1, float32[i]));
+    int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  return int16;
+}
+
+function triggerDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
 /* ── DOWNLOAD AUDIO ── */
 async function generateAndDownload() {
   if (isRunning) return;
@@ -709,7 +732,7 @@ async function generateAndDownload() {
   const wasStopped = stopReq;
   pill('Preparing download…', true);
 
-  recorder.onstop = () => {
+  recorder.onstop = async () => {
     stream.getTracks().forEach(t => t.stop());
     activeRecorder = null;
     activeStream = null;
@@ -720,16 +743,52 @@ async function generateAndDownload() {
       return;
     }
 
-    const blob = new Blob(chunks, { type: mime });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href = url;
-    a.download = 'script-audio.webm';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
-    pill('Downloaded!', false);
+    const webmBlob = new Blob(chunks, { type: mime });
+
+    /* Convert to MP3 via lamejs */
+    pill('Converting to MP3…', true);
+    try {
+      const arrayBuf = await webmBlob.arrayBuffer();
+      const actx = new (window.AudioContext || window.webkitAudioContext)();
+      const audioBuf = await actx.decodeAudioData(arrayBuf);
+      actx.close();
+
+      const sampleRate = audioBuf.sampleRate;
+      const numChannels = audioBuf.numberOfChannels;
+      const kbps = 128;
+      const encoder = new lamejs.Mp3Encoder(numChannels, sampleRate, kbps);
+      const mp3Parts = [];
+      const samplesPerFrame = 1152;
+
+      if (numChannels === 1) {
+        const pcm = floatTo16(audioBuf.getChannelData(0));
+        for (let i = 0; i < pcm.length; i += samplesPerFrame) {
+          const chunk = pcm.subarray(i, i + samplesPerFrame);
+          const buf = encoder.encodeBuffer(chunk);
+          if (buf.length > 0) mp3Parts.push(buf);
+        }
+      } else {
+        const left  = floatTo16(audioBuf.getChannelData(0));
+        const right = floatTo16(audioBuf.getChannelData(1));
+        for (let i = 0; i < left.length; i += samplesPerFrame) {
+          const lc = left.subarray(i, i + samplesPerFrame);
+          const rc = right.subarray(i, i + samplesPerFrame);
+          const buf = encoder.encodeBuffer(lc, rc);
+          if (buf.length > 0) mp3Parts.push(buf);
+        }
+      }
+
+      const flush = encoder.flush();
+      if (flush.length > 0) mp3Parts.push(flush);
+
+      const mp3Blob = new Blob(mp3Parts, { type: 'audio/mpeg' });
+      triggerDownload(mp3Blob, 'script-audio.mp3');
+      pill('Downloaded!', false);
+    } catch (err) {
+      console.error('MP3 conversion failed, falling back to webm:', err);
+      triggerDownload(webmBlob, 'script-audio.webm');
+      pill('Downloaded (webm fallback).', false);
+    }
     setTimeout(() => pill('', false), 2800);
   };
 
