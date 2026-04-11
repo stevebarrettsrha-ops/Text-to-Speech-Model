@@ -357,20 +357,66 @@ const NATURAL_CATALOG = [
   { match:'tessa',      label:'Tessa',      gender:'female', accent:'South African',quality:'Enhanced'},
   { match:'rishi',      label:'Rishi',      gender:'male',   accent:'Indian',   quality:'Enhanced' },
   { match:'fiona',      label:'Fiona',      gender:'female', accent:'Scottish', quality:'Enhanced' },
-  /* Microsoft Edge Neural */
-  { match:'microsoft aria',   label:'Aria',   gender:'female', accent:'American',  quality:'Neural' },
-  { match:'microsoft jenny',  label:'Jenny',  gender:'female', accent:'American',  quality:'Neural' },
-  { match:'microsoft guy',    label:'Guy',    gender:'male',   accent:'American',  quality:'Neural' },
-  { match:'microsoft ryan',   label:'Ryan',   gender:'male',   accent:'British',   quality:'Neural' },
-  { match:'microsoft libby',  label:'Libby',  gender:'female', accent:'British',   quality:'Neural' },
-  { match:'microsoft sonia',  label:'Sonia',  gender:'female', accent:'British',   quality:'Neural' },
-  { match:'microsoft natasha',label:'Natasha',gender:'female', accent:'Australian',quality:'Neural' },
-  { match:'microsoft william',label:'William',gender:'male',   accent:'Australian',quality:'Neural' },
-  { match:'microsoft luna',   label:'Luna',   gender:'female', accent:'American',  quality:'Neural' },
-  { match:'microsoft ana',    label:'Ana',    gender:'female', accent:'American',  quality:'Neural' },
-  { match:'microsoft andrew', label:'Andrew', gender:'male',   accent:'American',  quality:'Neural' },
-  { match:'microsoft brian',  label:'Brian',  gender:'male',   accent:'American',  quality:'Neural' },
-  { match:'microsoft emma',   label:'Emma',   gender:'female', accent:'British',   quality:'Neural' },
+  /* Microsoft Edge Neural — en-US */
+  { match:'microsoft aria',       label:'Aria',       gender:'female', accent:'American',      quality:'Neural' },
+  { match:'microsoft ana',        label:'Ana',        gender:'female', accent:'American',      quality:'Neural' },
+  { match:'microsoft andrew',     label:'Andrew',     gender:'male',   accent:'American',      quality:'Neural' },
+  { match:'microsoft brian',      label:'Brian',      gender:'male',   accent:'American',      quality:'Neural' },
+  { match:'microsoft christopher',label:'Christopher',gender:'male',   accent:'American',      quality:'Neural' },
+  { match:'microsoft eric',       label:'Eric',       gender:'male',   accent:'American',      quality:'Neural' },
+  { match:'microsoft guy',        label:'Guy',        gender:'male',   accent:'American',      quality:'Neural' },
+  { match:'microsoft jenny',      label:'Jenny',      gender:'female', accent:'American',      quality:'Neural' },
+  { match:'microsoft michelle',   label:'Michelle',   gender:'female', accent:'American',      quality:'Neural' },
+  { match:'microsoft roger',      label:'Roger',      gender:'male',   accent:'American',      quality:'Neural' },
+  { match:'microsoft steffan',    label:'Steffan',    gender:'male',   accent:'American',      quality:'Neural' },
+  { match:'microsoft ava',        label:'Ava',        gender:'female', accent:'American',      quality:'Neural' },
+  /* Microsoft Edge Neural — en-GB */
+  { match:'microsoft libby',      label:'Libby',      gender:'female', accent:'British',       quality:'Neural' },
+  { match:'microsoft sonia',      label:'Sonia',      gender:'female', accent:'British',       quality:'Neural' },
+  { match:'microsoft emma',       label:'Emma',       gender:'female', accent:'British',       quality:'Neural' },
+  { match:'microsoft ryan',       label:'Ryan',       gender:'male',   accent:'British',       quality:'Neural' },
+  { match:'microsoft maisie',     label:'Maisie',     gender:'female', accent:'British',       quality:'Neural' },
+  { match:'microsoft thomas',     label:'Thomas',     gender:'male',   accent:'British',       quality:'Neural' },
+  /* Microsoft Edge Neural — en-AU */
+  { match:'microsoft natasha',    label:'Natasha',    gender:'female', accent:'Australian',    quality:'Neural' },
+  { match:'microsoft william',    label:'William',    gender:'male',   accent:'Australian',    quality:'Neural' },
+  { match:'microsoft wayne',      label:'Wayne',      gender:'male',   accent:'Australian',    quality:'Neural' },
+  /* Microsoft Edge Neural — en-CA */
+  { match:'microsoft clara',      label:'Clara',      gender:'female', accent:'Canadian',      quality:'Neural' },
+  { match:'microsoft liam',       label:'Liam',       gender:'male',   accent:'Canadian',      quality:'Neural' },
+  /* Microsoft Edge Neural — en-HK */
+  { match:'microsoft yan',        label:'Yan',        gender:'female', accent:'Hong Kong',     quality:'Neural' },
+  { match:'microsoft sam',        label:'Sam',        gender:'male',   accent:'Hong Kong',     quality:'Neural' },
+  /* Microsoft Edge Neural — en-IN */
+  { match:'microsoft neerja',     label:'Neerja',     gender:'female', accent:'Indian',        quality:'Neural' },
+  { match:'microsoft prabhat',    label:'Prabhat',    gender:'male',   accent:'Indian',        quality:'Neural' },
+  /* Microsoft Edge Neural — en-IE */
+  { match:'microsoft connor',     label:'Connor',     gender:'male',   accent:'Irish',         quality:'Neural' },
+  { match:'microsoft emily',      label:'Emily',      gender:'female', accent:'Irish',         quality:'Neural' },
+  /* Microsoft Edge Neural — en-KE */
+  { match:'microsoft asilia',     label:'Asilia',     gender:'female', accent:'Kenyan',        quality:'Neural' },
+  { match:'microsoft chilemba',   label:'Chilemba',   gender:'male',   accent:'Kenyan',        quality:'Neural' },
+  /* Microsoft Edge Neural — en-NZ */
+  { match:'microsoft mitchell',   label:'Mitchell',   gender:'male',   accent:'New Zealand',   quality:'Neural' },
+  { match:'microsoft molly',      label:'Molly',      gender:'female', accent:'New Zealand',   quality:'Neural' },
+  /* Microsoft Edge Neural — en-NG */
+  { match:'microsoft abeo',       label:'Abeo',       gender:'male',   accent:'Nigerian',      quality:'Neural' },
+  { match:'microsoft ezinne',     label:'Ezinne',     gender:'female', accent:'Nigerian',      quality:'Neural' },
+  /* Microsoft Edge Neural — en-PH */
+  { match:'microsoft james',      label:'James',      gender:'male',   accent:'Filipino',      quality:'Neural' },
+  { match:'microsoft rosa',       label:'Rosa',       gender:'female', accent:'Filipino',      quality:'Neural' },
+  /* Microsoft Edge Neural — en-SG */
+  { match:'microsoft luna',       label:'Luna',       gender:'female', accent:'Singaporean',   quality:'Neural' },
+  /* Microsoft Edge Neural — en-ZA */
+  { match:'microsoft leah',       label:'Leah',       gender:'female', accent:'South African', quality:'Neural' },
+  { match:'microsoft luke',       label:'Luke',       gender:'male',   accent:'South African', quality:'Neural' },
+  /* Microsoft Edge Neural — en-TZ */
+  { match:'microsoft elimu',      label:'Elimu',      gender:'male',   accent:'Tanzanian',     quality:'Neural' },
+  { match:'microsoft imani',      label:'Imani',      gender:'female', accent:'Tanzanian',     quality:'Neural' },
+  /* Microsoft Edge Neural — local/Standard */
+  { match:'microsoft david',      label:'David',      gender:'male',   accent:'American',      quality:'Standard' },
+  { match:'microsoft mark',       label:'Mark',       gender:'male',   accent:'American',      quality:'Standard' },
+  { match:'microsoft zira',       label:'Zira',       gender:'female', accent:'American',      quality:'Standard' },
 ];
 
 /* ── CLOUD VOICES (StreamElements / Amazon Polly — free, no key) ── */
@@ -617,7 +663,7 @@ async function runScript() {
     const bel = document.getElementById('block-'+i);
     if (bel) { bel.classList.add('playing-'+b.speaker); bel.scrollIntoView({behavior:'smooth',block:'nearest'}); }
     if (cloudSel[b.speaker]) {
-      await sayViaAudioElement(b.text, spd, cloudSel[b.speaker]);
+      await sayViaAudioElement(b.text, spd, cloudSel[b.speaker], vol);
     } else {
       await say(b.text, sel[b.speaker], spd, vol);
     }
@@ -698,30 +744,51 @@ function splitTextForTTS(text, maxLen) {
   return chunks;
 }
 
-function playAudioElement(url, speed) {
+function playAudioElement(url, speed, volume) {
   return new Promise((resolve, reject) => {
     const a = document.createElement('audio');
     currentDlAudio = a;
     a.src = url;
     a.playbackRate = Math.max(0.25, Math.min(4, speed));
+    if (volume != null) a.volume = Math.max(0, Math.min(1, volume));
     a.onended = () => { currentDlAudio = null; resolve(); };
     a.onerror = () => { currentDlAudio = null; reject(new Error('Audio element failed')); };
     a.play().catch(e => { currentDlAudio = null; reject(e); });
   });
 }
 
-async function sayViaAudioElement(text, speed, cloudVoiceId) {
+async function sayViaAudioElement(text, speed, cloudVoiceId, volume) {
   const chunks = splitTextForTTS(text, 200);
   for (const chunk of chunks) {
     if (stopReq) break;
     const url = cloudVoiceId
       ? 'https://api.streamelements.com/kappa/v2/speech?voice=' + cloudVoiceId + '&text=' + encodeURIComponent(chunk)
       : 'https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=' + encodeURIComponent(chunk);
-    await playAudioElement(url, speed);
+    await playAudioElement(url, speed, volume);
   }
 }
 
 /* ── DOWNLOAD AUDIO ── */
+
+/* Map each speaker to a cloud voice for recording (browser voices can't be captured) */
+function pickDownloadVoices() {
+  const result = {};
+  const used = new Set();
+  for (const spk of ['s1', 's2']) {
+    if (cloudSel[spk]) { result[spk] = cloudSel[spk]; used.add(cloudSel[spk]); continue; }
+    const voice = sel[spk];
+    const cat = voice ? matchVoice(voice) : null;
+    const gender = cat ? cat.gender : (spk === 's1' ? 'female' : 'male');
+    const accent = cat ? cat.accent : null;
+    const candidates = CLOUD_VOICES.filter(cv => cv.gender === gender && !used.has(cv.id));
+    const match = (accent ? candidates.find(cv => cv.accent === accent) : null)
+               || candidates[0]
+               || CLOUD_VOICES.find(cv => !used.has(cv.id));
+    if (match) { result[spk] = match.id; used.add(match.id); } else { result[spk] = null; }
+  }
+  return result;
+}
+
 async function generateAndDownload() {
   if (isRunning) return;
   if (!blocks.length) { pill('Add some dialog first.', false); return; }
@@ -783,11 +850,14 @@ async function generateAndDownload() {
   runBtn.classList.add('running');
   dlBtn.classList.add('running');
   stopBtn.classList.add('visible');
-  pill('Recording…', true);
-
   const spd   = parseFloat(document.getElementById('spd-sl').value);
   const vol   = parseFloat(document.getElementById('vol-sl').value);
   const pause = parseFloat(document.getElementById('pause-sl').value) * 1000;
+
+  /* Map browser voices to cloud equivalents for recording */
+  const dlVoices = pickDownloadVoices();
+  const hasSub = (!cloudSel.s1 && dlVoices.s1) || (!cloudSel.s2 && dlVoices.s2);
+  pill(hasSub ? 'Recording (using cloud voices)…' : 'Recording…', true);
 
   for (let i = 0; i < blocks.length; i++) {
     if (stopReq) break;
@@ -796,8 +866,12 @@ async function generateAndDownload() {
     document.querySelectorAll('.dialog-block').forEach(e => e.classList.remove('playing-s1', 'playing-s2'));
     const bel = document.getElementById('block-' + i);
     if (bel) { bel.classList.add('playing-' + b.speaker); bel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
-    try { await sayViaAudioElement(b.text, spd, cloudSel[b.speaker] || undefined); }
-    catch (_) { await say(b.text, sel[b.speaker], spd, vol); }
+    try {
+      await sayViaAudioElement(b.text, spd, dlVoices[b.speaker], vol);
+    } catch (_) {
+      /* Cloud voice failed — fall back to Google Translate TTS (still capturable via <audio>) */
+      try { await sayViaAudioElement(b.text, spd, null, vol); } catch (__) { /* skip block */ }
+    }
     await wait(pause);
   }
 
