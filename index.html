@@ -328,6 +328,7 @@ let stopReq = false;
 let mode = 'multi';
 let activeRecorder = null;
 let activeStream = null;
+let currentDlAudio = null;
 
 /* Selected voice objects per speaker */
 let sel = { s1: null, s2: null };
@@ -605,6 +606,7 @@ function wait(ms){return new Promise(r=>setTimeout(r,ms));}
 
 function stopAll() {
   stopReq=true; synth.cancel(); isRunning=false;
+  if (currentDlAudio) { currentDlAudio.pause(); currentDlAudio=null; }
   document.getElementById('run-btn').classList.remove('running');
   document.getElementById('dl-btn').classList.remove('running');
   document.getElementById('stop-btn').classList.remove('visible');
@@ -641,6 +643,44 @@ function triggerDownload(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
+/* ── TTS VIA <AUDIO> ELEMENT (for download capture) ── */
+function splitTextForTTS(text, maxLen) {
+  if (text.length <= maxLen) return [text];
+  const chunks = [];
+  let rest = text;
+  while (rest.length > 0) {
+    if (rest.length <= maxLen) { chunks.push(rest); break; }
+    let i = rest.lastIndexOf('. ', maxLen);
+    if (i < maxLen / 2) i = rest.lastIndexOf(', ', maxLen);
+    if (i < maxLen / 2) i = rest.lastIndexOf(' ', maxLen);
+    if (i < 1) i = maxLen;
+    chunks.push(rest.slice(0, i + 1).trim());
+    rest = rest.slice(i + 1).trim();
+  }
+  return chunks;
+}
+
+function playAudioElement(url, speed) {
+  return new Promise((resolve, reject) => {
+    const a = document.createElement('audio');
+    currentDlAudio = a;
+    a.src = url;
+    a.playbackRate = Math.max(0.25, Math.min(4, speed));
+    a.onended = () => { currentDlAudio = null; resolve(); };
+    a.onerror = () => { currentDlAudio = null; reject(new Error('Audio element failed')); };
+    a.play().catch(e => { currentDlAudio = null; reject(e); });
+  });
+}
+
+async function sayViaAudioElement(text, speed) {
+  const chunks = splitTextForTTS(text, 200);
+  for (const chunk of chunks) {
+    if (stopReq) break;
+    const url = 'https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=' + encodeURIComponent(chunk);
+    await playAudioElement(url, speed);
+  }
+}
+
 /* ── DOWNLOAD AUDIO ── */
 async function generateAndDownload() {
   if (isRunning) return;
@@ -668,8 +708,7 @@ async function generateAndDownload() {
     return;
   }
 
-  /* Stop video track — we only need audio */
-  stream.getVideoTracks().forEach(t => t.stop());
+  /* Keep video track alive — stopping it can end audio capture in some browsers */
 
   const audioTracks = stream.getAudioTracks();
   if (!audioTracks.length) {
@@ -693,10 +732,10 @@ async function generateAndDownload() {
   activeRecorder = recorder;
   activeStream = stream;
 
-  /* Start recording */
-  recorder.start();
+  /* Start recording – timeslice for reliable data collection */
+  recorder.start(250);
 
-  /* Play the script (reuse playback logic) */
+  /* Play the script */
   isRunning = true; stopReq = false;
   const runBtn = document.getElementById('run-btn');
   const dlBtn  = document.getElementById('dl-btn');
@@ -717,7 +756,8 @@ async function generateAndDownload() {
     document.querySelectorAll('.dialog-block').forEach(e => e.classList.remove('playing-s1', 'playing-s2'));
     const bel = document.getElementById('block-' + i);
     if (bel) { bel.classList.add('playing-' + b.speaker); bel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
-    await say(b.text, sel[b.speaker], spd, vol);
+    try { await sayViaAudioElement(b.text, spd); }
+    catch (_) { await say(b.text, sel[b.speaker], spd, vol); }
     await wait(pause);
   }
 
@@ -727,6 +767,9 @@ async function generateAndDownload() {
   runBtn.classList.remove('running');
   dlBtn.classList.remove('running');
   stopBtn.classList.remove('visible');
+
+  /* Brief tail to capture any remaining audio */
+  await wait(300);
 
   /* Stop recording and trigger download */
   const wasStopped = stopReq;
@@ -752,6 +795,16 @@ async function generateAndDownload() {
       const actx = new (window.AudioContext || window.webkitAudioContext)();
       const audioBuf = await actx.decodeAudioData(arrayBuf);
       actx.close();
+
+      /* Silence check — warn if recording captured no speech */
+      const ch0 = audioBuf.getChannelData(0);
+      let peak = 0;
+      for (let j = 0; j < ch0.length; j += 100) { const a = Math.abs(ch0[j]); if (a > peak) peak = a; }
+      if (peak < 0.001) {
+        pill('Recording is silent — make sure you ticked "Also share tab audio".', false);
+        setTimeout(() => pill('', false), 5000);
+        return;
+      }
 
       const sampleRate = audioBuf.sampleRate;
       const numChannels = audioBuf.numberOfChannels;
