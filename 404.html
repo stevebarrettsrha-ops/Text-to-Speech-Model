@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#141414">
+<meta name="color-scheme" content="dark">
+<title>Page not found — Script Builder</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Ctext x='16' y='22.5' font-family='Arial,Helvetica,sans-serif' font-size='19' font-weight='700' fill='%23fff' text-anchor='middle'%3ES%3C/text%3E%3C/svg%3E">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{font-family:'Inter',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:#141414;color:#f0f0f0;display:flex;align-items:center;justify-content:center;padding:1.5rem}
+.card{max-width:440px;width:100%;background:#1c1c1c;border:1px solid #2e2e2e;border-radius:12px;padding:2rem 1.75rem;text-align:center}
+.logo{width:42px;height:42px;background:#4f46e5;border-radius:11px;display:inline-flex;align-items:center;justify-content:center;font-weight:700;font-size:19px;margin-bottom:1rem}
+h1{font-size:19px;font-weight:600;margin-bottom:.5rem}
+p{font-size:13.5px;color:#999;line-height:1.65}
+.btn{display:inline-block;margin-top:1.25rem;padding:10px 20px;background:#f0f0f0;color:#141414;border-radius:8px;text-decoration:none;font-weight:600;font-size:13px}
+.btn:hover{opacity:.85}
+.small{margin-top:1rem;font-size:11.5px;color:#666;word-break:break-all}
+</style>
+</head>
+<body>
+<main class="card">
+  <div class="logo">S</div>
+  <h1>Page not found</h1>
+  <p>That address doesn't exist on this site. The app lives at the address below &mdash; you'll be taken there in a moment.</p>
+  <a class="btn" id="home" href="/Text-to-Speech-Model/">Open Script Builder</a>
+  <p class="small" id="dest"></p>
+</main>
+<script>
+(function () {
+  /* GitHub project sites live under /<repo>/ — keep that segment; anything else goes to the site root. */
+  var seg = location.pathname.split('/').filter(Boolean);
+  var base = seg.length > 1 ? '/' + seg[0] + '/' : '/';
+  document.getElementById('home').href = base;
+  document.getElementById('dest').textContent = location.origin + base;
+  if (location.pathname !== base) setTimeout(function () { location.replace(base); }, 1500);
+})();
+</script>
+</body>
+</html>

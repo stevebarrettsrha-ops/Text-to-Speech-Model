@@ -4,6 +4,15 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Script Builder — Natural Voices</title>
+<meta name="description" content="Build single- or multi-speaker scripts, hear them read aloud with natural neural voices, and download the audio. Free and runs entirely in your browser.">
+<meta name="theme-color" content="#141414">
+<meta name="color-scheme" content="dark">
+<meta property="og:title" content="Script Builder — Natural Voices">
+<meta property="og:description" content="Build multi-speaker scripts, hear them read aloud with natural voices, and download the audio.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Ctext x='16' y='22.5' font-family='Arial,Helvetica,sans-serif' font-size='19' font-weight='700' fill='%23fff' text-anchor='middle'%3ES%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
 <style>
@@ -148,16 +157,40 @@ input[type=range].mslider{width:100%;accent-color:var(--accent);height:3px;}
 .chrome-hint a{color:#818cf8;text-decoration:underline;cursor:pointer;}
 .hint-close{margin-left:auto;cursor:pointer;color:var(--muted);font-size:16px;line-height:1;}
 .hint-close:hover{color:var(--text);}
+
+/* Title bar never forces the page wider than the viewport */
+.titlebar{overflow-x:auto;overflow-y:hidden;white-space:nowrap;}
+
+/* ── RESPONSIVE: stack the panels on narrow screens ── */
+@media (max-width: 900px){
+  html,body{height:auto;min-height:100vh;overflow:auto;}
+  .workspace{flex:none;flex-direction:column;overflow:visible;}
+  .raw-panel{display:none;}
+  .builder-panel,.settings-panel{width:100%;overflow:visible;}
+  .builder-scroll,.set-scroll{overflow:visible;padding-bottom:1rem;}
+  .settings-panel{border-left:none;border-top:1px solid var(--border);}
+  .bottombar{position:sticky;bottom:0;z-index:5;height:auto;min-height:52px;flex-wrap:wrap;padding:.55rem .8rem;}
+  .bottombar .preset-btn{display:none;}
+  .titlebar{padding:0 .8rem;gap:.5rem;}
+  .titlebar .tb-btn{padding:5px 8px;}
+  .kb{display:none;}
+  .dialog-block .d-actions{opacity:1;}
+}
+@media (max-width: 480px){
+  .logo-text{display:none;}
+}
 </style>
 </head>
 <body>
 
 <div class="titlebar">
-  <div class="logo"><div class="logo-icon">S</div> Script Builder</div>
+  <div class="logo"><div class="logo-icon">S</div><span class="logo-text">Script Builder</span></div>
   <div class="tb-sep"></div>
   <button class="tb-btn" onclick="loadPreset('podcast')">Podcast</button>
   <button class="tb-btn" onclick="loadPreset('assistant')">Assistant</button>
   <button class="tb-btn" onclick="loadPreset('movie')">Movie</button>
+  <div class="tb-sep"></div>
+  <button class="tb-btn" onclick="clearScript()" title="Start a new, empty script">New</button>
 </div>
 
 <div id="nosup">Web Speech API not supported — please use Google Chrome or Microsoft Edge.</div>
@@ -317,8 +350,14 @@ input[type=range].mslider{width:100%;accent-color:var(--accent);height:3px;}
 </div>
 
 <script>
-const synth = window.speechSynthesis;
-if (!synth) document.getElementById('nosup').style.display = 'block';
+const synth = window.speechSynthesis || null;
+if (!synth) {
+  const ns = document.getElementById('nosup');
+  ns.textContent = 'Built-in browser voices are not available here — cloud voices will be used instead. For built-in neural voices, open this page in Google Chrome or Microsoft Edge.';
+  ns.style.display = 'block';
+}
+function cancelSpeech() { if (synth) synth.cancel(); }
+function esc(s) { return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 
 let allVoices = [];
 let blocks = [];
@@ -333,6 +372,7 @@ let needsCaptureFallback = false;
 /* Selected voice objects per speaker */
 let sel = { s1: null, s2: null };
 let cloudSel = { s1: null, s2: null }; /* null = browser voice, string = cloud voice ID */
+let userPicked = { s1: null, s2: null }; /* voice label the user chose explicitly; restored when the list re-renders */
 
 /* ── AVATAR COLORS ── */
 const COLORS = ['#4f46e5','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#ec4899','#0ea5e9','#f97316','#84cc16'];
@@ -443,7 +483,7 @@ function matchVoice(v) {
 
 /* ── POPULATE VOICE CARDS ── */
 function populateVoices() {
-  allVoices = synth.getVoices();
+  allVoices = synth ? synth.getVoices() : [];
 
   /* Find browser voices that match our natural catalog */
   const matched = [];
@@ -509,7 +549,10 @@ function renderVoiceDropdown(containerId, voiceList, spk) {
     else                    { cloudSel[spk] = null; sel[spk] = m.voice; }
   }
 
-  select.addEventListener('change', applySelection);
+  select.addEventListener('change', () => {
+    applySelection();
+    userPicked[spk] = voiceList[parseInt(select.value)].label;
+  });
 
   const prevBtn = document.createElement('button');
   prevBtn.className = 'voice-preview-btn';
@@ -525,12 +568,16 @@ function renderVoiceDropdown(containerId, voiceList, spk) {
   wrap.appendChild(prevBtn);
   container.appendChild(wrap);
 
-  /* Auto-select first voice */
+  /* Keep the user's explicit choice across re-renders (voiceschanged), otherwise pick the first voice */
+  if (userPicked[spk]) {
+    const prev = voiceList.findIndex(m => m.label === userPicked[spk]);
+    if (prev >= 0) select.value = String(prev);
+  }
   applySelection();
 }
 
 function previewVoice(voice, label) {
-  synth.cancel();
+  cancelSpeech();
   if (currentDlAudio) { currentDlAudio.pause(); currentDlAudio = null; }
   const u = new SpeechSynthesisUtterance(`Hi, I'm ${label}.`);
   u.voice = voice; u.rate = 1; u.volume = 1;
@@ -538,7 +585,7 @@ function previewVoice(voice, label) {
 }
 
 function previewCloudVoice(voiceId, label) {
-  synth.cancel();
+  cancelSpeech();
   if (currentDlAudio) { currentDlAudio.pause(); currentDlAudio = null; }
   const cleanLabel = label.replace(/[()]/g, '').trim();
   const url = 'https://api.streamelements.com/kappa/v2/speech?voice=' + voiceId + '&text=' + encodeURIComponent("Hi, I'm " + cleanLabel + '.');
@@ -569,7 +616,7 @@ function previewCloudVoice(voiceId, label) {
   });
 }
 
-synth.onvoiceschanged = populateVoices;
+if (synth) synth.onvoiceschanged = populateVoices;
 populateVoices();
 
 /* ── MODE ── */
@@ -623,10 +670,10 @@ function renderBlock(i) {
       <button class="ibt" onclick="delBlock(${i})">✕</button>
     </div>
     <button class="dialog-speaker ${b.speaker}" onclick="${mode==='multi'?`flipSpeaker(${i})`:'void(0)'}">
-      <div class="ddot"></div>${nm}
+      <div class="ddot"></div>${esc(nm)}
     </button>
     <textarea class="dialog-text" id="t-${i}" placeholder="Type dialog here…" rows="2"
-      oninput="blocks[${i}].text=this.value;resize(this);updateRaw()">${b.text}</textarea>`;
+      oninput="blocks[${i}].text=this.value;resize(this);updateRaw()">${esc(b.text)}</textarea>`;
   document.getElementById('dlist').appendChild(el);
   resize(el.querySelector('textarea'));
 }
@@ -641,6 +688,50 @@ function updateRaw() {
   let r = st ? st+'\n' : '';
   blocks.forEach(b => { r += `${spkName(b.speaker)}: ${b.text||'…'}\n`; });
   document.getElementById('raw-text').textContent = r.trim() || '—';
+  scheduleSave();
+}
+
+/* ── AUTOSAVE (localStorage) ── */
+const STORAGE_KEY = 'scriptBuilder.v1';
+let saveTimer = null;
+function scheduleSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveState, 200);
+}
+function saveState() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      style: document.getElementById('style-input').value,
+      names: { s1: document.getElementById('name-s1').value, s2: document.getElementById('name-s2').value },
+      mode,
+      blocks: blocks.map(b => ({ speaker: b.speaker, text: b.text })),
+    }));
+  } catch (_) { /* storage unavailable (private mode, quota) — nothing to do */ }
+}
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return false;
+    const st = JSON.parse(raw);
+    if (!st || !Array.isArray(st.blocks) || !st.blocks.length) return false;
+    document.getElementById('style-input').value = typeof st.style === 'string' ? st.style : '';
+    for (const s of ['s1', 's2']) {
+      const v = st.names && typeof st.names[s] === 'string' ? st.names[s] : '';
+      document.getElementById('name-' + s).value = v;
+      const hd = document.getElementById(s + '-hd');
+      if (hd) hd.textContent = (v || (s === 's1' ? 'Speaker 1' : 'Speaker 2')) + ' settings';
+    }
+    blocks = st.blocks
+      .filter(b => b && (b.speaker === 's1' || b.speaker === 's2'))
+      .map(b => ({ speaker: b.speaker, text: typeof b.text === 'string' ? b.text : '' }));
+    setMode(st.mode === 'single' ? 'single' : 'multi');
+    return blocks.length > 0;
+  } catch (_) { return false; }
+}
+function clearScript() {
+  if (blocks.some(b => b.text.trim()) && !confirm('Start a new script? The current dialog will be cleared.')) return;
+  blocks = [];
+  addBlock();
 }
 
 /* ── PRESETS ── */
@@ -714,8 +805,12 @@ async function runScript() {
 }
 
 function say(text, voice, rate=1, volume=1) {
+  if (!synth) {
+    /* No browser speech engine here — play through the cloud fallback instead */
+    return sayViaAudioElement(text, rate, null, volume).catch(() => {});
+  }
   return new Promise(res => {
-    synth.cancel();
+    cancelSpeech();
     const u = new SpeechSynthesisUtterance(text);
     u.voice=voice||null; u.rate=rate; u.volume=volume; u.pitch=1;
     u.onend=res; u.onerror=res; synth.speak(u);
@@ -724,7 +819,7 @@ function say(text, voice, rate=1, volume=1) {
 function wait(ms){return new Promise(r=>setTimeout(r,ms));}
 
 function stopAll() {
-  stopReq=true; synth.cancel(); isRunning=false;
+  stopReq=true; cancelSpeech(); isRunning=false;
   if (currentDlAudio) { currentDlAudio.pause(); currentDlAudio=null; }
   document.getElementById('run-btn').classList.remove('running');
   document.getElementById('dl-btn').classList.remove('running');
@@ -968,7 +1063,7 @@ async function downloadViaFetch(dlVoices, spd, pause) {
       outputBuf = await offCtx.startRendering();
     }
 
-    encodeAndDownloadMp3(outputBuf);
+    encodeAndDownload(outputBuf);
   } finally {
     actx.close();
   }
@@ -1042,7 +1137,7 @@ async function downloadViaCapture(dlVoices, spd, pause) {
           return;
         }
 
-        encodeAndDownloadMp3(audioBuf);
+        encodeAndDownload(audioBuf);
       } catch (err) {
         console.error('MP3 conversion failed:', err);
         triggerDownload(webmBlob, 'script-audio.webm');
@@ -1106,6 +1201,44 @@ async function downloadViaCapture(dlVoices, spd, pause) {
   });
 }
 
+/* ── Encoding dispatcher: MP3 when the encoder loaded, WAV otherwise ── */
+function encodeAndDownload(audioBuf) {
+  if (typeof lamejs !== 'undefined' && lamejs && lamejs.Mp3Encoder) {
+    try { encodeAndDownloadMp3(audioBuf); return; }
+    catch (err) { console.error('MP3 encoding failed, falling back to WAV:', err); }
+  }
+  triggerDownload(encodeWav(audioBuf), 'script-audio.wav');
+  pill('Downloaded as WAV (MP3 encoder unavailable).', false);
+  setTimeout(() => pill('', false), 3500);
+}
+
+/* 16-bit PCM WAV encoder — no dependencies */
+function encodeWav(audioBuf) {
+  const numChannels = Math.min(2, audioBuf.numberOfChannels);
+  const sampleRate = audioBuf.sampleRate;
+  const frames = audioBuf.length;
+  const dataBytes = frames * numChannels * 2;
+  const out = new ArrayBuffer(44 + dataBytes);
+  const v = new DataView(out);
+  const str = (o, txt) => { for (let i = 0; i < txt.length; i++) v.setUint8(o + i, txt.charCodeAt(i)); };
+  str(0, 'RIFF'); v.setUint32(4, 36 + dataBytes, true); str(8, 'WAVE');
+  str(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, numChannels, true); v.setUint32(24, sampleRate, true);
+  v.setUint32(28, sampleRate * numChannels * 2, true); v.setUint16(32, numChannels * 2, true); v.setUint16(34, 16, true);
+  str(36, 'data'); v.setUint32(40, dataBytes, true);
+  const chans = [];
+  for (let c = 0; c < numChannels; c++) chans.push(audioBuf.getChannelData(c));
+  let o = 44;
+  for (let i = 0; i < frames; i++) {
+    for (let c = 0; c < numChannels; c++) {
+      const smp = Math.max(-1, Math.min(1, chans[c][i]));
+      v.setInt16(o, smp < 0 ? smp * 0x8000 : smp * 0x7FFF, true);
+      o += 2;
+    }
+  }
+  return new Blob([out], { type: 'audio/wav' });
+}
+
 /* ── Shared MP3 encoding ── */
 function encodeAndDownloadMp3(audioBuf) {
   const sampleRate = audioBuf.sampleRate;
@@ -1143,7 +1276,18 @@ document.addEventListener('keydown',e=>{
   if(e.key==='Escape'&&isRunning)stopAll();
 });
 
-loadPreset('podcast');
+window.addEventListener('error', () => {
+  pill('Something went wrong — check the browser console.', false);
+  setTimeout(() => pill('', false), 4000);
+});
+window.addEventListener('unhandledrejection', e => {
+  console.error(e.reason);
+  pill('Something went wrong — check the browser console.', false);
+  setTimeout(() => pill('', false), 4000);
+});
+
+/* Restore the last session, or start from the podcast example */
+if (!loadState()) loadPreset('podcast');
 </script>
 </body>
 </html>
