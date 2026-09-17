@@ -15,6 +15,14 @@
    instead of scrolling its own chips. And a media query adds no specificity, so
    plain `.app` inside `@media` loses to `body.solo .app`, which left Models and
    Engine on the desktop rail. Both are named explicitly in the 760px block.
+1d. **`playTake` takes a start index, never a sliced take, and owns the player
+   by token.** `stepLine` used to hand it `lines.slice(next)`, and that copy
+   became `S.take`: "line 2 of 3" renumbered itself to "line 1 of 2", and the
+   lines it dropped were the ones ⏮ needed, so one press of ⏭ left the other
+   button with nowhere to go. The token matters because `stepLine` starts the
+   next playback 120ms after telling the current one to stop — without it the
+   older run reaches its cleanup last and switches the player off underneath
+   its replacement.
 2. **Never hard-code a ComfyUI workflow.** `comfy.py` builds each graph from
    `/object_info` and matches inputs through candidate-name lists. The
    Qwen-TTS node renames inputs between releases; a schema read turns that into
@@ -116,3 +124,8 @@ The gap between clips is a whole number of **frames**, never a rounded byte
 count. `int(rate * pause * sampwidth * nchannels)` can land on half a frame —
 0.75s at 22050 Hz stereo is one such — and every sample after it plays in the
 wrong channel.
+
+A refusal **raises**, so the one `except` deletes the half-built file. Returning
+False from inside the `with` left the clips written so far on disk as `take.wav`
+— a file that looks exactly like the joined take, holding one line of it, next
+to the zip the caller then made.

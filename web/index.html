@@ -695,7 +695,7 @@ var S = {
   },
   voices: { speakers: [], models: [], attentions: [], capabilities: {} },
   status: null, job: null, jobs: [], take: null, takes: [], libFilter: "",
-  playing: false, stopped: false, playIndex: -1, repeat: false,
+  playing: false, stopped: false, playIndex: -1, repeat: false, playToken: 0,
   setupCursor: 0, taskId: null, taskCursor: 0, setupSeen: false
 };
 function $(id) { return document.getElementById(id); }
@@ -1145,8 +1145,12 @@ function highlight(index) {
 }
 
 /* ========================= playback ========================= */
-async function playTake(take, quiet) {
+async function playTake(take, quiet, startAt) {
   if (!take) return;
+  // Every call claims the player. An earlier run that is still unwinding —
+  // stepLine starts the next one 120ms after telling this one to stop — must
+  // not run the cleanup at the bottom over the top of its replacement.
+  var token = ++S.playToken;
   S.take = take;
   S.stopped = false;
   S.playing = true;
@@ -1157,9 +1161,10 @@ async function playTake(take, quiet) {
   paintArt($("npArt").querySelector("canvas"), take.id + (take.style || ""));
   $("playIcon").innerHTML = '<path d="M7 5h4v14H7zM13 5h4v14h-4z"/>';
   var pause = (take.pause || 0) * 1000;
+  var from = Math.max(0, Math.min(take.lines.length - 1, startAt || 0));
   do {
-    for (var i = 0; i < take.lines.length; i++) {
-      if (S.stopped) break;
+    for (var i = from; i < take.lines.length; i++) {
+      if (S.stopped || token !== S.playToken) break;
       S.playIndex = i;
       $("lineFlag").textContent = "line " + (i + 1) + " of " + take.lines.length;
       if (!quiet) highlight(take.lines[i].index);
@@ -1172,7 +1177,9 @@ async function playTake(take, quiet) {
       }
       if (i < take.lines.length - 1 && pause && !S.stopped) await wait(pause);
     }
-  } while (S.repeat && !S.stopped);
+    from = 0;   // a repeat pass starts from the top, not from where we came in
+  } while (S.repeat && !S.stopped && token === S.playToken);
+  if (token !== S.playToken) return;   // a newer playback owns the player now
   highlight(-1);
   S.playing = false;
   S.playIndex = -1;
@@ -1219,11 +1226,13 @@ function stepLine(d) {
   S.stopped = true;
   var next = Math.max(0, Math.min(S.take.lines.length - 1, S.playIndex + d));
   var take = S.take;
+  // Start the take again at another line — never a copy with the earlier lines
+  // sliced off it. That copy became S.take, so "line 2 of 3" renumbered itself
+  // to "line 1 of 2", and the lines it dropped were the ones ⏮ needed to go
+  // back to: one press of ⏭ and the other button could never leave that spot.
   setTimeout(function () {
     S.stopped = false;
-    S.playIndex = next - 1;
-    var rest = Object.assign({}, take, { lines: take.lines.slice(next) });
-    playTake(rest, false);
+    playTake(take, false, next);
   }, 120);
 }
 

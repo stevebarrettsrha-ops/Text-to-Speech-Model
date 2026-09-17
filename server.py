@@ -96,7 +96,12 @@ def stitch_wavs(paths: list[Path], dest: Path, pause: float) -> bool:
                 with wave.open(str(p), "rb") as w:
                     if (w.getnchannels(), w.getsampwidth(), w.getframerate()) != \
                             (params.nchannels, params.sampwidth, params.framerate):
-                        return False
+                        # Raised, not returned: by the time a mismatch shows up
+                        # the earlier clips are already written, and returning
+                        # from inside the `with` left that half-built file on
+                        # disk next to the zip the caller then made — a wav
+                        # that looks like the take and holds one line of it.
+                        raise ValueError("clip formats differ")
                     out.writeframes(w.readframes(w.getnframes()))
                 if i < len(paths) - 1 and gap:
                     out.writeframes(gap)
