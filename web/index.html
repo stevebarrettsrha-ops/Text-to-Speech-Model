@@ -1648,8 +1648,9 @@ async function pollSetup() {
   }
   var list = $("step-list");
   list.innerHTML = "";
-  Object.keys(st.steps).forEach(function (k) {
-    var s = st.steps[k];
+  // An array, in the order the steps run — a plain object would come back
+  // with its keys sorted, which is not the order anything happens in.
+  (st.steps || []).forEach(function (s) {
     var d = document.createElement("div");
     d.className = "step " + s.state;
     d.innerHTML = '<span class="mark">' +

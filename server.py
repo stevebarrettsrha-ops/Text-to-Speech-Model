@@ -22,8 +22,9 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 
 import bootstrap
 import manager
-from bootstrap import (APP_DIR, ComfyProcess, Progress, comfy_online,
-                       detect_comfy_dirs, load_config, save_config)
+from bootstrap import (APP_DIR, ComfyProcess, Progress, clean_url,
+                       comfy_online, comfy_port, detect_comfy_dirs,
+                       load_config, save_config)
 from comfy import ComfyClient, ComfyError
 
 DATA_DIR = APP_DIR / "data"
@@ -86,8 +87,11 @@ def stitch_wavs(paths: list[Path], dest: Path, pause: float) -> bool:
             params = first.getparams()
         with wave.open(str(dest), "wb") as out:
             out.setparams(params)
-            gap = b"\x00" * int(params.framerate * max(pause, 0)
-                                * params.sampwidth * params.nchannels)
+            # Whole frames only. Rounding the byte count instead lets a pause
+            # like 0.75s at 22050 Hz stereo end on half a frame, and every
+            # sample after it lands in the wrong channel.
+            frame = params.sampwidth * params.nchannels
+            gap = b"\x00" * (int(params.framerate * max(pause, 0)) * frame)
             for i, p in enumerate(paths):
                 with wave.open(str(p), "rb") as w:
                     if (w.getnchannels(), w.getsampwidth(), w.getframerate()) != \
@@ -157,7 +161,12 @@ def run_job(job_id: str, payload: dict) -> None:
 
         for i, line in enumerate(lines):
             key = str(line.get("speaker", 1))
-            voice = speakers.get(key) or speakers.get(int(key), {}) or {}
+            # JSON object keys are strings, but a take loaded back can carry
+            # integer ones. A key that is neither is a speaker we do not have,
+            # not a reason to fail the whole job.
+            voice = speakers.get(key) or {}
+            if not voice and key.isdigit():
+                voice = speakers.get(int(key)) or {}
             set_state(stage=f"Line {i + 1} of {len(lines)} · "
                             f"{voice.get('name') or 'Speaker ' + key}",
                       pct=round(i / max(len(lines), 1) * 100, 1),
@@ -294,7 +303,8 @@ def api_setup_start():
                 "want_voicedesign"):
         if key in body:
             cfg[key] = body[key]
-    client.url = cfg["comfy_url"].rstrip("/")
+    cfg["comfy_url"] = clean_url(cfg.get("comfy_url")) or client.url
+    client.url = cfg["comfy_url"]
     save_config(cfg)
     progress.__init__()
     threading.Thread(target=bootstrap.run_setup,
@@ -317,8 +327,11 @@ def api_comfy_start():
     py = bootstrap.comfy_python(cfg)
     if not cfg.get("comfy_dir") or not py:
         return jsonify({"error": "Run setup first."}), 400
-    port = int(cfg["comfy_url"].rsplit(":", 1)[-1])
-    comfy_proc.start(py, Path(cfg["comfy_dir"]), port, progress)
+    try:
+        comfy_proc.start(py, Path(cfg["comfy_dir"]),
+                         comfy_port(cfg["comfy_url"]), progress)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 400
     return jsonify({"ok": True})
 
 
@@ -329,7 +342,8 @@ def api_config():
                 "torch_index", "want_clone", "want_17b", "want_voicedesign"):
         if key in body:
             cfg[key] = body[key]
-    client.url = cfg["comfy_url"].rstrip("/")
+    cfg["comfy_url"] = clean_url(cfg.get("comfy_url")) or client.url
+    client.url = cfg["comfy_url"]
     save_config(cfg)
     return jsonify({"ok": True})
 
@@ -558,8 +572,14 @@ def main() -> None:
             and cfg.get("comfy_dir") and bootstrap.comfy_python(cfg) \
             and not comfy_online(cfg["comfy_url"]):
         progress.log("Restarting ComfyUI from the last setup…")
-        comfy_proc.start(bootstrap.comfy_python(cfg), Path(cfg["comfy_dir"]),
-                         int(cfg["comfy_url"].rsplit(":", 1)[-1]), progress)
+        # An engine that cannot be started is an engine the Engine panel
+        # reports as offline, never a reason the whole app fails to boot.
+        try:
+            comfy_proc.start(bootstrap.comfy_python(cfg),
+                             Path(cfg["comfy_dir"]),
+                             comfy_port(cfg["comfy_url"]), progress)
+        except RuntimeError as exc:
+            progress.log(f"Could not restart ComfyUI: {exc}")
     url = f"http://127.0.0.1:{PORT}"
     print(f"\n  Script Builder  →  {url}\n")
     if os.environ.get("SCRIPT_BUILDER_NO_BROWSER") != "1":

@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 
@@ -38,6 +39,42 @@ NODE_REPO = "https://github.com/flybirdxx/ComfyUI-Qwen-TTS.git"
 NODE_DIR_NAME = "ComfyUI-Qwen-TTS"
 
 HF_BASE = "https://huggingface.co"
+DEFAULT_COMFY_URL = "http://127.0.0.1:8188"
+
+
+def clean_url(url) -> str:
+    """A base URL fit to build requests on, or "" if it cannot be made into one.
+
+    No stray whitespace and no trailing slash — appending /system_stats to
+    "http://host:8188/" asks for //system_stats, which is a 404, not a health
+    check. A bare "localhost:8188", which is what people type, gains the scheme
+    it is missing; anything with no host at all comes back empty so the caller
+    can keep whatever address was already working.
+    """
+    text = url.strip().rstrip("/") if isinstance(url, str) else ""
+    if not text:
+        return ""
+    if "://" not in text:
+        text = "http://" + text
+    parts = urlsplit(text)
+    if (parts.scheme not in ("http", "https") or not parts.hostname
+            or any(ch.isspace() for ch in parts.netloc)):
+        return ""
+    return text
+
+
+def comfy_port(url: str) -> int:
+    """The port to start ComfyUI on, read out of its URL.
+
+    This used to be int(url.rsplit(":")[-1]), which blew up on a trailing slash
+    or a port-less address — typed once into Settings, that config stopped the
+    server from booting at all.
+    """
+    try:
+        port = urlsplit(clean_url(url) or DEFAULT_COMFY_URL).port
+    except ValueError:
+        port = None
+    return port or 8188
 
 # The Qwen3-TTS collection on HuggingFace. The custom node looks for these
 # under ComfyUI/models/qwen-tts/Qwen/<folder>.
@@ -69,7 +106,7 @@ GROUP_FLAG = {"core": None, "preset": None, "clone": "want_clone",
               "design": "want_voicedesign"}
 
 DEFAULT_CONFIG = {
-    "comfy_url": "http://127.0.0.1:8188",
+    "comfy_url": DEFAULT_COMFY_URL,
     "comfy_dir": "",
     "models_dir": "",        # ComfyUI/models
     "python": "",            # interpreter that runs ComfyUI
@@ -99,6 +136,9 @@ def load_config() -> dict:
             cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
         except Exception:
             pass
+    # Heal a URL saved before it was normalised — a trailing slash in here used
+    # to keep the whole app from starting.
+    cfg["comfy_url"] = clean_url(cfg.get("comfy_url")) or DEFAULT_COMFY_URL
     return cfg
 
 
@@ -162,7 +202,13 @@ class Progress:
         with self._lock:
             return {"running": self.running, "done": self.done,
                     "error": self.error, "step": self.step,
-                    "steps": json.loads(json.dumps(self.steps)),
+                    # A list, in the order the steps actually happen. This used
+                    # to be the dict itself, and Flask sorts the keys of every
+                    # dict it sends — which listed Check Python last, after the
+                    # step that starts the engine, on the one screen where
+                    # order is the whole point.
+                    "steps": [{"key": key, **self.steps[key]}
+                              for key, _ in self.STEPS],
                     "cursor": len(self.lines), "lines": self.lines[since:]}
 
 
@@ -223,17 +269,71 @@ def venv_python(comfy_dir: Path) -> Path:
                    else "bin/python")
 
 
+def _interpreters(comfy_dir: Path) -> list[Path]:
+    """Where a ComfyUI install keeps the interpreter it runs on, best first.
+
+    Portable python_embeded leads, as the install instructions say. After it
+    come the environments an install someone else set up keeps beside or inside
+    its own folder — an existing ComfyUI already has torch in one of these, and
+    the node's requirements have to land in the same place or ComfyUI will not
+    import them. Our own comfy-venv is last, because it only exists when we
+    built it.
+    """
+    win = platform.system() == "Windows"
+    exe = "Scripts/python.exe" if win else "bin/python"
+    cands: list[Path] = []
+    if win:
+        cands += [comfy_dir.parent / "python_embeded" / "python.exe",
+                  comfy_dir / "python_embeded" / "python.exe"]
+    cands += [comfy_dir / "venv" / exe,
+              comfy_dir / ".venv" / exe,
+              comfy_dir.parent / "venv" / exe,
+              comfy_dir.parent / ".venv" / exe]
+    if win:
+        cands += [comfy_dir.parent / "python_standalone" / "python.exe"]
+    else:
+        cands += [comfy_dir.parent / "python_standalone" / "bin" / "python"]
+    cands += [venv_python(comfy_dir)]
+    return cands
+
+
+def existing_python(comfy_dir: Path) -> str:
+    """The interpreter an existing ComfyUI already runs on, if we can find it.
+
+    Tested by running it, never by its path alone — the same rule as
+    find_python(). An install whose environment has torch wins outright; a
+    working interpreter without torch is the fallback, because it is still that
+    install's own environment and ours has no business replacing it.
+    """
+    fallback = ""
+    for cand in _interpreters(comfy_dir):
+        try:
+            if not cand.exists():
+                continue
+            out = _run([str(cand), "-c", "import importlib.util as u;"
+                                         "print(bool(u.find_spec('torch')))"],
+                       timeout=60)
+        except Exception:
+            continue
+        if out.returncode != 0:
+            continue
+        if out.stdout.strip().splitlines()[-1:] == ["True"]:
+            return str(cand)
+        fallback = fallback or str(cand)
+    return fallback
+
+
 def comfy_python(cfg: dict) -> str:
-    """Whichever interpreter ComfyUI runs on: portable first, then our venv,
-    then whatever was recorded during setup."""
+    """Whichever interpreter ComfyUI runs on: portable first, then the
+    environment the install already has, then whatever setup recorded."""
     comfy_dir = Path(cfg["comfy_dir"]) if cfg.get("comfy_dir") else None
     if comfy_dir:
         p = portable_python(comfy_dir)
         if p:
             return str(p)
-        v = venv_python(comfy_dir)
-        if v.exists():
-            return str(v)
+        found = existing_python(comfy_dir)
+        if found:
+            return found
     return cfg.get("python") or ""
 
 
@@ -387,10 +487,15 @@ def download_file(cfg: dict, repo: str, path: str, dest: Path,
             raise RuntimeError("HuggingFace refused the download. Add a token "
                                "with access to this repo.")
         r.raise_for_status()
-        total = int(r.headers.get("Content-Length", 0)) + have
-        mode = "ab" if (have and r.status_code == 206) else "wb"
-        if mode == "wb":
+        # A 206 means the server honoured the Range header and Content-Length
+        # covers only what is left; a 200 means it ignored it and is sending
+        # the whole file again, so what is already on disk does not count —
+        # towards the total either, or the progress readout runs past 100%.
+        resuming = bool(have) and r.status_code == 206
+        mode = "ab" if resuming else "wb"
+        if not resuming:
             have = 0
+        total = int(r.headers.get("Content-Length", 0)) + have
         got, last = have, 0.0
         with open(part, mode) as fh:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -449,17 +554,29 @@ class ComfyProcess:
 
     def start(self, python: str, comfy_dir: Path, port: int,
               prog: Progress) -> None:
+        """Raises RuntimeError with a sentence a person can act on. A ComfyUI
+        folder that has moved, or an interpreter that is gone, is an engine
+        that cannot start — never a reason the whole app fails to boot."""
         if self.alive():
             return
+        if not (comfy_dir / "main.py").exists():
+            raise RuntimeError(
+                f"There is no ComfyUI at {comfy_dir} any more — the folder has "
+                "moved or been deleted. Run setup again from Settings.")
         cmd = [python, "main.py", "--listen", "127.0.0.1", "--port", str(port),
                "--disable-auto-launch"]
         prog.log("Launching ComfyUI: " + " ".join(cmd))
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) \
             if platform.system() == "Windows" else 0
-        self.proc = subprocess.Popen(cmd, cwd=str(comfy_dir),
-                                     stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, text=True,
-                                     bufsize=1, creationflags=flags)
+        try:
+            self.proc = subprocess.Popen(cmd, cwd=str(comfy_dir),
+                                         stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, text=True,
+                                         bufsize=1, creationflags=flags)
+        except OSError as exc:
+            raise RuntimeError(
+                f"ComfyUI could not be started with {python} — {exc}. "
+                "Run setup again from Settings.") from exc
         threading.Thread(target=self._pump, args=(prog,), daemon=True).start()
 
     def _pump(self, prog: Progress) -> None:
@@ -634,15 +751,31 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
         if mode == "external":
             prog.finish("deps", "Handled by your own ComfyUI install")
         else:
-            target = portable_python(Path(cfg["comfy_dir"]))
+            comfy_dir = Path(cfg["comfy_dir"])
+            target = portable_python(comfy_dir)
             if target:
                 prog.log(f"Portable ComfyUI detected — installing into {target}")
+            elif not cfg.get("managed"):
+                # Someone else's install already runs on its own environment,
+                # with torch in it. Building a second one beside it would cost
+                # gigabytes and put the node's requirements where ComfyUI never
+                # looks, so the nodes would still fail to import.
+                found = existing_python(comfy_dir)
+                if not found:
+                    raise RuntimeError(
+                        f"Could not find the Python environment that the "
+                        f"ComfyUI at {comfy_dir} runs on, so the Qwen-TTS "
+                        "requirements have nowhere to go. Start that ComfyUI "
+                        "yourself and pick 'Connect to a ComfyUI I start "
+                        "myself', or let Script Builder install its own.")
+                target = Path(found)
+                prog.log(f"That install runs on {target} — using it as it is")
             else:
-                vpy = venv_python(Path(cfg["comfy_dir"]))
+                vpy = venv_python(comfy_dir)
                 if not vpy.exists():
                     prog.detail("deps", "Creating the Python environment…")
                     res = _run([py, "-m", "venv",
-                                str(Path(cfg["comfy_dir"]).parent / "comfy-venv")])
+                                str(comfy_dir.parent / "comfy-venv")])
                     if res.returncode != 0:
                         raise RuntimeError("venv creation failed: " +
                                            (res.stderr or res.stdout)[-600:])
@@ -656,7 +789,7 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
                 pip_install(str(target), args, prog.log)
                 prog.detail("deps", "Installing ComfyUI requirements…")
                 pip_install(str(target),
-                            ["-r", str(Path(cfg["comfy_dir"]) / "requirements.txt")],
+                            ["-r", str(comfy_dir / "requirements.txt")],
                             prog.log)
             cfg["python"] = str(target)
             node_reqs = Path(cfg["comfy_dir"]) / "custom_nodes" / NODE_DIR_NAME \
@@ -690,8 +823,8 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
         elif comfy_online(url):
             prog.log("ComfyUI is already running")
         else:
-            port = int(url.rsplit(":", 1)[-1])
-            comfy.start(cfg["python"], Path(cfg["comfy_dir"]), port, prog)
+            comfy.start(cfg["python"], Path(cfg["comfy_dir"]),
+                        comfy_port(url), prog)
             prog.detail("launch", "Waiting for ComfyUI — the first start is slow…")
             if not wait_for_comfy(url, timeout=900):
                 raise RuntimeError("ComfyUI did not start within 15 minutes.\n"

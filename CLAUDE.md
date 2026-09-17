@@ -17,8 +17,12 @@
    typed into the source.** `CustomVoiceNode.speaker` is the only truth about
    which voices exist.
 4. **Node requirements install into the interpreter ComfyUI runs on.** Portable
-   `python_embeded\python.exe` first, then the managed venv. Never the system
-   Python. This mirrors the documented install step.
+   `python_embeded\python.exe` first; then, for an install we did not make, the
+   environment it already has (`existing_python` probes `venv/`, `.venv/`,
+   `python_standalone`, by execution); then our own managed `comfy-venv`. Never
+   the system Python. Building a second environment beside someone else's
+   ComfyUI costs gigabytes and puts the requirements where ComfyUI never looks,
+   so the nodes still fail to import.
 5. **Python detection is by execution, never PATH lookup.** Windows Store stubs
    resolve on PATH and fail to run.
 6. **Downloads are resumable.** Stream to `<name>.part`, `Range` on retry,
@@ -28,6 +32,18 @@
    `DialogueInferenceNode` — see below.
 8. **Model deletes are path-checked**: repo must contain `/`, no `..`, and the
    resolved path must sit under `models_dir/qwen-tts`.
+9. **`comfy_url` goes through `clean_url()`, and its port through
+   `comfy_port()`.** Never `int(url.rsplit(":")[-1])`: a trailing slash or a
+   port-less address makes that a `ValueError` at import time, and the whole
+   server stops booting over a value typed into Settings. `load_config` heals
+   an address saved before it was normalised.
+10. **Setup steps cross the wire as a list, in run order.** Flask sorts the keys
+   of every dict it sends, which listed *Check Python* last — after the step
+   that starts the engine — on the one screen where order is the point.
+11. **A launcher never installs into the Python it found.** `run.sh`/`run.bat`
+   build a `.venv` beside themselves. Debian, Ubuntu and Homebrew mark their
+   Python externally managed and pip refuses it (PEP 668), which took the
+   launcher down with `set -e` before it ever reached `server.py`.
 
 ## Why line-by-line, not DialogueInferenceNode
 
@@ -62,7 +78,13 @@ because it is the usual cause of IMPORT FAILED.
 
 Models: `Qwen/Qwen3-TTS-12Hz-0.6B-Base` and `Qwen/Qwen3-TTS-Tokenizer-12Hz` are
 required; the 1.7B Base and 1.7B VoiceDesign folders are optional. They live in
-`ComfyUI/models/qwen-tts/Qwen/<name>/`, which is where the node searches.
+`ComfyUI/models/qwen-tts/Qwen/<name>/`, which is where the node searches. The
+repo names in `MODEL_REPOS` are the ones in the node's own `HF_MODEL_MAP` — keep
+them in step with it, not with the node's README, which lists fewer.
+
+`VoiceDesignNode` raises on `model_choice="0.6B"`; only the 1.7B build exists.
+`comfy.py` picks the 1.7B entry out of the node's own enum for a designed voice,
+whatever the model picker says, because the picker offers 0.6B for cloning.
 
 ## Stitching
 
@@ -70,3 +92,8 @@ required; the 1.7B Base and 1.7B VoiceDesign folders are optional. They live in
 count, sample width or rate differ between clips, and the caller falls back to a
 zip. Keep it that way: adding a resampler would pull in a dependency the app
 does not otherwise need.
+
+The gap between clips is a whole number of **frames**, never a rounded byte
+count. `int(rate * pause * sampwidth * nchannels)` can land on half a frame —
+0.75s at 22050 Hz stereo is one such — and every sample after it plays in the
+wrong channel.

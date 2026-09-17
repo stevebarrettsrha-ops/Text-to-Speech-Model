@@ -364,8 +364,17 @@ def _install_torch(task: Task, cfg: dict, opts: dict) -> None:
     if not (comfy_dir / "main.py").exists():
         raise RuntimeError("Install ComfyUI first.")
     target = portable_python(comfy_dir)
+    # An install we did not make runs on its own environment. PyTorch goes in
+    # there, beside the ComfyUI that will import it — never into a second
+    # environment ComfyUI never loads. Probed once: each call runs the
+    # candidates to see which of them is real.
+    own = "" if (target or cfg.get("managed")) \
+        else bootstrap.existing_python(comfy_dir)
     if target:
         task.log(f"Portable ComfyUI — installing into {target}")
+    elif own:
+        target = Path(own)
+        task.log(f"That ComfyUI runs on {target} — installing into it")
     else:
         vpy = venv_python(comfy_dir)
         if not vpy.exists():
