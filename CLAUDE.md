@@ -9,6 +9,12 @@
 1b. **Textareas in the Script card are auto-sized, and `scrollHeight` reads 0
    while a page is hidden.** Any code path that renders blocks off-screen must
    call `resizeAll()` once the page is shown, or every line renders clipped.
+1c. **The narrow breakpoint needs `min-width:0` and has to out-weigh
+   `body.solo`.** A grid item is `min-width:auto`, so the rail refused to shrink
+   below its content and `overflow-x:auto` never engaged — it widened the page
+   instead of scrolling its own chips. And a media query adds no specificity, so
+   plain `.app` inside `@media` loses to `body.solo .app`, which left Models and
+   Engine on the desktop rail. Both are named explicitly in the 760px block.
 2. **Never hard-code a ComfyUI workflow.** `comfy.py` builds each graph from
    `/object_info` and matches inputs through candidate-name lists. The
    Qwen-TTS node renames inputs between releases; a schema read turns that into
@@ -25,9 +31,15 @@
    so the nodes still fail to import.
 5. **Python detection is by execution, never PATH lookup.** Windows Store stubs
    resolve on PATH and fail to run.
-6. **Downloads are resumable.** Stream to `<name>.part`, `Range` on retry,
-   atomic `replace()`. Whole-repo downloads skip `.bin` duplicates of
-   safetensors and repo furniture.
+6. **Downloads are resumable, and nothing is renamed until it is whole.** Stream
+   to `<name>.part`, `Range` on retry, atomic `replace()` — but only once what
+   arrived accounts for the size the listing gave. A dropped connection ends the
+   chunk loop exactly like a clean finish, so promoting the short file made it
+   look complete for good: the `.part` to resume from was gone, and the folder
+   counted as installed with truncated weights in it. `model_installed()` also
+   returns False while any `.part` remains, or a repo whose config.json landed
+   first reports installed while its weights are still arriving. Whole-repo
+   downloads skip `.bin` duplicates of safetensors and repo furniture.
 7. **One line of dialogue is one graph.** Do not switch to
    `DialogueInferenceNode` — see below.
 8. **Model deletes are path-checked**: repo must contain `/`, no `..`, and the
@@ -44,6 +56,13 @@
    build a `.venv` beside themselves. Debian, Ubuntu and Homebrew mark their
    Python externally managed and pip refuses it (PEP 668), which took the
    launcher down with `set -e` before it ever reached `server.py`.
+12. **`takes.json` is the record; a folder missing from it is rubbish.** A run
+   that fails or is cancelled records no take, so the clips it already fetched
+   are unreachable — no card lists them, no Delete removes them. `run_job`
+   clears the folder on every exit that is not a recorded take, and
+   `sweep_orphan_takes()` clears what an earlier crash left.
+13. **The page carries its own favicon, inline.** The server has no static
+   route, so without it every load asks for `/favicon.ico` and logs a 404.
 
 ## Why line-by-line, not DialogueInferenceNode
 

@@ -220,13 +220,18 @@ def run_job(job_id: str, payload: dict) -> None:
                 pass
         add_take(take)
         set_state(status="done", pct=100, stage="Ready", take=take)
+    # A job that does not finish records no take, so the clips it did fetch are
+    # unreachable: nothing in the library lists them and no Delete can remove
+    # them. Left behind, every failed run — and out of memory on line four is
+    # the failure this app documents — costs another few megabytes for good.
     except ComfyError as exc:
+        shutil.rmtree(folder, ignore_errors=True)
         if str(exc) == "Cancelled":
-            shutil.rmtree(folder, ignore_errors=True)
             set_state(status="cancelled", stage="Cancelled")
         else:
             set_state(status="error", error=str(exc), stage="Failed")
     except Exception as exc:  # noqa: BLE001
+        shutil.rmtree(folder, ignore_errors=True)
         set_state(status="error", error=f"{type(exc).__name__}: {exc}",
                   stage="Failed")
 
@@ -251,12 +256,18 @@ def web_asset(name: str):
 def api_status():
     online = comfy_online(cfg["comfy_url"])
     models_dir = Path(cfg["models_dir"]) if cfg.get("models_dir") else None
-    missing = []
-    if models_dir and models_dir.is_dir():
-        missing = [m["repo"] for m in bootstrap.missing_models(models_dir, cfg)]
+    # Whether the voices could be checked at all, which is not the same as
+    # finding none missing. With no models folder set there is nowhere to look,
+    # and an empty "missing" list used to read as "all present" — so a machine
+    # with ComfyUI up, the nodes loaded and not one voice on disk reported the
+    # engine ready and let someone press Read.
+    models_known = bool(models_dir and models_dir.is_dir())
+    missing = [m["repo"] for m in bootstrap.missing_models(models_dir, cfg)] \
+        if models_known else []
     payload = {
         "comfy_online": online,
         "setup_complete": bool(cfg.get("setup_complete")),
+        "models_known": models_known,
         "missing_models": missing,
         "detected": detect_comfy_dirs(),
         "config": {k: cfg.get(k) for k in
@@ -273,7 +284,7 @@ def api_status():
         except Exception as exc:  # noqa: BLE001
             payload["schema_error"] = str(exc)
     payload["ready"] = bool(online and payload["nodes_ready"]
-                            and not [m for m in missing])
+                            and models_known and not missing)
     return jsonify(payload)
 
 
@@ -565,9 +576,28 @@ def api_take_delete(take_id: str):
 
 
 # --------------------------------------------------------------------------- #
+def sweep_orphan_takes() -> int:
+    """Drop clip folders that takes.json does not list.
+
+    takes.json is the record of what exists. A folder missing from it is one a
+    run never finished — killed part way through, or left by a version that did
+    not clean up after a failure — and nothing in the app can reach it again.
+    """
+    known = {t["id"] for t in read_takes()}
+    gone = 0
+    for folder in TAKES_DIR.iterdir() if TAKES_DIR.is_dir() else []:
+        if folder.is_dir() and folder.name not in known:
+            shutil.rmtree(folder, ignore_errors=True)
+            gone += 1
+    return gone
+
+
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     TAKES_DIR.mkdir(parents=True, exist_ok=True)
+    swept = sweep_orphan_takes()
+    if swept:
+        progress.log(f"Cleared {swept} unfinished take folder(s).")
     if cfg.get("setup_complete") and cfg.get("auto_start_comfy", True) \
             and cfg.get("comfy_dir") and bootstrap.comfy_python(cfg) \
             and not comfy_online(cfg["comfy_url"]):

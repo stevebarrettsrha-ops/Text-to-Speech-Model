@@ -379,6 +379,12 @@ def model_installed(models_dir: Path, repo: str) -> bool:
     d = qwen_model_dir(models_dir, repo)
     if not d.is_dir():
         return False
+    # A .part is a download that stopped part way through. The config.json
+    # beside it arrived first and is perfectly good, which is exactly why this
+    # has to be checked: without it a folder whose weights are still half here
+    # reports as installed, and the engine reports ready.
+    if any(d.rglob("*.part")):
+        return False
     weights = [f for f in d.rglob("*")
                if f.suffix in (".safetensors", ".bin", ".pt", ".pth")]
     has_config = (d / "config.json").exists()
@@ -468,8 +474,12 @@ def wanted_files(files: list[dict]) -> list[dict]:
 
 def download_file(cfg: dict, repo: str, path: str, dest: Path,
                   on_progress=None, should_cancel=None,
-                  revision: str = "main") -> None:
-    """Resumable single-file download: .part file, Range resume, atomic move."""
+                  revision: str = "main", expected: int = 0) -> None:
+    """Resumable single-file download: .part file, Range resume, atomic move.
+
+    `expected` is the size the repo listing gave, when there is one. Nothing is
+    moved into place until what arrived accounts for it.
+    """
     url = f"{hf_endpoint(cfg)}/{repo}/resolve/{revision}/{path}"
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".part")
@@ -509,6 +519,18 @@ def download_file(cfg: dict, repo: str, path: str, dest: Path,
                 if on_progress and now - last > 0.6:
                     last = now
                     on_progress(got, total)
+    # A connection that drops mid-file ends that loop exactly like a clean
+    # finish does. Renaming a short file into place makes it look complete for
+    # good: the .part it would have resumed from is gone, and the folder counts
+    # as installed while the weights in it are truncated. Keep the .part and
+    # say so — the next attempt carries on from where this one stopped.
+    want = expected or total
+    landed = part.stat().st_size if part.exists() else 0
+    if want and landed < want:
+        raise RuntimeError(
+            f"{path} stopped at {landed / 1e6:.1f} MB of {want / 1e6:.1f} MB — "
+            "the connection dropped. Start the download again and it carries "
+            "on from here.")
     part.replace(dest)
     if on_progress:
         on_progress(dest.stat().st_size, dest.stat().st_size)
@@ -534,7 +556,8 @@ def download_repo(cfg: dict, repo: str, models_dir: Path,
                           f"{(_done + got)/1e9:.2f} of {total_bytes/1e9:.2f} GB",
                           overall)
 
-        download_file(cfg, repo, f["path"], dest, prog, should_cancel)
+        download_file(cfg, repo, f["path"], dest, prog, should_cancel,
+                      expected=f["size"])
         if should_cancel and should_cancel():
             return
         done_bytes += f["size"]
