@@ -244,7 +244,7 @@ run without touching the first one's takes.
 
 ```bash
 node tests/check.mjs     # everything compiles and the inline script parses
-npm run test:units       # 98 unit tests, standard library only
+npm run test:units       # 100 unit tests, standard library only
 npm install && npx playwright install chromium
 npm test                 # 68 checks driving the real page in headless Chromium
 ```

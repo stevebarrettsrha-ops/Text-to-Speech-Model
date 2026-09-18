@@ -204,7 +204,7 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 98 unit tests, standard library only
+npm run test:units       # 100 unit tests, standard library only
 npm test                 # 68 checks driving the real page in headless Chromium
 ```
 

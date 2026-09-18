@@ -514,9 +514,9 @@
     <section class="page" data-page="models" hidden>
       <div class="panel">
         <h2>HuggingFace</h2>
-        <p class="sub">Voices come from the Qwen3-TTS collection and land in
-          ComfyUI/models/qwen-tts/Qwen/. A token is only needed for a gated repo; point
-          at a mirror if huggingface.co is slow where you are.</p>
+        <p class="sub">Voices come from the Qwen3-TTS and MOSS-TTS collections. A token
+          is only needed for a gated repo; point at a mirror if huggingface.co is slow
+          where you are.</p>
         <div class="frow">
           <input type="password" id="hf-token" placeholder="Access token (gated repos only)">
           <input type="text" id="hf-endpoint" placeholder="https://huggingface.co">
@@ -525,10 +525,11 @@
         <p class="note" id="hf-token-note"></p>
       </div>
       <div class="panel">
-        <h2>The Qwen3-TTS collection</h2>
-        <p class="sub">CustomVoice carries the preset speakers, Base does voice cloning,
-          VoiceDesign builds a voice from a description, and the tokenizer is needed by
-          all of them.</p>
+        <h2>Voices and models</h2>
+        <p class="sub">On Qwen3-TTS, CustomVoice carries the preset speakers, Base does
+          voice cloning and VoiceDesign builds a voice from a description. MOSS-TTS has
+          no presets: the 1.7B does speech and cloning, VoiceGenerator does descriptions.
+          Each engine needs its own tokenizer.</p>
         <div class="flist" id="curated-list"></div>
       </div>
       <div class="panel">
@@ -1802,8 +1803,8 @@ function renderPicks() {
   });
   opts.push({ mode: "managed", dir: "",
     title: "Install a fresh ComfyUI for Script Builder",
-    sub: "Downloads ComfyUI, adds the Qwen-TTS nodes, builds its own Python environment "
-       + "and fetches the voices. Nothing else on this machine changes." });
+    sub: "Downloads ComfyUI, adds both sets of speech nodes, builds its own Python "
+       + "environment and fetches the voices. Nothing else on this machine changes." });
   opts.push({ mode: "external", dir: "",
     title: "Connect to a ComfyUI I start myself",
     sub: "Set the address in Settings first. Setup adds the nodes and models only." });

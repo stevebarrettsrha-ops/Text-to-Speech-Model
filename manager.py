@@ -205,13 +205,26 @@ def dependencies(cfg: dict, client=None) -> list[dict]:
                           "state": "off",
                           "detail": "Turned off in Settings.", "action": None})
             continue
+        loaded = client.engine_ready(eid) if client else None
         if not (comfy_dir and bootstrap.node_installed(comfy_dir, eid)):
+            if loaded:
+                # The running ComfyUI has the classes, so they are installed —
+                # we simply cannot see where, because this is someone's own
+                # ComfyUI and setup was never told its folder. Reporting that
+                # as "missing" put two red rows and an Install button in front
+                # of someone whose engine was working perfectly.
+                items.append({"id": dep_id, "label": f"{eng['label']} nodes",
+                              "state": "ok",
+                              "detail": "Loaded by the ComfyUI you are running. "
+                                        "Set its folder in Settings to manage "
+                                        "them from here.",
+                              "action": None})
+                continue
             items.append({"id": dep_id, "label": f"{eng['label']} nodes",
                           "state": "missing",
                           "detail": f"{eng['node_repo']} is not installed.",
                           "action": "install"})
             continue
-        loaded = client.engine_ready(eid) if client else None
         items.append({
             "id": dep_id, "label": f"{eng['label']} nodes",
             "state": "ok" if loaded is not False else "warn",

@@ -922,6 +922,26 @@ class NodesNotLoaded(unittest.TestCase):
         self.assertEqual(rows.get("node"), "Qwen3-TTS nodes")
         self.assertEqual(rows.get("node_moss"), "MOSS-TTS nodes")
 
+    def test_a_comfyui_we_do_not_own_is_not_reported_as_missing(self):
+        # "Connect to a ComfyUI I start myself" never records a comfy_dir, so
+        # the folder check finds nothing — and both node rows read "missing",
+        # with an Install button, in front of someone whose engine was working
+        # perfectly and whose pill said Engine ready. The running schema is the
+        # better witness: if the classes are loaded, they are installed.
+        items = manager.dependencies({"models_dir": self.cfg["models_dir"],
+                                      "comfy_url": "http://127.0.0.1:1"},
+                                     self.Engine(True))
+        rows = {i["id"]: i for i in items if i["id"] in ("node", "node_moss")}
+        self.assertEqual({r["state"] for r in rows.values()}, {"ok"})
+        self.assertTrue(all(r["action"] is None for r in rows.values()))
+        self.assertIn("ComfyUI you are running", rows["node"]["detail"])
+
+    def test_with_no_folder_and_no_engine_they_really_are_missing(self):
+        items = manager.dependencies({"models_dir": self.cfg["models_dir"],
+                                      "comfy_url": "http://127.0.0.1:1"}, None)
+        rows = {i["id"]: i for i in items if i["id"] in ("node", "node_moss")}
+        self.assertEqual({r["state"] for r in rows.values()}, {"missing"})
+
     def test_an_engine_turned_off_is_not_reported_as_missing(self):
         items = manager.dependencies(dict(self.cfg, want_moss=False),
                                      self.Engine(True))
