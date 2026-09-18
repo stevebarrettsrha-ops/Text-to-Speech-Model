@@ -142,6 +142,14 @@ Every check stands for something that broke once, so the names say what would
 break rather than what the function is called. Add to them when you fix
 something: a fault worth fixing is worth the test that would have caught it.
 
+**A job name in `.github/workflows/test.yml` is also a required check in
+`.github/branch-protection.json`.** GitHub accepts a required check that names
+no job and then gates nothing, silently, so renaming a job without editing the
+JSON would switch the gate off without a word. `tests/check.mjs` compares the
+two — including expanding the `matrix.python` values — and fails on either a
+required check with no job or a job nothing requires. It parses the YAML by
+hand on purpose: the gate has to keep running with nothing installed.
+
 ## Version floor
 
 Node classes used: `CustomVoiceNode`, `VoiceCloneNode`, `VoiceDesignNode`,

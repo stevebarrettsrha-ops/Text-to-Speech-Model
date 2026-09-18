@@ -205,3 +205,22 @@ None of it needs a GPU, a model download or the network: `tests/mock_comfy.py`
 and `tests/mock_hf.py` stand in for ComfyUI and HuggingFace, and the suite runs
 against a temporary data folder rather than your library. The same three run in
 CI on every push and pull request.
+
+### Making CI actually gate a merge
+
+CI reports on its own; it only blocks anything once `main` requires those
+checks. `.github/branch-protection.json` is that rule, ready to apply:
+
+```bash
+gh api -X PUT repos/<owner>/<repo>/branches/main/protection \
+  --input .github/branch-protection.json
+```
+
+It requires the four checks and forbids force pushes and branch deletion, but
+leaves admins able to push directly and asks for no reviews — a solo project
+can still merge its own work.
+
+The file is in the repo because GitHub accepts a required check whose name
+matches no job and then silently gates nothing, so renaming a job would quietly
+switch the gate off. `node tests/check.mjs` compares the two and fails if they
+disagree.

@@ -1,0 +1,17 @@
+{
+  "required_status_checks": {
+    "strict": true,
+    "contexts": [
+      "Validation gate",
+      "Unit tests (Python 3.10)",
+      "Unit tests (Python 3.13)",
+      "Browser smoke test"
+    ]
+  },
+  "enforce_admins": false,
+  "required_pull_request_reviews": null,
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false,
+  "required_conversation_resolution": true
+}
