@@ -181,10 +181,11 @@ def visible_info() -> dict:
     return {k: v for k, v in OBJECT_INFO.items() if not k.startswith(drop)}
 
 
-def make_wav(path: Path, seconds: float, freq: float, rate=24000):
+def make_wav(path: Path, seconds: float, freq: float, rate=24000, silent=False):
     frames = int(rate * seconds)
-    data = b"".join(struct.pack("<h", int(12000 * math.sin(2 * math.pi * freq * i / rate)))
-                    for i in range(frames))
+    data = (b"\x00\x00" * frames) if silent else b"".join(
+        struct.pack("<h", int(12000 * math.sin(2 * math.pi * freq * i / rate)))
+        for i in range(frames))
     with wave.open(str(path), "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
@@ -291,7 +292,11 @@ def validate(prompt: dict):
 
 
 # Behaviour switches the test harness pokes at.
-MODE = {"fail_on": None, "delay": 0.4, "vary_rate": False, "force_ext": ""}
+MODE = {"fail_on": None, "delay": 0.4, "vary_rate": False, "force_ext": "",
+        # A clip of the right length holding nothing but zeros: it decodes
+        # perfectly and plays silence, which is what a model that loaded and
+        # generated nothing sounds like.
+        "silent": False}
 
 
 @app.post("/mock/mode")
@@ -375,7 +380,7 @@ def run_prompt(pid, graph, text, fmt):
     if MODE.get("vary_rate"):
         rate = [24000, 16000, 44100][len(HISTORY) % 3]
     make_wav(dest, max(0.4, min(len(text), 80) * 0.045), 180 + len(text) % 200,
-             rate=rate)
+             rate=rate, silent=bool(MODE.get("silent")))
     HISTORY[pid]["status"] = {"status_str": "success", "completed": True,
                               "messages": []}
     HISTORY[pid]["outputs"] = {"3": {"audio": [

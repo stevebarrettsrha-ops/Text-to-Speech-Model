@@ -261,6 +261,46 @@ try {
      'everything first launch fetches will actually run',
      defaults.map(c => `${c.repo.split('/')[1]}:${c.fits}`).join(' '));
 
+  // The self-test is the answer to "does this engine actually work", so it
+  // has to run the whole way and it has to fail when the engine is broken.
+  const st = async engine => {
+    const r = await app.post(`/api/selftest/${engine}`, {});
+    for (let i = 0; i < 90; i++) {
+      await sleep(700);
+      const t = await app.api(`/api/tasks?id=${r.task.id}&since=99999`);
+      if (t.state !== 'running') return t;
+    }
+    return null;
+  };
+  const pass = await st('moss');
+  const names = (pass.meta.steps || []).map(x => `${x.id}:${x.state}`);
+  is(pass.state === 'done' && (pass.meta.steps || []).every(x => x.state !== 'fail'),
+     'the MOSS self-test runs the whole way', names.join(' '));
+  is((pass.meta.steps || []).some(x => x.id === 'audio' && /of audio/.test(x.detail)),
+     'and proves audio came back',
+     (pass.meta.steps || []).find(x => x.id === 'audio')?.detail);
+
+  await app.comfyApi('/mock/hide/moss', { method: 'POST' });
+  const broken = await st('moss');
+  const nodeStep = (broken.meta.steps || []).find(x => x.id === 'nodes');
+  is(broken.state === 'error' && nodeStep && nodeStep.state === 'fail',
+     'and fails at the right step when ComfyUI has not loaded the nodes',
+     nodeStep && nodeStep.state);
+  // The schema is cached for two minutes; a self-test reading that cache
+  // reported nodes as loaded straight after they were hidden.
+  is(!(broken.meta.steps || []).some(x => x.id === 'audio'),
+     'stopping early rather than carrying on to generate');
+
+  // Put the nodes back and run it again. This is not tidying up: the app
+  // caches ComfyUI's schema for two minutes, so the run that proves recovery
+  // is also the thing that clears the stale "they are gone" answer for
+  // everything after it.
+  await app.comfyApi('/mock/hide/none', { method: 'POST' });
+  const again = await st('moss');
+  is(again.state === 'done',
+     'and passes again once the nodes are back, without waiting out the cache',
+     (again.meta.steps || []).map(x => `${x.id}:${x.state}`).join(' '));
+
   const eightB = await app.api('/api/moss/8b');
   is(eightB.through_comfyui.fits === false
        && /AutoModel\.from_pretrained/.test(eightB.through_comfyui.why),

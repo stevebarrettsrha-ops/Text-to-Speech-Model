@@ -292,6 +292,9 @@
   .state.warn,.state.wanted{color:#ffd693;border-color:rgba(255,176,32,.36);
          background:rgba(255,176,32,.08)}
   .state.off{color:var(--dim);border-style:dashed}
+  .state.fail{color:#ffa8a8;border-color:rgba(255,90,90,.36);background:rgba(255,90,90,.08)}
+  .state.skip{color:var(--dim)}
+  .state.running{color:#cbb6ff;border-color:rgba(150,110,255,.4)}
   .log{background:#08080a;border:1px solid var(--line-soft);border-radius:11px;padding:12px;
        font-family:ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace;font-size:11.5px;
        color:#9a9aa4;height:210px;overflow-y:auto;white-space:pre-wrap;line-height:1.55}
@@ -558,9 +561,15 @@
         <p class="sub">Install anything marked missing. It all runs from here — no command
           prompt, no manual downloads.</p>
         <div class="flist" id="dep-list"></div>
+        <div id="selftest" hidden style="margin-top:12px">
+          <div class="rowhead" style="margin:0 0 8px" id="selftest-title">Self-test</div>
+          <div class="flist" id="selftest-list"></div>
+        </div>
         <div class="rowbtn">
           <button class="btn" id="btnRecheck">Recheck</button>
           <button class="btn go" id="btnInstallAll">Install everything missing</button>
+          <button class="btn" id="btnTestQwen" title="Generate one line with Qwen3-TTS and report what happens">Test Qwen3-TTS</button>
+          <button class="btn" id="btnTestMoss" title="Generate one line with MOSS-TTS and report what happens">Test MOSS-TTS</button>
           <button class="btn" id="btnStartEngine">Start ComfyUI</button>
           <button class="btn" id="btnReRun">Run setup again</button>
         </div>
@@ -1612,6 +1621,58 @@ async function installAllMissing() {
     toast("All set. Press Restart engine so ComfyUI loads the nodes.");
   } catch (e) { toast(e.message, true); }
 }
+async function runSelfTest(engine, btn) {
+  var box = $("selftest"), list = $("selftest-list");
+  var was = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "Testing…"; }
+  box.hidden = false;
+  list.innerHTML = '<div class="empty">Starting…</div>';
+  try {
+    var r = await api("/api/selftest/" + engine, { method: "POST" });
+    S.taskId = r.task.id; S.taskCursor = 0; $("task-log").textContent = "";
+    pollTasks();
+    var id = r.task.id, done = false;
+    while (!done) {
+      await new Promise(function (s) { setTimeout(s, 1200); });
+      var t = await api("/api/tasks?id=" + id + "&since=99999");
+      renderSelfTest(engine, t);
+      done = t.state !== "running";
+    }
+  } catch (e) {
+    list.innerHTML = '<div class="empty bad-text">' + esc(e.message) + "</div>";
+  }
+  if (btn) { btn.disabled = false; btn.textContent = was; }
+  loadDeps();
+}
+function renderSelfTest(engine, t) {
+  var steps = (t.meta && t.meta.steps) || [];
+  $("selftest-title").textContent = t.title +
+    (t.state === "running" ? " — running…"
+      : t.state === "done" ? " — it works"
+      : t.state === "cancelled" ? " — cancelled" : " — stopped");
+  var list = $("selftest-list");
+  list.innerHTML = "";
+  steps.forEach(function (s) {
+    var el = document.createElement("div");
+    el.className = "fitem";
+    el.innerHTML = '<div class="n"><b>' + esc(s.label) + "</b><span>" +
+      esc(s.detail || "") + '</span></div><div class="right">' +
+      '<span class="state ' + esc(s.state) + '">' + esc(s.state) +
+      "</span></div>";
+    list.appendChild(el);
+  });
+  // A task that stopped without a failing step failed before the first one.
+  if (t.state === "error" && !steps.some(function (s) { return s.state === "fail"; })) {
+    var el = document.createElement("div");
+    el.className = "fitem";
+    el.innerHTML = '<div class="n"><b>Stopped</b><span>' + esc(t.detail || "") +
+      '</span></div><div class="right"><span class="state fail">fail</span></div>';
+    list.appendChild(el);
+  }
+  if (!steps.length && t.state === "running") {
+    list.innerHTML = '<div class="empty">' + esc(t.detail || "Working…") + "</div>";
+  }
+}
 async function restartEngine() {
   try {
     var r = await api("/api/comfy/restart", { method: "POST" });
@@ -2019,6 +2080,10 @@ function wire() {
     S.libFilter = e.target.value; renderLib(); });
 
   $("btnRecheck").addEventListener("click", function () { loadDeps(true); refreshStatus(); });
+  $("btnTestQwen").addEventListener("click", function (e) {
+    runSelfTest("qwen", e.currentTarget); });
+  $("btnTestMoss").addEventListener("click", function (e) {
+    runSelfTest("moss", e.currentTarget); });
   $("btnInstallAll").addEventListener("click", installAllMissing);
   $("btnStartEngine").addEventListener("click", startEngine);
   $("btnReRun").addEventListener("click", openSetup);

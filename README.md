@@ -132,6 +132,31 @@ take, and two of the five cannot be fetched at any speed:
 Add `?check=1` and the two HuggingFace repos are looked up rather than taken on
 trust. Nothing in first launch assumes any of this is present.
 
+### Does it actually work?
+
+The Engine page has **Test Qwen3-TTS** and **Test MOSS-TTS**. Each generates one
+line on your own machine and reports every step:
+
+```
+ok    ComfyUI is answering                 http://127.0.0.1:8188
+ok    MOSS-TTS nodes are loaded
+ok    Model folders are on disk            MOSS-Audio-Tokenizer 1.1 GB · MOSS-TTS-Local-Transformer 3.4 GB
+ok    A graph can be built for it          MossTTSModelLoader → MossTTSGenerate → SaveAudioAdvanced
+ok    ComfyUI accepts the graph            prompt 0620e2bc
+ok    Speech comes back                    4.2s of audio, 24000 Hz, mono · 31s to generate · peak 62%
+warn  Ran without reaching for the network ComfyUI fetched something while generating…
+```
+
+It stops at the first step that breaks and names it, which is the difference
+between "it does not work" and "the weights in that folder never finished
+downloading". Silence counts as a failure: a clip of the right length full of
+zeros decodes perfectly and plays nothing.
+
+The last step is worth watching on MOSS. The node only passes `codec_local_path`
+to the TTSD model, so the 1.7B and VoiceGenerator resolve their audio tokenizer
+through `AutoProcessor.from_pretrained` — if that reaches HuggingFace during
+generation, this is where you will see it.
+
 ### Will it run on this card?
 
 Every model carries a VRAM figure, and the app reads what the card actually
@@ -279,9 +304,9 @@ run without touching the first one's takes.
 
 ```bash
 node tests/check.mjs     # everything compiles and the inline script parses
-npm run test:units       # 114 unit tests, standard library only
+npm run test:units       # 122 unit tests, standard library only
 npm install && npx playwright install chromium
-npm test                 # 75 checks driving the real page in headless Chromium
+npm test                 # 80 checks driving the real page in headless Chromium
 ```
 
 None of it needs a GPU, a model download or the network: `tests/mock_comfy.py`

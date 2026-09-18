@@ -1361,5 +1361,112 @@ class Moss8bPrerequisites(unittest.TestCase):
         self.assertNotIn(bootstrap.GGUF_REPO, repos)
 
 
+
+class SelfTestSteps(unittest.TestCase):
+    """A self-test that only ever reports success is worth nothing, so each
+    way it can stop has its own check."""
+
+    class Engine:
+        def __init__(self, ready=True, speakers=("Eric",)):
+            self.ready, self._speakers = ready, list(speakers)
+
+        def schema(self, force=False):
+            return {}
+
+        def engine_ready(self, _engine):
+            return self.ready
+
+        def speakers(self):
+            return self._speakers
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="sb-self-"))
+        self.models = self.root / "models"
+        self.models.mkdir()
+        self.cfg = {"comfy_url": "http://127.0.0.1:1",
+                    "models_dir": str(self.models), "comfy_dir": "",
+                    "want_moss": True, "want_clone": False,
+                    "want_moss_design": False}
+        self.task = manager.Task("selftest", "Test")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _seed(self, engine, weights=True):
+        for m in bootstrap.wanted_models(self.cfg, engine):
+            d = bootstrap.model_dir(self.models, m["repo"], engine)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "config.json").write_text("{}")
+            if weights:
+                (d / "model.safetensors").write_bytes(b"\0" * 32)
+
+    def _run(self, engine="moss", online=True, client=None):
+        with mock.patch.object(bootstrap, "comfy_online", return_value=online):
+            try:
+                manager.selftest(self.cfg, client or self.Engine(), engine,
+                                 self.task)
+            except Exception:  # noqa: BLE001
+                pass
+        return {s["id"]: s for s in self.task.meta.get("steps", [])}
+
+    def test_a_dead_engine_stops_at_the_first_step(self):
+        steps = self._run(online=False)
+        self.assertEqual(steps["engine"]["state"], "fail")
+        self.assertNotIn("nodes", steps)
+
+    def test_nodes_that_are_not_loaded_stop_before_the_models(self):
+        steps = self._run(client=self.Engine(ready=False))
+        self.assertEqual(steps["engine"]["state"], "ok")
+        self.assertEqual(steps["nodes"]["state"], "fail")
+        self.assertNotIn("models", steps)
+
+    def test_the_node_list_is_read_fresh_not_from_the_cache(self):
+        # The schema is cached for two minutes, and the reason anyone presses
+        # Test is usually that something just changed. Reading the cache once
+        # reported "nodes are loaded" about a ComfyUI that had just been shown
+        # not to have them.
+        forced = []
+
+        class Watcher(self.Engine):
+            def schema(self, force=False):
+                forced.append(force)
+                return {}
+
+        self._seed("moss")
+        self._run(client=Watcher())
+        self.assertIn(True, forced)
+
+    def test_a_folder_with_no_weights_in_it_is_caught(self):
+        self._seed("moss", weights=False)
+        steps = self._run()
+        self.assertEqual(steps["models"]["state"], "fail")
+        self.assertIn("no weights", steps["models"]["detail"])
+        self.assertNotIn("graph", steps)
+
+    def test_a_missing_folder_is_named(self):
+        steps = self._run()
+        self.assertEqual(steps["models"]["state"], "fail")
+        self.assertIn("MOSS-TTS-Local-Transformer", steps["models"]["detail"])
+
+    def test_silence_counts_as_a_failure(self):
+        # The right number of frames, all zeros: it decodes perfectly and
+        # plays nothing, which is what a model that generated nothing sounds
+        # like.
+        self.assertEqual(manager._peak(b"\x00\x00" * 200, 2), 0.0)
+        loud = struct.pack("<h", 20000) * 200
+        self.assertGreater(manager._peak(loud, 2), 0.5)
+
+    def test_a_format_it_cannot_measure_is_not_called_silent(self):
+        # 24-bit or float audio is not a failure, it is simply not something
+        # this check can weigh — and -1 keeps it out of the silence branch.
+        self.assertEqual(manager._peak(b"\x00\x00\x00" * 60, 3), -1.0)
+        self.assertEqual(manager._peak(b"", 2), -1.0)
+
+    def test_weight_suffixes_cover_both_engines_shapes(self):
+        for suffix in (".safetensors", ".bin", ".gguf", ".onnx", ".npy"):
+            with self.subTest(suffix=suffix):
+                self.assertIn(suffix, manager.WEIGHT_SUFFIXES)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

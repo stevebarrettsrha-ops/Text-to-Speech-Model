@@ -212,6 +212,31 @@
    them on trust. A first launch that promised an 8B it could not deliver
    would fail in the middle of someone's first take instead of here.
 
+29. **The dependency report cannot answer "does it work", so there is a
+   self-test.** Every row there can read ok while the first take still fails:
+   folders present but holding no weights, classes loaded from a version whose
+   inputs were renamed, a model larger than the card. `manager.selftest` runs
+   the whole path in order — engine answering, nodes loaded, folders whole,
+   graph builds, ComfyUI accepts it, audio comes back — and stops at the first
+   step that breaks, naming it. It **forces a fresh schema read**: the cache
+   lasts two minutes and the reason anyone presses Test is usually that
+   something just changed, so reading it once reported "nodes are loaded"
+   about a ComfyUI that had just been shown not to have them.
+29b. **Silence is a failure, and a byte count is not a test.** A clip of the
+   right length full of zeros decodes perfectly and plays nothing, which is
+   exactly what a model that loaded and generated nothing sounds like —
+   `_peak` catches it, and returns -1 rather than 0 for a width it cannot
+   measure so 24-bit audio is never called silent. The folder check looks for
+   weight **files**, not a size: the right floor for a tokenizer is not the
+   right floor for an 8B, and picking one number gets both wrong.
+29c. **The self-test reads ComfyUI's console over the run.** It is the only
+   way to see what the API never reports — a model reaching for HuggingFace
+   mid-generation because a processor could not find its codec locally, which
+   is live for MOSS: `codec_local_path` is only used for TTSD, so the Local
+   1.7B and VoiceGenerator resolve their audio tokenizer through
+   `AutoProcessor.from_pretrained` instead. Where someone else started
+   ComfyUI, that step reports skipped rather than passing on an empty tail.
+
 ## Why line-by-line, not DialogueInferenceNode
 
 `DialogueInferenceNode` takes a `RoleBankNode`, which takes prompts from
@@ -225,8 +250,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 114 unit tests, standard library only
-npm test                 # 75 checks driving the real page in headless Chromium
+npm run test:units       # 122 unit tests, standard library only
+npm test                 # 80 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script

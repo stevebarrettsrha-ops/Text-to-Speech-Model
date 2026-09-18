@@ -528,6 +528,37 @@ def api_comfy_restart():
                                           run).view()})
 
 
+@app.post("/api/selftest/<engine>")
+def api_selftest(engine: str):
+    """Prove an engine end to end on this machine, or name the step that stops.
+
+    Every row of the dependency report can read ok while the first take still
+    fails — folders present and truncated, classes loaded from a version whose
+    inputs were renamed, weights larger than the card. One line of speech,
+    generated here, is the only answer that settles it.
+    """
+    if engine not in bootstrap.ENGINES:
+        return jsonify({"error": f"There is no '{engine}' engine."}), 400
+    if not bootstrap.engine_enabled(cfg, engine):
+        return jsonify({"error": f"{bootstrap.ENGINES[engine]['label']} is "
+                                 "turned off in Settings."}), 400
+    if manager.TASKS.running("selftest"):
+        return jsonify({"error": "A self-test is already running."}), 409
+
+    # Only our own ComfyUI's console is ours to read; someone else's belongs
+    # to them, and the test says so rather than reporting an empty tail as a
+    # clean run.
+    tail = comfy_proc.tail if comfy_proc.alive() else None
+
+    def run(task: manager.Task) -> None:
+        manager.selftest(cfg, client, engine, task, tail)
+
+    label = bootstrap.ENGINES[engine]["label"]
+    return jsonify({"ok": True,
+                    "task": manager.spawn("selftest", f"Test {label}", run,
+                                          {"engine": engine}).view()})
+
+
 @app.get("/api/moss/8b")
 def api_moss_8b():
     """What running the MOSS 8B on a small card would actually take.

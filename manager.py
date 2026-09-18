@@ -12,12 +12,15 @@ mirror are all set from the page; nothing here needs a terminal.
 
 from __future__ import annotations
 
+import array
+import io
 import platform
 import shutil
 import subprocess
 import threading
 import time
 import uuid
+import wave
 from pathlib import Path
 
 import bootstrap
@@ -493,6 +496,251 @@ def _install_node_reqs(task: Task, cfg: dict, engine: str = "") -> None:
         task.set(detail=f"Installing the {eng['label']} requirements…")
         bootstrap.pip_install(py, ["-r", str(reqs)], task.log, _reporter(task))
     task.set(detail="Packages installed. Restart ComfyUI.")
+
+
+
+# --------------------------------------------------------------------------- #
+# self-test
+# --------------------------------------------------------------------------- #
+# "Does this engine actually work?" is not a question the dependency report can
+# answer. Every row there can read ok while the first take still fails: the
+# folders can be present and truncated, the classes loaded from a version whose
+# inputs have been renamed, the weights too big for the card. The only proof is
+# one line of speech, generated here, on this machine.
+#
+# So this runs the whole path in order and stops at the first step that breaks,
+# naming it. It also reads ComfyUI's own console over the run, which is the one
+# way to see something the API never reports — a model reaching for HuggingFace
+# mid-generation because a processor could not find its codec locally.
+
+SELFTEST_LINE = "This is a short line, spoken once, to prove the engine works."
+
+# What a folder must contain to be worth loading. .onnx and .gguf are here
+# because a MOSS codec or a quantized backbone is no less a weight file.
+WEIGHT_SUFFIXES = {".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf",
+                   ".onnx", ".npy"}
+
+
+def _peak(raw: bytes, width: int) -> float:
+    """Loudest sample as a fraction of full scale, 0.0 when it cannot be read.
+
+    A file of the right length full of zeros decodes perfectly and plays
+    nothing, which is exactly the failure worth catching here. audioop would
+    do this in one call and was removed in Python 3.13.
+    """
+    if width != 2 or not raw:
+        return -1.0
+    try:
+        samples = array.array("h")
+        samples.frombytes(raw[:len(raw) - (len(raw) % 2)])
+        return max(abs(s) for s in samples) / 32768.0 if samples else 0.0
+    except Exception:  # noqa: BLE001
+        return -1.0
+
+
+class _Steps:
+    """Ordered results, published to the task as each one lands."""
+
+    def __init__(self, task: Task) -> None:
+        self.task = task
+        self.rows: list[dict] = []
+
+    def add(self, sid: str, label: str, state: str, detail: str = "") -> dict:
+        row = {"id": sid, "label": label, "state": state, "detail": detail}
+        self.rows.append(row)
+        self.task.log(f"{state.upper():5} {label}" + (f" — {detail}" if detail else ""))
+        self.task.set(meta={**self.task.meta, "steps": list(self.rows)},
+                      detail=f"{label}: {state}")
+        return row
+
+    def ok(self, sid, label, detail=""):
+        return self.add(sid, label, "ok", detail)
+
+    def fail(self, sid, label, detail=""):
+        return self.add(sid, label, "fail", detail)
+
+    def skip(self, sid, label, detail=""):
+        return self.add(sid, label, "skip", detail)
+
+
+def selftest(cfg: dict, client, engine: str, task: Task, tail=None) -> None:
+    """Prove an engine end to end, or say exactly where it stops.
+
+    `tail` returns the last lines of ComfyUI's console when we are the ones who
+    started it; None when someone else's ComfyUI is in front of us and its
+    output is theirs to read.
+    """
+    eng = ENGINES[engine]
+    steps = _Steps(task)
+    task.set(meta={**task.meta, "engine": engine, "steps": []})
+    started_lines = len(tail(4000)) if tail else 0
+
+    # 1. is anything there ---------------------------------------------- #
+    if not bootstrap.comfy_online(cfg["comfy_url"]):
+        steps.fail("engine", "ComfyUI is answering",
+                   f"Nothing at {cfg['comfy_url']}. Start it from the Engine "
+                   "panel first.")
+        raise RuntimeError("ComfyUI is not running.")
+    steps.ok("engine", "ComfyUI is answering", cfg["comfy_url"])
+
+    # 2. did it load these nodes ----------------------------------------- #
+    # Forced: the schema is cached for two minutes, and the whole point of
+    # pressing Test is usually that something just changed — nodes installed,
+    # ComfyUI restarted. Answering from a stale cache would report the state
+    # of the world before the thing being tested.
+    try:
+        client.schema(force=True)
+    except Exception as exc:  # noqa: BLE001
+        steps.fail("nodes", f"{eng['label']} nodes are loaded",
+                   f"Could not read ComfyUI's node list: {exc}"[:300])
+        raise
+    if not client.engine_ready(engine):
+        why = ""
+        if cfg.get("comfy_dir"):
+            why = bootstrap.node_import_error(bootstrap.comfy_python(cfg),
+                                              Path(cfg["comfy_dir"]), engine)
+        steps.fail("nodes", f"{eng['label']} nodes are loaded",
+                   why or "ComfyUI has none of this engine's classes. If they "
+                          "are installed, it started before they were — press "
+                          "Restart engine.")
+        raise RuntimeError(f"{eng['label']} nodes are not loaded.")
+    steps.ok("nodes", f"{eng['label']} nodes are loaded")
+
+    # 3. are the folders there, and whole -------------------------------- #
+    models_dir = Path(cfg["models_dir"]) if cfg.get("models_dir") else None
+    if not models_dir or not models_dir.is_dir():
+        steps.fail("models", "Model folders are on disk",
+                   "No models folder is set — run setup, or set it in Settings.")
+        raise RuntimeError("No models folder.")
+    missing = bootstrap.missing_models(models_dir, cfg, engine)
+    if missing:
+        steps.fail("models", "Model folders are on disk",
+                   "Missing: " + ", ".join(m["repo"] for m in missing))
+        raise RuntimeError("Models are missing.")
+    sizes = []
+    for m in bootstrap.wanted_models(cfg, engine):
+        folder = bootstrap.model_dir(models_dir, m["repo"], engine)
+        sizes.append(f"{m['repo'].split('/')[-1]} "
+                     f"{bootstrap.human_size(bootstrap.dir_size(folder))}")
+        # model_installed() accepts a folder with only a config.json in it,
+        # deliberately — a repo whose config landed first is still arriving.
+        # By the time anyone presses Test, a folder with no weights in it is a
+        # download that stopped, and it fails at load rather than here. Weight
+        # files, not a byte count: the right floor for a tokenizer is not the
+        # right floor for an 8B, and picking one number gets both wrong.
+        if not any(f.suffix in WEIGHT_SUFFIXES for f in folder.rglob("*")):
+            steps.fail("models", "Model folders are on disk",
+                       f"{m['repo']} has no weights in it, only "
+                       f"{', '.join(sorted({f.suffix or f.name for f in folder.rglob('*') if f.is_file()}))[:80]}"
+                       " — delete it on the Models page and fetch it again.")
+            raise RuntimeError("A model folder has no weights in it.")
+    steps.ok("models", "Model folders are on disk", " · ".join(sizes))
+
+    # 4. can we build a graph for it ------------------------------------- #
+    opts = {"engine": engine, "prefer_wav": True, "style": ""}
+    voice = {"kind": "preset"}
+    if engine == "moss":
+        opts["moss_dirs"] = {
+            m["repo"]: str(bootstrap.model_dir(models_dir, m["repo"], "moss"))
+            for m in bootstrap.wanted_models(cfg, "moss")
+            if bootstrap.model_installed(models_dir, m["repo"], "moss")}
+    else:
+        speakers = client.speakers()
+        voice["speaker"] = speakers[0] if speakers else ""
+    try:
+        built = client.build_line({"text": SELFTEST_LINE}, voice, opts)
+    except Exception as exc:  # noqa: BLE001
+        steps.fail("graph", "A graph can be built for it", str(exc)[:300])
+        raise
+    shape = " → ".join(built["prompt"][k]["class_type"]
+                       for k in sorted(built["prompt"]))
+    steps.ok("graph", "A graph can be built for it", shape)
+
+    # 5. does ComfyUI accept it ------------------------------------------ #
+    try:
+        prompt_id = client.queue(built["prompt"])
+    except Exception as exc:  # noqa: BLE001
+        # This is where a node that renamed an input shows up: the graph is
+        # well formed against the schema we read and rejected by the one
+        # running.
+        steps.fail("accepted", "ComfyUI accepts the graph", str(exc)[:400])
+        raise
+    steps.ok("accepted", "ComfyUI accepts the graph", f"prompt {prompt_id[:8]}")
+
+    # 6. does audio come back -------------------------------------------- #
+    task.set(detail="Generating one line — the first run loads the model, "
+                    "which is the slow part…")
+    began = time.time()
+    outs: list[dict] = []
+    while time.time() - began < 1800:
+        if task.cancel:
+            steps.skip("audio", "Speech comes back", "Cancelled.")
+            return
+        err = client.failed(prompt_id)
+        if err:
+            steps.fail("audio", "Speech comes back", err[:400])
+            raise RuntimeError(err)
+        outs = client.outputs(prompt_id)
+        if outs:
+            break
+        time.sleep(2)
+    took = time.time() - began
+    if not outs:
+        steps.fail("audio", "Speech comes back",
+                   f"Nothing after {int(took / 60)} minutes.")
+        raise RuntimeError("The engine produced nothing.")
+
+    with client.view(outs[0]) as resp:
+        resp.raise_for_status()
+        raw = resp.content
+    detail = f"{bootstrap.human_size(len(raw))} in {took:.0f}s"
+    try:
+        with wave.open(io.BytesIO(raw), "rb") as w:
+            frames, rate = w.getnframes(), w.getframerate()
+            width, chans = w.getsampwidth(), w.getnchannels()
+            peak = _peak(w.readframes(frames), width)
+        seconds = frames / float(rate or 1)
+        detail = (f"{seconds:.1f}s of audio, {rate} Hz, "
+                  f"{'mono' if chans == 1 else f'{chans}ch'} · {took:.0f}s to "
+                  "generate")
+        if seconds < 0.2:
+            steps.fail("audio", "Speech comes back",
+                       f"Only {seconds:.2f}s came back — too short to be the "
+                       "line.")
+            raise RuntimeError("The clip is too short.")
+        if 0.0 <= peak < 0.005:
+            # The right number of frames, all of them silence.
+            steps.fail("audio", "Speech comes back",
+                       f"{seconds:.1f}s of silence — the graph ran but the "
+                       "model produced nothing audible.")
+            raise RuntimeError("The clip is silent.")
+        if peak >= 0:
+            detail += f" · peak {peak * 100:.0f}%"
+    except wave.Error:
+        # Not a wav: SaveAudioAdvanced fell back to flac or opus, which is not
+        # a failure — only a take that will be zipped rather than joined.
+        detail += " (not wav — takes will be zipped instead of joined)"
+    steps.ok("audio", "Speech comes back", detail)
+
+    # 7. what ComfyUI said while it worked -------------------------------- #
+    if tail:
+        fresh = tail(4000)[started_lines:]
+        pulled = [l for l in fresh
+                  if "huggingface" in l.lower() or "Downloading" in l
+                  or "%|" in l]
+        if pulled:
+            steps.add("console", "Ran without reaching for the network",
+                      "warn",
+                      "ComfyUI fetched something while generating — the model "
+                      "found part of itself missing locally: "
+                      + " / ".join(l.strip()[:80] for l in pulled[:3]))
+        else:
+            steps.ok("console", "Ran without reaching for the network")
+    else:
+        steps.skip("console", "Ran without reaching for the network",
+                   "You start this ComfyUI yourself, so its console is not "
+                   "ours to read.")
+    task.set(detail=f"{eng['label']} works: " + detail)
 
 
 # --------------------------------------------------------------------------- #
