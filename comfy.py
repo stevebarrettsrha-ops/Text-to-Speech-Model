@@ -40,6 +40,24 @@ class ComfyError(RuntimeError):
     pass
 
 
+OFFLINE = ("ComfyUI stopped answering at {url}. It may have crashed or been "
+           "closed — check its console, then start it again from the Engine "
+           "panel.")
+
+
+def _reach(fn, url: str):
+    """Run a request, and turn a dead engine into a sentence.
+
+    Everything else this app says is plain English; a socket error read as
+    "ConnectionError: HTTPConnectionPool(host='127.0.0.1', port=8188): Max
+    retries exceeded" in the middle of a take, which tells nobody what to do.
+    """
+    try:
+        return fn()
+    except (requests.ConnectionError, requests.Timeout) as exc:
+        raise ComfyError(OFFLINE.format(url=url)) from exc
+
+
 class ComfyClient:
     def __init__(self, url: str = "http://127.0.0.1:8188") -> None:
         self.url = url.rstrip("/")
@@ -54,7 +72,8 @@ class ComfyClient:
     def schema(self, force: bool = False) -> dict:
         with self._lock:
             if force or self._schema is None or time.time() - self._schema_at > 120:
-                r = requests.get(f"{self.url}/object_info", timeout=30)
+                r = _reach(lambda: requests.get(f"{self.url}/object_info",
+                                                timeout=30), self.url)
                 r.raise_for_status()
                 self._schema = r.json()
                 self._schema_at = time.time()
@@ -296,7 +315,8 @@ class ComfyClient:
     # ------------------------------------------------------------------ #
     def queue(self, prompt: dict) -> str:
         body = {"prompt": prompt, "client_id": self.client_id}
-        r = requests.post(f"{self.url}/prompt", json=body, timeout=60)
+        r = _reach(lambda: requests.post(f"{self.url}/prompt", json=body,
+                                        timeout=60), self.url)
         if r.status_code >= 400:
             try:
                 raise ComfyError(_readable(r.json()))
@@ -311,7 +331,8 @@ class ComfyClient:
             pass
 
     def history(self, prompt_id: str) -> dict:
-        r = requests.get(f"{self.url}/history/{prompt_id}", timeout=20)
+        r = _reach(lambda: requests.get(f"{self.url}/history/{prompt_id}",
+                                       timeout=20), self.url)
         r.raise_for_status()
         return r.json().get(prompt_id) or {}
 
@@ -339,15 +360,16 @@ class ComfyClient:
         params = {"filename": item.get("filename", ""),
                   "subfolder": item.get("subfolder", ""),
                   "type": item.get("type", "output")}
-        return requests.get(f"{self.url}/view", params=params, stream=True,
-                            timeout=180)
+        return _reach(lambda: requests.get(f"{self.url}/view", params=params,
+                                          stream=True, timeout=180), self.url)
 
     def upload_audio(self, file_storage) -> str:
         files = {"image": (file_storage.filename, file_storage.stream,
                            file_storage.mimetype or "audio/wav")}
-        r = requests.post(f"{self.url}/upload/image", files=files,
-                          data={"type": "input", "overwrite": "true"},
-                          timeout=180)
+        r = _reach(lambda: requests.post(
+            f"{self.url}/upload/image", files=files,
+            data={"type": "input", "overwrite": "true"}, timeout=180),
+            self.url)
         r.raise_for_status()
         data = r.json()
         name = data.get("name") or file_storage.filename

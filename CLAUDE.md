@@ -64,14 +64,30 @@
    build a `.venv` beside themselves. Debian, Ubuntu and Homebrew mark their
    Python externally managed and pip refuses it (PEP 668), which took the
    launcher down with `set -e` before it ever reached `server.py`.
-12. **`takes.json` is the record; a folder missing from it is rubbish.** A run
+12. **`takes.json` is read, changed and written inside one hold of
+   `takes_lock`, and moved into place from a `.tmp`.** `add_take` used to take
+   the lock twice with a gap: two jobs finishing together each wrote the list
+   they had read before the other's take was in it, and the loser vanished
+   from the library while its audio stayed on disk for the sweep below to
+   delete. Forty concurrent adds lost twenty-nine. The private `_read_takes`
+   and `_write_takes` assume the caller holds the lock; the public ones take
+   it.
+12b. **A folder missing from `takes.json` is rubbish.** A run
    that fails or is cancelled records no take, so the clips it already fetched
    are unreachable — no card lists them, no Delete removes them. `run_job`
    clears the folder on every exit that is not a recorded take, and
    `sweep_orphan_takes()` clears what an earlier crash left.
 13. **The page carries its own favicon, inline.** The server has no static
    route, so without it every load asks for `/favicon.ico` and logs a 404.
-14. **Long work reports a percentage, and pip is asked what it supports.**
+14. **Anything that grows is capped.** `progress.lines`, `Task.lines`,
+   `ComfyProcess.lines`, `TASKS` and `takes.json` all have a limit; `jobs` was
+   the one that did not, and a finished job holds the whole take while
+   `/api/jobs` walks the lot once a second during a run.
+15. **A dead engine is a sentence, not a stack trace.** `comfy.py` routes its
+   requests through `_reach`, so a ComfyUI that crashes mid-take says so and
+   says what to do, instead of surfacing "ConnectionError: HTTPConnectionPool
+   (host='127.0.0.1', port=8188): Max retries exceeded" as the take's error.
+16. **Long work reports a percentage, and pip is asked what it supports.**
    `pip_install` reads its pipe a character at a time, because pip redraws
    progress with `\r` and iterating by line waits for a `\n` that only lands
    once the download is over — which is why a 2.7 GB PyTorch showed
