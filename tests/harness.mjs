@@ -4,6 +4,7 @@
 // uses: the two stand-ins under tests/ answer for ComfyUI and HuggingFace, and
 // SCRIPT_BUILDER_DATA points the app at a throwaway directory.
 import { spawn } from 'node:child_process';
+import http from 'node:http';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -12,6 +13,41 @@ import { fileURLToPath } from 'node:url';
 
 export const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// node:http rather than the global fetch, on purpose. fetch goes through
+// undici, and polling a Flask development server that closes connections
+// tripped an assertion inside undici's HTTP parser —
+// `assert(!this.paused)` — thrown from a socket event, so nothing here could
+// catch it and the whole run died. It surfaced only on Node 22.23, having
+// passed twice on 22.22. node:http is the older, plainer client and avoids
+// that path entirely.
+function request(url, { method = 'GET', body = null, headers = {} } = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const head = { ...headers };
+    if (body) {
+      head['Content-Type'] = head['Content-Type'] || 'application/json';
+      head['Content-Length'] = Buffer.byteLength(body);
+    }
+    const req = http.request({
+      hostname: u.hostname, port: u.port,
+      path: u.pathname + u.search, method, headers: head,
+    }, res => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve({
+        status: res.statusCode,
+        ok: res.statusCode >= 200 && res.statusCode < 300,
+        text: Buffer.concat(chunks).toString('utf8'),
+      }));
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    req.setTimeout(30_000, () => req.destroy(new Error(`timed out: ${url}`)));
+    if (body) req.write(body);
+    req.end();
+  });
+}
 
 function pythonCandidates() {
   return process.env.PYTHON ? [process.env.PYTHON]
@@ -43,7 +79,7 @@ async function waitFor(url, label, tries = 120, procs = []) {
       }
     }
     try {
-      const r = await fetch(url);
+      const r = await request(url);
       if (r.ok) return;
     } catch { /* not up yet */ }
     await sleep(500);
@@ -86,6 +122,24 @@ export async function boot({ log = console.log } = {}) {
     return p;
   }
 
+  // Everything from here can throw, and until boot() returns the caller has
+  // nothing to call stop() on — a failure part way through used to leave the
+  // mocks and the app running, which the CI log showed as three orphan python
+  // processes the runner had to kill.
+  const teardown = async () => {
+    for (const { p } of procs) { try { p.kill('SIGTERM'); } catch { /* gone */ } }
+    await sleep(400);
+    for (const { p } of procs) { try { p.kill('SIGKILL'); } catch { /* gone */ } }
+    rmSync(scratch, { recursive: true, force: true });
+  };
+  try {
+    return await bringUp();
+  } catch (err) {
+    await teardown();
+    throw err;
+  }
+
+  async function bringUp() {
   start('mock-comfy', ['tests/mock_comfy.py', comfyRoot],
         { MOCK_COMFY_PORT: String(comfyPort) });
   start('mock-hf', ['tests/mock_hf.py'], { MOCK_HF_PORT: String(hfPort) });
@@ -115,13 +169,15 @@ export async function boot({ log = console.log } = {}) {
   await waitFor(base + '/', 'Script Builder', 120, procs);
 
   const api = async (p, opts) => {
-    const r = await fetch(base + p, opts);
-    return r.json();
+    const r = await request(base + p, opts);
+    try {
+      return JSON.parse(r.text);
+    } catch {
+      throw new Error(`${p} returned ${r.status}, not JSON: `
+                      + r.text.slice(0, 200));
+    }
   };
-  const post = (p, body) => api(p, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  const post = (p, body) => api(p, { method: 'POST', body: JSON.stringify(body) });
 
   // Seed the voices the app needs before it will call itself ready.
   for (const repo of ['Qwen/Qwen3-TTS-Tokenizer-12Hz',
@@ -173,11 +229,7 @@ export async function boot({ log = console.log } = {}) {
     base, api, post, runTake, dataDir, modelsDir,
     comfy: `http://127.0.0.1:${comfyPort}`,
     hf: `http://127.0.0.1:${hfPort}`,
-    async stop() {
-      for (const { p } of procs) { try { p.kill('SIGTERM'); } catch { /* gone */ } }
-      await sleep(400);
-      for (const { p } of procs) { try { p.kill('SIGKILL'); } catch { /* gone */ } }
-      rmSync(scratch, { recursive: true, force: true });
-    },
+    stop: teardown,
   };
+  }
 }
