@@ -42,6 +42,8 @@ CONFIG_PATH = DATA_DIR / "config.json"
 COMFY_REPO = "https://github.com/comfyanonymous/ComfyUI.git"
 NODE_REPO = "https://github.com/flybirdxx/ComfyUI-Qwen-TTS.git"
 NODE_DIR_NAME = "ComfyUI-Qwen-TTS"
+MOSS_NODE_REPO = "https://github.com/richservo/comfyui-moss-tts.git"
+MOSS_NODE_DIR_NAME = "comfyui-moss-tts"
 
 HF_BASE = "https://huggingface.co"
 DEFAULT_COMFY_URL = "http://127.0.0.1:8188"
@@ -108,7 +110,35 @@ MODEL_REPOS = [
 # group -> the config flag that asks for it. core and preset are always needed.
 GROUP_FLAG = {"core": None, "preset": None, "clone": "want_clone",
               "clone_hq": "want_17b", "preset_hq": "want_17b",
-              "design": "want_voicedesign"}
+              "design": "want_voicedesign",
+              "moss_core": None, "moss_hq": "want_moss_8b",
+              "moss_design": "want_moss_design"}
+
+# MOSS-TTS. The repo ids are the ones in the node's own
+# utils/constants.py MODEL_VARIANTS — keep them in step with that file, not
+# with its README, exactly as MODEL_REPOS tracks the Qwen node's HF_MODEL_MAP.
+#
+# Only the Local 1.7B is core. Every other MOSS checkpoint is the Delay 8B
+# architecture and wants about 18 GB of VRAM, which no 8 GB card will hold;
+# the node's own README calls the 1.7B "the only model fast enough for
+# practical iterative use on a single consumer GPU". So the big ones are a
+# tick, not a default — downloading tens of gigabytes someone cannot run is
+# worse than not having them.
+MOSS_MODEL_REPOS = [
+    {"repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer", "group": "moss_core",
+     "params": "codec",
+     "note": "Shared audio codec. Every MOSS model needs it."},
+    {"repo": "OpenMOSS-Team/MOSS-TTS-Local-Transformer", "group": "moss_core",
+     "params": "1.7B",
+     "note": "Speech and zero-shot cloning. ~5 GB of VRAM, and the fast one."},
+    {"repo": "OpenMOSS-Team/MOSS-TTS", "group": "moss_hq", "params": "8B",
+     "note": "Delay 8B — better, far slower, and wants ~18 GB of VRAM."},
+    {"repo": "OpenMOSS-Team/MOSS-VoiceGenerator", "group": "moss_design",
+     "params": "8B",
+     "note": "Builds a voice from a description. Delay 8B, ~18 GB of VRAM."},
+]
+
+MOSS_CODEC_REPO = "OpenMOSS-Team/MOSS-Audio-Tokenizer"
 
 DEFAULT_CONFIG = {
     "comfy_url": DEFAULT_COMFY_URL,
@@ -124,10 +154,63 @@ DEFAULT_CONFIG = {
     "want_clone": True,
     "want_17b": False,
     "want_voicedesign": False,
+    "want_moss": True,
+    "want_moss_8b": False,
+    "want_moss_design": False,
+    "engine": "qwen",
     "setup_complete": False,
 }
 
 QWEN_SUBDIR = Path("qwen-tts")
+MOSS_SUBDIR = Path("moss-tts")
+
+# Everything that differs between the two engines, in one place, so adding a
+# third is a table entry rather than a hunt through four files.
+#
+# `layout` is the part that bites: the Qwen node searches
+# models/qwen-tts/<Org>/<Name>, while the MOSS loader builds its cache path as
+# repo_id.replace("/", "--") under models/moss-tts. Put a MOSS folder in the
+# Qwen shape and the node silently ignores it and downloads its own copy.
+ENGINES = {
+    "qwen": {
+        "id": "qwen",
+        "label": "Qwen3-TTS",
+        "node_repo": NODE_REPO,
+        "node_dir": NODE_DIR_NAME,
+        "node_marker": "nodes.py",
+        "subdir": QWEN_SUBDIR,
+        "layout": "org",
+        "models": MODEL_REPOS,
+        "blurb": "Preset speakers, cloning and voice design. Small and fast.",
+    },
+    "moss": {
+        "id": "moss",
+        "label": "MOSS-TTS",
+        "node_repo": MOSS_NODE_REPO,
+        "node_dir": MOSS_NODE_DIR_NAME,
+        "node_marker": "__init__.py",
+        "subdir": MOSS_SUBDIR,
+        "layout": "flat",
+        "models": MOSS_MODEL_REPOS,
+        "blurb": "Zero-shot cloning and voice design, no preset speakers.",
+    },
+}
+DEFAULT_ENGINE = "qwen"
+
+
+def engine_of(repo: str) -> str:
+    """Which engine a model repo belongs to, from the tables themselves."""
+    for eid, eng in ENGINES.items():
+        if any(m["repo"] == repo for m in eng["models"]):
+            return eid
+    return DEFAULT_ENGINE
+
+
+def engine_enabled(cfg: dict, engine: str) -> bool:
+    """MOSS can be turned off; Qwen is the engine the app is built around."""
+    if engine == "moss":
+        return bool(cfg.get("want_moss", True))
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -159,7 +242,7 @@ class Progress:
     STEPS = [
         ("python", "Check Python"),
         ("comfyui", "Install ComfyUI"),
-        ("node", "Install the Qwen-TTS nodes"),
+        ("node", "Install the speech nodes"),
         ("deps", "Install dependencies"),
         ("models", "Download voices and models"),
         ("launch", "Start ComfyUI"),
@@ -390,14 +473,29 @@ def detect_comfy_dirs() -> list[str]:
     return out
 
 
-def qwen_model_dir(models_dir: Path, repo: str) -> Path:
-    """models/qwen-tts/Qwen/<repo name> — the layout the node searches."""
+def model_dir(models_dir: Path, repo: str, engine: str = "") -> Path:
+    """Where a model folder has to live for its own node to find it.
+
+    Two different layouts, and neither is a preference:
+      qwen  models/qwen-tts/<Org>/<Name>  — where the Qwen node searches.
+      moss  models/moss-tts/<Org>--<Name> — what the MOSS loader builds from
+            repo_id.replace("/", "--"). Put a MOSS folder in the Qwen shape
+            and the node does not see it; it downloads its own second copy.
+    """
+    eng = ENGINES[engine or engine_of(repo)]
     org, name = repo.split("/", 1)
-    return models_dir / QWEN_SUBDIR / org / name
+    if eng["layout"] == "flat":
+        return models_dir / eng["subdir"] / f"{org}--{name}"
+    return models_dir / eng["subdir"] / org / name
 
 
-def model_installed(models_dir: Path, repo: str) -> bool:
-    d = qwen_model_dir(models_dir, repo)
+def qwen_model_dir(models_dir: Path, repo: str) -> Path:
+    """Kept for callers that only ever meant Qwen."""
+    return model_dir(models_dir, repo, "qwen")
+
+
+def model_installed(models_dir: Path, repo: str, engine: str = "") -> bool:
+    d = model_dir(models_dir, repo, engine)
     if not d.is_dir():
         return False
     # A .part is a download that stopped part way through. The config.json
@@ -412,25 +510,37 @@ def model_installed(models_dir: Path, repo: str) -> bool:
     return bool(weights) or has_config
 
 
-def wanted_models(cfg: dict) -> list[dict]:
-    """The folders this setup actually needs, from what the person asked for."""
+def wanted_models(cfg: dict, engine: str = "") -> list[dict]:
+    """The folders this setup actually needs, from what the person asked for.
+
+    Each entry carries its own engine, because the caller downloading them has
+    to know which of the two folder layouts above to use.
+    """
     out = []
-    for m in MODEL_REPOS:
-        flag = GROUP_FLAG.get(m["group"])
-        if flag is None or cfg.get(flag):
+    for eid, eng in ENGINES.items():
+        if engine and eid != engine:
+            continue
+        if not engine_enabled(cfg, eid):
+            continue
+        for m in eng["models"]:
+            flag = GROUP_FLAG.get(m["group"])
+            if flag is not None and not cfg.get(flag):
+                continue
             if m["group"] == "clone_hq" and not cfg.get("want_clone"):
                 continue
-            out.append(m)
+            out.append({**m, "engine": eid})
     return out
 
 
-def missing_models(models_dir: Path, cfg: dict) -> list[dict]:
-    return [m for m in wanted_models(cfg)
-            if not model_installed(models_dir, m["repo"])]
+def missing_models(models_dir: Path, cfg: dict, engine: str = "") -> list[dict]:
+    return [m for m in wanted_models(cfg, engine)
+            if not model_installed(models_dir, m["repo"], m["engine"])]
 
 
-def node_installed(comfy_dir: Path) -> bool:
-    return (comfy_dir / "custom_nodes" / NODE_DIR_NAME / "nodes.py").exists()
+def node_installed(comfy_dir: Path, engine: str = "qwen") -> bool:
+    eng = ENGINES[engine]
+    return (comfy_dir / "custom_nodes" / eng["node_dir"]
+            / eng["node_marker"]).exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -573,9 +683,9 @@ def download_file(cfg: dict, repo: str, path: str, dest: Path,
 
 
 def download_repo(cfg: dict, repo: str, models_dir: Path,
-                  on_detail=None, should_cancel=None) -> None:
-    """Pull a whole model folder into models/qwen-tts/Qwen/<name>."""
-    target = qwen_model_dir(models_dir, repo)
+                  on_detail=None, should_cancel=None, engine: str = "") -> None:
+    """Pull a whole model folder into the layout its own node searches."""
+    target = model_dir(models_dir, repo, engine)
     files = wanted_files(hf_tree(cfg, repo))
     total_bytes = sum(f["size"] for f in files) or 1
     done_bytes = 0
@@ -1153,8 +1263,8 @@ print("OK")
 """
 
 
-def node_import_error(python: str, comfy_dir: Path) -> str:
-    """Why ComfyUI could not load the Qwen-TTS nodes, in one sentence.
+def node_import_error(python: str, comfy_dir: Path, engine: str = "qwen") -> str:
+    """Why ComfyUI could not load an engine's nodes, in one sentence.
 
     ComfyUI prints its import failures to its own console and carries on, so
     "Installed but ComfyUI has not loaded them" was as far as the Engine panel
@@ -1167,9 +1277,10 @@ def node_import_error(python: str, comfy_dir: Path) -> str:
     Returns "" when the import succeeds, which means the running ComfyUI is
     simply older than the install and wants a restart.
     """
-    node_path = comfy_dir / "custom_nodes" / NODE_DIR_NAME
+    eng = ENGINES[engine]
+    node_path = comfy_dir / "custom_nodes" / eng["node_dir"]
     if not (node_path / "__init__.py").exists():
-        return "The Qwen-TTS nodes are not installed."
+        return f"The {eng['label']} nodes are not installed."
     try:
         out = _run([str(python), "-c", NODE_PROBE, str(comfy_dir),
                     str(node_path)], cwd=str(comfy_dir), timeout=600)
@@ -1249,29 +1360,35 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
 
         models_dir = Path(cfg["models_dir"])
 
-        # 3. custom node --------------------------------------------------- #
+        # 3. custom nodes ---------------------------------------------------- #
         prog.begin("node")
+        wanted_engines = [e for e in ENGINES.values()
+                          if engine_enabled(cfg, e["id"])]
         if comfy_dir is None:
-            prog.finish("node", "Install the Qwen-TTS nodes in your own ComfyUI")
+            prog.finish("node", "Install the speech nodes in your own ComfyUI")
         else:
             nodes_dir = comfy_dir / "custom_nodes"
-            node_path = nodes_dir / NODE_DIR_NAME
-            if node_path.exists():
-                prog.detail("node", "Updating the Qwen-TTS nodes…")
-                _run(["git", "-C", str(node_path), "pull", "--ff-only"])
-            else:
-                if not have_git():
-                    raise RuntimeError("Git is needed to install the Qwen-TTS "
-                                       "nodes. Install it from the Engine panel.")
-                nodes_dir.mkdir(parents=True, exist_ok=True)
-                prog.detail("node", "Downloading the Qwen-TTS nodes…")
-                prog.log(f"git clone {NODE_REPO}")
-                res = _run(["git", "clone", "--depth", "1", NODE_REPO,
-                            str(node_path)])
-                if res.returncode != 0:
-                    raise RuntimeError("git clone failed: " +
-                                       (res.stderr or res.stdout)[-600:])
-            prog.finish("node", str(node_path))
+            landed = []
+            for eng in wanted_engines:
+                node_path = nodes_dir / eng["node_dir"]
+                if node_path.exists():
+                    prog.detail("node", f"Updating the {eng['label']} nodes…")
+                    _run(["git", "-C", str(node_path), "pull", "--ff-only"])
+                else:
+                    if not have_git():
+                        raise RuntimeError(
+                            f"Git is needed to install the {eng['label']} "
+                            "nodes. Install it from the Engine panel.")
+                    nodes_dir.mkdir(parents=True, exist_ok=True)
+                    prog.detail("node", f"Downloading the {eng['label']} nodes…")
+                    prog.log(f"git clone {eng['node_repo']}")
+                    res = _run(["git", "clone", "--depth", "1",
+                                eng["node_repo"], str(node_path)])
+                    if res.returncode != 0:
+                        raise RuntimeError("git clone failed: " +
+                                           (res.stderr or res.stdout)[-600:])
+                landed.append(eng["label"])
+            prog.finish("node", " and ".join(landed) + f" in {nodes_dir}")
 
         # 4. dependencies --------------------------------------------------- #
         prog.begin("deps")
@@ -1333,14 +1450,19 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
                             ["-r", str(comfy_dir / "requirements.txt")],
                             prog.log, say)
             cfg["python"] = str(target)
-            node_reqs = Path(cfg["comfy_dir"]) / "custom_nodes" / NODE_DIR_NAME \
-                / "requirements.txt"
-            if node_reqs.exists():
-                prog.detail("deps", "Installing the Qwen-TTS requirements…")
-                pip_install(str(target), ["-r", str(node_reqs)], prog.log,
-                            lambda t, pct: prog.detail("deps", t, pct))
-            else:
-                prog.log("No requirements.txt in the node folder — skipping.")
+            for eng in ENGINES.values():
+                if not engine_enabled(cfg, eng["id"]):
+                    continue
+                node_reqs = (Path(cfg["comfy_dir"]) / "custom_nodes"
+                             / eng["node_dir"] / "requirements.txt")
+                if node_reqs.exists():
+                    prog.detail("deps",
+                                f"Installing the {eng['label']} requirements…")
+                    pip_install(str(target), ["-r", str(node_reqs)], prog.log,
+                                lambda t, pct: prog.detail("deps", t, pct))
+                else:
+                    prog.log(f"No requirements.txt in {eng['node_dir']} — "
+                             "skipping.")
             prog.finish("deps", f"Installed into {Path(cfg['python']).name}")
 
         # 5. models --------------------------------------------------------- #
@@ -1358,7 +1480,7 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
                 # the bar crosses the run once instead of restarting per repo.
                 span, base = 100.0 / len(todo), 100.0 * i / len(todo)
                 download_repo(
-                    cfg, m["repo"], models_dir,
+                    cfg, m["repo"], models_dir, engine=m.get("engine", ""),
                     on_detail=lambda d, pct, _b=base, _s=span:
                         prog.detail("models", d, _b + (pct or 0) * _s / 100.0))
             prog.finish("models", "Voices and models ready")

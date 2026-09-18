@@ -164,6 +164,26 @@ def wait_for_prompt(prompt_id: str, job_id: str, timeout: int = 900) -> list[dic
                              "ComfyUI console.")
 
 
+def moss_dirs() -> dict:
+    """repo id -> the folder it is really in, for the folders that are there.
+
+    The MOSS loader treats local_model_path as a path only when it can stat it
+    and as a HuggingFace repo id otherwise, so handing it a folder that has not
+    been downloaded turns into snapshot_download("D:\\...\\MOSS-TTS"), which is
+    not a repo id and fails. A folder that is absent is left out here, and the
+    node then fetches the model itself.
+    """
+    base = Path(cfg["models_dir"]) if cfg.get("models_dir") else None
+    if not base:
+        return {}
+    out = {}
+    for m in bootstrap.ENGINES["moss"]["models"]:
+        folder = bootstrap.model_dir(base, m["repo"], "moss")
+        if folder.is_dir() and bootstrap.model_installed(base, m["repo"], "moss"):
+            out[m["repo"]] = str(folder)
+    return out
+
+
 def run_job(job_id: str, payload: dict) -> None:
     def set_state(**kw):
         with jobs_lock:
@@ -174,15 +194,24 @@ def run_job(job_id: str, payload: dict) -> None:
     try:
         lines = payload.get("lines") or []
         speakers = payload.get("speakers") or {}
+        engine = payload.get("engine") or cfg.get("engine") \
+            or bootstrap.DEFAULT_ENGINE
+        if engine not in bootstrap.ENGINES:
+            engine = bootstrap.DEFAULT_ENGINE
         opts = {
+            "engine": engine,
             "style": payload.get("style", ""),
             "model": payload.get("model", ""),
             "attention": payload.get("attention", "auto"),
             "unload": bool(payload.get("unload")),
             "temperature": payload.get("temperature"),
             "top_p": payload.get("top_p"),
+            "language": payload.get("language", ""),
             "prefer_wav": True,
         }
+        if engine == "moss":
+            opts["moss_model"] = payload.get("moss_model") or ""
+            opts["moss_dirs"] = moss_dirs()
         pause = float(payload.get("pause") or 0.5)
         folder.mkdir(parents=True, exist_ok=True)
         clips: list[Path] = []
@@ -233,6 +262,7 @@ def run_job(job_id: str, payload: dict) -> None:
             "style": payload.get("style", ""),
             "mode": payload.get("mode", "multi"),
             "created": time.time(),
+            "engine": engine,
             "pause": pause, "model": opts["model"],
             "speakers": {k: {"name": v.get("name"), "kind": v.get("kind"),
                              "speaker": v.get("speaker")}
@@ -291,28 +321,42 @@ def api_status():
     # with ComfyUI up, the nodes loaded and not one voice on disk reported the
     # engine ready and let someone press Read.
     models_known = bool(models_dir and models_dir.is_dir())
-    missing = [m["repo"] for m in bootstrap.missing_models(models_dir, cfg)] \
-        if models_known else []
+    engine = request.args.get("engine") or cfg.get("engine") \
+        or bootstrap.DEFAULT_ENGINE
+    if engine not in bootstrap.ENGINES:
+        engine = bootstrap.DEFAULT_ENGINE
     payload = {
         "comfy_online": online,
+        "engine": engine,
+        "engines": [{"id": e["id"], "label": e["label"], "blurb": e["blurb"],
+                     "enabled": bootstrap.engine_enabled(cfg, e["id"])}
+                    for e in bootstrap.ENGINES.values()],
         "setup_complete": bool(cfg.get("setup_complete")),
         # So the Create page can say "Setting up…" rather than offer a setup
         # that is already running.
         "setup_running": bool(progress.running),
         "models_known": models_known,
-        "missing_models": missing,
         "detected": detect_comfy_dirs(),
         "config": {k: cfg.get(k) for k in
                    ("comfy_url", "comfy_dir", "models_dir", "managed",
                     "auto_start_comfy", "torch_index", "want_clone",
-                    "want_17b", "want_voicedesign")},
+                    "want_17b", "want_voicedesign", "want_moss",
+                    "want_moss_8b", "want_moss_design", "engine")},
         "nodes_ready": False, "ready": False,
     }
+    # Readiness is per engine: with MOSS selected, a missing Qwen folder is
+    # not what stands between this script and a take, and reporting it as one
+    # sends people to download a model they are not about to use.
+    missing = [m["repo"] for m in
+               bootstrap.missing_models(models_dir, cfg, engine)] \
+        if models_known else []
+    payload["missing_models"] = missing
     if online:
         try:
-            payload["nodes_ready"] = client.has("CustomVoiceNode") \
-                or client.has("VoiceDesignNode")
-            payload["capabilities"] = client.capabilities()
+            payload["nodes_ready"] = client.engine_ready(engine)
+            payload["capabilities"] = client.capabilities(engine)
+            payload["engine_nodes"] = {
+                e: client.engine_ready(e) for e in bootstrap.ENGINES}
         except Exception as exc:  # noqa: BLE001
             payload["schema_error"] = str(exc)
     payload["ready"] = bool(online and payload["nodes_ready"]
@@ -324,14 +368,40 @@ def api_status():
 def api_voices():
     if not comfy_online(cfg["comfy_url"]):
         return jsonify({"error": "ComfyUI is not running."}), 503
+    engine = request.args.get("engine") or cfg.get("engine") \
+        or bootstrap.DEFAULT_ENGINE
     try:
+        if engine == "moss":
+            # No speaker enum exists on any MOSS node, so an empty list here is
+            # the truth rather than a failed read — "fallback" stays False so
+            # the page does not offer three Qwen names it cannot use.
+            #
+            # The picker carries repo ids, not the loader's display names: the
+            # display name a repo maps to is read off the node when the graph
+            # is built, and sending it back and forth through the browser would
+            # be one more place for the two to drift apart.
+            here = moss_dirs()
+            models = [{"value": m["repo"],
+                       "label": f"{m['repo'].split('/')[-1]} · {m['params']}"
+                                + ("" if m["repo"] in here else " (not downloaded)")}
+                      for m in bootstrap.ENGINES["moss"]["models"]
+                      if m["group"] != "moss_core"
+                      or "Tokenizer" not in m["repo"]]
+            return jsonify({
+                "engine": "moss", "speakers": [], "fallback": False,
+                "models": models,
+                "variants": client.moss_variants(),
+                "attentions": [],
+                "capabilities": client.capabilities("moss"),
+            })
         speakers = client.speakers()
         return jsonify({
+            "engine": "qwen",
             "speakers": speakers or [],
             "fallback": not speakers,
             "models": client.models(),
             "attentions": client.attentions(),
-            "capabilities": client.capabilities(),
+            "capabilities": client.capabilities("qwen"),
         })
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 400
@@ -343,7 +413,8 @@ def api_setup_start():
         return jsonify({"error": "Setup is already running."}), 409
     body = request.get_json(silent=True) or {}
     for key in ("comfy_url", "models_dir", "want_clone", "want_17b",
-                "want_voicedesign"):
+                "want_voicedesign", "want_moss", "want_moss_8b",
+                "want_moss_design"):
         if key in body:
             cfg[key] = body[key]
     cfg["comfy_url"] = clean_url(cfg.get("comfy_url")) or client.url
@@ -412,19 +483,27 @@ def api_comfy_restart():
         # force=True: the schema is cached for two minutes, and two minutes of
         # "still missing" after a restart that fixed it is the wrong answer.
         client.schema(force=True)
-        if client.has("CustomVoiceNode") or client.has("VoiceDesignNode"):
-            task.set(detail="Restarted — the Qwen-TTS nodes are loaded.")
+        wanted = [e for e in bootstrap.ENGINES
+                  if bootstrap.engine_enabled(cfg, e)
+                  and bootstrap.node_installed(Path(cfg["comfy_dir"]), e)]
+        short = [e for e in wanted if not client.engine_ready(e)]
+        if not short:
+            task.set(detail="Restarted — " + (", ".join(
+                bootstrap.ENGINES[e]["label"] for e in wanted) or "ComfyUI")
+                + " loaded.")
             return
-        task.set(detail="ComfyUI is up but the nodes are still missing — "
+        task.set(detail="ComfyUI is up but some nodes are still missing — "
                         "finding out why…")
         for line in comfy_proc.tail(80):
-            if "IMPORT FAILED" in line or "Qwen" in line:
+            if "IMPORT FAILED" in line or "Qwen" in line or "Moss" in line:
                 task.log(line)
-        why = bootstrap.node_import_error(py, Path(cfg["comfy_dir"]))
-        raise RuntimeError(
-            why or "ComfyUI did not load the nodes, but importing them by hand "
-                   "works — so something else in custom_nodes is failing "
-                   "first. Check the ComfyUI console.")
+        reasons = []
+        for eid in short:
+            why = bootstrap.node_import_error(py, Path(cfg["comfy_dir"]), eid)
+            reasons.append(f"{bootstrap.ENGINES[eid]['label']}: "
+                           + (why or "imports fine by hand, so something else "
+                                     "in custom_nodes is failing first"))
+        raise RuntimeError("; ".join(reasons))
 
     return jsonify({"ok": True,
                     "task": manager.spawn("engine", "Restart ComfyUI",
@@ -435,7 +514,8 @@ def api_comfy_restart():
 def api_config():
     body = request.get_json(silent=True) or {}
     for key in ("comfy_url", "comfy_dir", "models_dir", "auto_start_comfy",
-                "torch_index", "want_clone", "want_17b", "want_voicedesign"):
+                "torch_index", "want_clone", "want_17b", "want_voicedesign",
+                "want_moss", "want_moss_8b", "want_moss_design", "engine"):
         if key in body:
             cfg[key] = body[key]
     cfg["comfy_url"] = clean_url(cfg.get("comfy_url")) or client.url

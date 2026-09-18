@@ -1,5 +1,5 @@
 """
-comfy.py - talks to ComfyUI and builds the Qwen3-TTS graphs.
+comfy.py - talks to ComfyUI and builds the Qwen3-TTS and MOSS-TTS graphs.
 
 Graphs are built from ComfyUI's own /object_info rather than a stored workflow.
 The custom node renames and adds inputs between releases; reading the schema
@@ -15,6 +15,16 @@ is set up:
 
 Lines are generated one at a time and stitched afterwards, which is what lets
 the pause between lines, per-speaker voices and per-line retries work.
+
+MOSS-TTS is the same idea in two nodes rather than one, because its weights are
+loaded by a separate node that hands a MOSS_TTS_PIPE to the generator:
+
+  model's voice  Loader ─► MossTTSGenerate(text) ─► Save
+  cloned voice   Loader + LoadAudio ─► MossTTSGenerate(text, reference) ─► Save
+  designed voice Loader ─► MossTTSVoiceDesign(text, instruction) ─► Save
+
+It has no preset speakers at all — the voice comes from a reference clip, from
+a written description, or from the model itself.
 """
 
 from __future__ import annotations
@@ -32,6 +42,26 @@ CLONE = "VoiceCloneNode"
 DESIGN = "VoiceDesignNode"
 CLONE_PROMPT = "VoiceClonePromptNode"
 DIALOGUE = "DialogueInferenceNode"
+
+MOSS_LOADER = "MossTTSModelLoader"
+MOSS_GEN = "MossTTSGenerate"
+MOSS_DESIGN = "MossTTSVoiceDesign"
+MOSS_DIALOGUE = "MossTTSDialogue"
+
+# The loader's model_variant is an enum of display names — "MOSS-TTS (Local
+# 1.7B)" and friends — and the repo id each one maps to lives in the node's
+# constants, not in /object_info. So the entry is picked by substring, the same
+# way the Qwen design branch picks 1.7B out of its own enum, rather than typed
+# in here where a rename would go unnoticed.
+MOSS_VARIANT_HINTS = {
+    "OpenMOSS-Team/MOSS-TTS-Local-Transformer": ["local", "1.7"],
+    "OpenMOSS-Team/MOSS-TTS": ["delay", "8b"],
+    "OpenMOSS-Team/MOSS-VoiceGenerator": ["voicegenerator", "voice generator"],
+}
+
+MOSS_DEFAULT_MODEL = "OpenMOSS-Team/MOSS-TTS-Local-Transformer"
+MOSS_VOICE_GENERATOR = "OpenMOSS-Team/MOSS-VoiceGenerator"
+MOSS_CODEC = "OpenMOSS-Team/MOSS-Audio-Tokenizer"
 
 FALLBACK_SPEAKERS = ["Aiden", "Eric", "Serena"]
 
@@ -85,22 +115,38 @@ class ComfyClient:
     def node_inputs(self, class_type: str) -> dict:
         info = self.schema().get(class_type)
         if not info:
+            kit = "MOSS-TTS" if class_type.startswith("Moss") else "Qwen-TTS"
             raise ComfyError(
                 f"This ComfyUI has no '{class_type}' node. Install the "
-                "Qwen-TTS nodes from the Engine panel, then restart ComfyUI.")
+                f"{kit} nodes from the Engine panel, then restart ComfyUI.")
         spec = info.get("input", {})
         merged = {}
         merged.update(spec.get("required", {}) or {})
         merged.update(spec.get("optional", {}) or {})
         return merged
 
-    def ensure_supported(self) -> None:
+    def ensure_supported(self, engine: str = "qwen") -> None:
+        if engine == "moss":
+            if self.has(MOSS_LOADER) and (self.has(MOSS_GEN)
+                                          or self.has(MOSS_DESIGN)):
+                return
+            raise ComfyError(
+                "The MOSS-TTS nodes are not loaded in ComfyUI. Install them "
+                "from the Engine panel and restart ComfyUI — or switch the "
+                "engine back to Qwen3-TTS on the Create page.")
         if not self.has(CUSTOM) and not self.has(DESIGN) and not self.has(CLONE):
             raise ComfyError(
                 "The Qwen-TTS nodes are not loaded in ComfyUI. Install them "
                 "from the Engine panel and restart ComfyUI. If they are "
                 "installed, check the ComfyUI console for an IMPORT FAILED "
                 "line — that is usually a missing requirement.")
+
+    def engine_ready(self, engine: str) -> bool:
+        try:
+            self.ensure_supported(engine)
+            return True
+        except ComfyError:
+            return False
 
     def _enum(self, class_type: str, name: str) -> list[str]:
         try:
@@ -132,9 +178,38 @@ class ComfyClient:
                 return vals
         return []
 
-    def capabilities(self) -> dict:
+    def capabilities(self, engine: str = "qwen") -> dict:
+        if engine == "moss":
+            # No preset key at all would read as "unknown" in the page; MOSS
+            # genuinely has no speaker list, and saying so is the point.
+            return {"preset": False, "clone": self.has(MOSS_GEN),
+                    "design": self.has(MOSS_DESIGN),
+                    "dialogue": self.has(MOSS_DIALOGUE),
+                    "own_voice": self.has(MOSS_GEN)}
         return {"preset": self.has(CUSTOM), "clone": self.has(CLONE),
-                "design": self.has(DESIGN), "dialogue": self.has(DIALOGUE)}
+                "design": self.has(DESIGN), "dialogue": self.has(DIALOGUE),
+                "own_voice": False}
+
+    def moss_variants(self) -> list[str]:
+        return self._enum(MOSS_LOADER, "model_variant")
+
+    def moss_variant_for(self, repo: str) -> str:
+        """The loader enum entry that means `repo`, read off the node.
+
+        Empty when nothing matches, and the caller then leaves model_variant on
+        its own default rather than sending a value the node would reject.
+        """
+        hints = MOSS_VARIANT_HINTS.get(repo) or [repo.split("/")[-1].lower()]
+        variants = self.moss_variants()
+        for v in variants:
+            low = v.lower()
+            if all(h in low for h in hints):
+                return v
+        for v in variants:
+            low = v.lower()
+            if any(h in low for h in hints):
+                return v
+        return ""
 
     # ------------------------------------------------------------------ #
     # output node
@@ -171,9 +246,11 @@ class ComfyClient:
             name = self._match(spec, want["names"])
             if name is None:
                 if want.get("required"):
+                    kit = "MOSS-TTS" if class_type.startswith("Moss") \
+                        else "Qwen-TTS"
                     raise ComfyError(
                         f"{class_type} has no input for '{key}'. This version "
-                        "of the Qwen-TTS nodes does not match Script Builder — "
+                        f"of the {kit} nodes does not match Script Builder — "
                         "update it from the Engine panel.")
                 continue
             inputs[name] = want["value"]
@@ -196,7 +273,110 @@ class ComfyClient:
                     inputs[name] = ""
         return {"class_type": class_type, "inputs": inputs}
 
+    def _save(self, g: dict, source: str, opts: dict) -> str:
+        save_class, fmt = self.save_node(prefer_wav=opts.get("prefer_wav", True))
+        wanted = {
+            "audio": {"names": ["audio"], "value": [source, 0], "required": True},
+            "prefix": {"names": ["filename_prefix"],
+                       "value": "audio/ScriptBuilder"},
+        }
+        if save_class == "SaveAudioAdvanced":
+            wanted["format"] = {"names": ["format"], "value": fmt}
+        g["3"] = self._node(save_class, wanted)
+        return fmt
+
     def build_line(self, line: dict, voice: dict, opts: dict) -> dict:
+        """One line of dialogue → one prompt graph, on whichever engine."""
+        if (opts.get("engine") or "qwen") == "moss":
+            return self.build_moss_line(line, voice, opts)
+        return self.build_qwen_line(line, voice, opts)
+
+    def build_moss_line(self, line: dict, voice: dict, opts: dict) -> dict:
+        """One line → loader + generator + save.
+
+        MOSS splits what Qwen does in one node across two: the loader holds the
+        weights and hands a MOSS_TTS_PIPE downstream. Everything about which
+        checkpoint that is comes off the node's own enum.
+        """
+        self.ensure_supported("moss")
+        text = (line.get("text") or "").strip()
+        if not text:
+            raise ComfyError("There is an empty line in the script.")
+
+        kind = voice.get("kind") or "preset"
+        style = (opts.get("style") or "").strip()
+        instruct = (voice.get("instruct") or "").strip() or style
+        dirs = opts.get("moss_dirs") or {}
+        repo = opts.get("moss_model") or MOSS_DEFAULT_MODEL
+
+        if kind == "design":
+            if not self.has(MOSS_DESIGN):
+                raise ComfyError("This ComfyUI has no MossTTSVoiceDesign node, "
+                                 "so a described voice cannot be used on "
+                                 "MOSS-TTS.")
+            # The node itself warns when it is handed anything else: only
+            # MOSS-VoiceGenerator was trained to build a voice from a
+            # description, so the loader is pointed at it whatever the model
+            # picker says. Same reasoning as Qwen's VoiceDesign forcing 1.7B.
+            repo = MOSS_VOICE_GENERATOR
+
+        g: dict = {}
+        variant = self.moss_variant_for(repo)
+        loader = {}
+        if variant:
+            loader["variant"] = {"names": ["model_variant"], "value": variant}
+        # Only ever a folder that is really there. The loader treats a path it
+        # cannot stat as a HuggingFace repo id and calls snapshot_download on
+        # it, which fails on an absolute path — so a missing folder has to come
+        # through as "", which lets the node fetch the model itself.
+        local = dirs.get(repo) or ""
+        loader["local"] = {"names": ["local_model_path"], "value": local}
+        codec = dirs.get(MOSS_CODEC) or ""
+        loader["codec"] = {"names": ["codec_local_path"], "value": codec}
+        g["1"] = self._node(MOSS_LOADER, loader)
+
+        gen_class = MOSS_DESIGN if kind == "design" else MOSS_GEN
+        wanted = {
+            "pipe": {"names": ["moss_pipe"], "value": ["1", 0], "required": True},
+            "text": {"names": ["text", "target_text"], "value": text,
+                     "required": True},
+            # Without this the schema default of 0 is filled in for every line
+            # and a retry gives back exactly what it gave before.
+            "seed": {"names": ["seed", "noise_seed"],
+                     "value": random.randint(0, 2 ** 31 - 1)},
+        }
+        if opts.get("temperature") is not None:
+            wanted["temperature"] = {"names": ["temperature"],
+                                     "value": float(opts["temperature"])}
+        if opts.get("top_p") is not None:
+            wanted["top_p"] = {"names": ["top_p"], "value": float(opts["top_p"])}
+        if opts.get("language"):
+            wanted["language"] = {"names": ["language"],
+                                  "value": opts["language"]}
+
+        if kind == "design":
+            wanted["instruct"] = {
+                "names": ["instruction", "instruct", "description"],
+                "value": instruct or "A clear, natural voice", "required": True}
+        elif kind == "clone":
+            ref = voice.get("ref_audio")
+            if not ref:
+                raise ComfyError("That speaker is set to a cloned voice but has "
+                                 "no reference audio loaded.")
+            g["2"] = self._node("LoadAudio",
+                                {"audio": {"names": ["audio"], "value": ref,
+                                           "required": True}})
+            wanted["reference"] = {"names": ["reference_audio", "ref_audio"],
+                                   "value": ["2", 0], "required": True}
+        # kind == "preset" falls through with no reference and no instruction:
+        # MOSS has no speaker list, and the base model then speaks in a voice
+        # of its own, which is what the page offers as "the model's own voice".
+
+        g["4"] = self._node(gen_class, wanted)
+        fmt = self._save(g, "4", opts)
+        return {"prompt": g, "format": fmt}
+
+    def build_qwen_line(self, line: dict, voice: dict, opts: dict) -> dict:
         """One line of dialogue → one prompt graph.
 
         line  : {"text": str}
@@ -299,15 +479,7 @@ class ComfyClient:
             })
             g["2"] = self._node(CUSTOM, wanted)
 
-        save_class, fmt = self.save_node(prefer_wav=opts.get("prefer_wav", True))
-        save_wanted = {
-            "audio": {"names": ["audio"], "value": ["2", 0], "required": True},
-            "prefix": {"names": ["filename_prefix"], "value": "audio/ScriptBuilder"},
-        }
-        if save_class == "SaveAudioAdvanced":
-            save_wanted["format"] = {"names": ["format"], "value": fmt}
-        g["3"] = self._node(save_class, save_wanted)
-
+        fmt = self._save(g, "2", opts)
         return {"prompt": g, "format": fmt}
 
     # ------------------------------------------------------------------ #

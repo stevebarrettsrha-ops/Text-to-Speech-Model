@@ -1,13 +1,21 @@
 # Script Builder
 
 A local text-to-speech studio. Write a script with named speakers, press Run,
-and Qwen3-TTS reads it on your own machine — no account, no upload, no per-word
-billing.
+and it is read on your own machine — no account, no upload, no per-word billing.
+
+Two engines, switched from the picker on the Create page:
+
+| | [Qwen3-TTS](https://github.com/flybirdxx/ComfyUI-Qwen-TTS) | [MOSS-TTS](https://github.com/richservo/comfyui-moss-tts) |
+|---|---|---|
+| Preset speakers | nine, read off the node | none — see below |
+| Clone from a clip | yes | yes |
+| Voice from a description | yes, 1.7B | yes, needs the 8B VoiceGenerator |
+| Smallest useful model | 0.9B | 1.7B, about 5 GB of VRAM |
 
 The layout is the Script Builder file you already had: raw structure on the
 left, dialogue blocks in the middle, speaker settings on the right. What changed
-is underneath — the browser's own voices are gone, and every line is spoken by
-Qwen3-TTS running through ComfyUI.
+is underneath — the browser's own voices are gone, and every line is spoken by a
+local model running through ComfyUI.
 
 ---
 
@@ -45,10 +53,21 @@ Nothing goes into your system Python.
 
 - Python 3.10 or newer (on Debian and Ubuntu, `python3-venv` too)
 - Git
-- An NVIDIA GPU with 8 GB or more is comfortable. Less works with **Free GPU
-  memory after each run** switched on. CPU works but is slow.
+- An NVIDIA GPU with 8 GB or more is comfortable for Qwen3-TTS and for MOSS's
+  1.7B. MOSS's Delay 8B models want about 18 GB and are left un-ticked by
+  default. Less works with **Free GPU memory after each run** switched on. CPU
+  works but is slow.
 
 ### Model folders
+
+**The two engines do not share a folder shape**, and neither shape is a
+preference — each is where that node looks. Qwen nests by organisation,
+`models/qwen-tts/<Org>/<Name>`; MOSS flattens the slash,
+`models/moss-tts/<Org>--<Name>`, because its loader builds that path from
+`repo_id.replace("/", "--")`. Move a MOSS folder into the Qwen tree and the node
+cannot see it — it quietly downloads a second copy.
+
+#### Qwen3-TTS
 
 All six repos in the [Qwen3-TTS collection](https://huggingface.co/collections/Qwen/qwen3-tts),
 pulled into `ComfyUI/models/qwen-tts/Qwen/`:
@@ -71,6 +90,27 @@ preset speakers, **Base** does zero-shot cloning, **VoiceDesign** builds a voice
 from a description. The node's own README only lists Base and VoiceDesign, so
 the CustomVoice mapping is read off the model names — if a preset voice errors,
 grab the matching Base folder from the Models page and the node will find it.
+
+#### MOSS-TTS
+
+Pulled into `ComfyUI/models/moss-tts/`:
+
+| Folder | Size | VRAM | What it does |
+|---|---|---|---|
+| `OpenMOSS-Team--MOSS-Audio-Tokenizer` | codec | — | Shared codec; every MOSS model needs it |
+| `OpenMOSS-Team--MOSS-TTS-Local-Transformer` | 1.7B | ~5 GB | Speech and cloning, and the fast one |
+| `OpenMOSS-Team--MOSS-TTS` | 8B | ~18 GB | Delay 8B — better, far slower |
+| `OpenMOSS-Team--MOSS-VoiceGenerator` | 8B | ~18 GB | Voice from a description |
+
+Only the codec and the 1.7B are downloaded by default. The other two are Delay
+8B models wanting roughly 18 GB of VRAM, which no 8 GB card will hold, and the
+node's own README calls the 1.7B "the only model fast enough for practical
+iterative use on a single consumer GPU" — so they are a tick on the setup sheet
+and a button on the Models page, not a default. Downloading tens of gigabytes
+you cannot run is worse than not having them.
+
+The repo names come from the nodes' own source — `HF_MODEL_MAP` for Qwen,
+`utils/constants.py` for MOSS — not from either README, which list fewer.
 
 Duplicate weights are skipped: where a repo ships both `.safetensors` and
 `.bin`, only the safetensors are fetched.
@@ -108,11 +148,19 @@ Each speaker picks one in the Voices card:
 
 - **Preset** — the voices built into Qwen3-TTS. The list is read from the node
   itself, so it stays right when the node is updated. **Hear it** generates a
-  one-line sample.
+  one-line sample. On MOSS this button reads **Own voice** instead: MOSS has no
+  speaker list at all, and with neither a clip nor a description it speaks in a
+  voice of its own that changes with the seed.
 - **Clone** — upload a clean 5–15 second clip and type what is said in it.
-  Matching the reference text properly makes a large difference.
-- **Design** — describe a voice in words. Needs the VoiceDesign model, which
-  only exists as 1.7B; a designed line uses it whatever the model picker says.
+  Matching the reference text properly makes a large difference. Both engines
+  do this.
+- **Design** — describe a voice in words. On Qwen it needs the VoiceDesign
+  model, which only exists as 1.7B; on MOSS it needs MOSS-VoiceGenerator. Either
+  way a designed line loads that model whatever the model picker says, because
+  it is the only one trained for it.
+
+Switching engines keeps the script and the speaker names — only the voice
+sources change, since the two engines do not offer the same ones.
 
 ### More options
 
@@ -196,9 +244,9 @@ run without touching the first one's takes.
 
 ```bash
 node tests/check.mjs     # everything compiles and the inline script parses
-npm run test:units       # 43 unit tests, standard library only
+npm run test:units       # 98 unit tests, standard library only
 npm install && npx playwright install chromium
-npm test                 # 52 checks driving the real page in headless Chromium
+npm test                 # 68 checks driving the real page in headless Chromium
 ```
 
 None of it needs a GPU, a model download or the network: `tests/mock_comfy.py`

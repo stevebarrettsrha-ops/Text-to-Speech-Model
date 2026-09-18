@@ -291,6 +291,7 @@
   .state.missing{color:#ffa8a8;border-color:rgba(255,90,90,.36);background:rgba(255,90,90,.08)}
   .state.warn,.state.wanted{color:#ffd693;border-color:rgba(255,176,32,.36);
          background:rgba(255,176,32,.08)}
+  .state.off{color:var(--dim);border-style:dashed}
   .log{background:#08080a;border:1px solid var(--line-soft);border-radius:11px;padding:12px;
        font-family:ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace;font-size:11.5px;
        color:#9a9aa4;height:210px;overflow-y:auto;white-space:pre-wrap;line-height:1.55}
@@ -411,8 +412,9 @@
       <div class="banner">
         <h3>Three ways to find a voice</h3>
         <p>Pick a preset speaker, clone one from a short clip, or describe the voice
-           you want in words. Qwen3-TTS does all three on your own GPU — nothing
-           leaves this machine.</p>
+           you want in words. Two engines, switched on the Create page —
+           Qwen3-TTS does all three, MOSS-TTS clones and designs. Both run on
+           your own GPU; nothing leaves this machine.</p>
         <button class="btn" data-view="create">Start a script</button>
       </div>
       <div class="rowhead">Recent takes
@@ -429,6 +431,10 @@
         <div class="segmented" id="segMode">
           <button class="on" data-v="multi">Two speakers</button>
           <button data-v="single">One speaker</button>
+        </div>
+        <div class="modelsel">
+          <svg viewBox="0 0 24 24" style="width:14px;height:14px"><path d="M12 2a7 7 0 0 1 7 7v4a7 7 0 0 1-14 0V9a7 7 0 0 1 7-7z"/><path d="M9 21h6"/></svg>
+          <select id="engine-sel" title="Which speech model reads the script"></select>
         </div>
         <div class="modelsel">
           <svg viewBox="0 0 24 24" style="width:14px;height:14px"><path d="M12 3 3 8l9 5 9-5zM3 16l9 5 9-5"/></svg>
@@ -478,7 +484,7 @@
             <div class="ctl"><div class="slider">
               <input type="range" id="temp-sl" min="0.2" max="1.5" step="0.05" value="0.9">
               <span class="v" id="temp-v">0.90</span></div></div></div>
-          <div class="orow"><span class="lab">Attention <i class="hint">i</i></span>
+          <div class="orow" id="rowAttn"><span class="lab">Attention <i class="hint">i</i></span>
             <div class="ctl"><select id="attn-sel"><option value="auto">auto</option></select></div></div>
           <div class="orow"><span class="lab">Free GPU memory after each run <i class="hint">i</i></span>
             <div class="ctl"><div class="segmented" id="segUnload">
@@ -630,9 +636,10 @@
 <div class="veil" id="veil-setup" hidden>
   <div class="sheet">
     <h1>Set up the engine</h1>
-    <p class="lede">Script Builder speaks with Qwen3-TTS on this machine, through ComfyUI.
-      The first run installs ComfyUI, adds the Qwen-TTS nodes and downloads the voices.
-      After that it starts on its own.</p>
+    <p class="lede">Script Builder speaks with Qwen3-TTS and MOSS-TTS on this machine,
+      through ComfyUI. The first run installs ComfyUI, adds both sets of nodes and
+      downloads the voices. After that it starts on its own, and you switch engines
+      on the Create page.</p>
     <div id="setup-choice">
       <div class="pick" id="pick-list"></div>
       <div class="grid2">
@@ -642,6 +649,16 @@
           <input type="checkbox" id="opt-design"></div>
         <div class="switch"><label for="opt-17b">1.7B versions (better, slower)</label>
           <input type="checkbox" id="opt-17b"></div>
+        <div class="switch"><label for="opt-moss">MOSS-TTS as a second engine</label>
+          <input type="checkbox" id="opt-moss" checked></div>
+        <div class="switch"><label for="opt-moss-8b"
+          title="Delay 8B — about 18 GB of VRAM, and slow on one card">MOSS
+          Delay 8B (needs ~18 GB VRAM)</label>
+          <input type="checkbox" id="opt-moss-8b"></div>
+        <div class="switch"><label for="opt-moss-design"
+          title="MOSS-VoiceGenerator is a Delay 8B model too">MOSS voice design
+          (needs ~18 GB VRAM)</label>
+          <input type="checkbox" id="opt-moss-design"></div>
       </div>
       <div class="rowbtn">
         <button class="btn go" id="btnRunSetup">Start setup</button>
@@ -727,7 +744,7 @@
 
 /* ========================= state ========================= */
 var S = {
-  view: "home", mode: "multi", blocks: [],
+  view: "home", mode: "multi", blocks: [], engine: "qwen",
   speakers: {
     1: { name: "Speaker 1", kind: "preset", speaker: "", ref_audio: "", ref_text: "", instruct: "" },
     2: { name: "Speaker 2", kind: "preset", speaker: "", ref_audio: "", ref_text: "", instruct: "" }
@@ -942,11 +959,13 @@ function loadExample(i) {
 }
 function saveDraft() {
   store("sb.draft", { mode: S.mode, style: $("style-input").value, blocks: S.blocks,
-    speakers: S.speakers, pause: $("pause-sl").value, temp: $("temp-sl").value });
+    speakers: S.speakers, pause: $("pause-sl").value, temp: $("temp-sl").value,
+    engine: S.engine });
 }
 function loadDraft() {
   var d = store("sb.draft");
   if (!d) { loadExample(0); return; }
+  if (d.engine) S.engine = d.engine;
   S.blocks = d.blocks || [];
   if (d.speakers) S.speakers = d.speakers;
   $("style-input").value = d.style || "";
@@ -969,7 +988,11 @@ function renderSpeakers() {
       '<div><label class="flab">Name</label>' +
       '<input type="text" data-name="' + n + '" value="' + esc(s.name) + '"></div>' +
       '<div><label class="flab">Voice source</label><div class="seg3" data-src="' + n + '">' +
-      '<button data-v="preset"' + (s.kind === "preset" ? ' class="on"' : "") + '>Preset</button>' +
+      // MOSS has no speaker list at all, so "Preset" would be a button that
+      // opens an empty dropdown. On that engine the same slot is the model's
+      // own voice, which is what it does with neither a clip nor a description.
+      '<button data-v="preset"' + (s.kind === "preset" ? ' class="on"' : "") + '>' +
+      (isMoss() ? "Own voice" : "Preset") + '</button>' +
       '<button data-v="clone"' + (s.kind === "clone" ? ' class="on"' : "") + '>Clone</button>' +
       '<button data-v="design"' + (s.kind === "design" ? ' class="on"' : "") + '>Design</button>' +
       "</div></div></div>" +
@@ -989,6 +1012,12 @@ function renderSpeakers() {
 function renderSpeakerBody(n) {
   var s = S.speakers[n];
   var body = $("spk-" + n).querySelector("[data-body]");
+  if (s.kind === "preset" && isMoss()) {
+    body.innerHTML = '<div class="note">MOSS-TTS has no preset speakers. With no ' +
+      'clip and no description it picks a voice of its own, and a different ' +
+      'seed gives a different one. Use Clone or Design to pin it down.</div>';
+    return;
+  }
   if (s.kind === "preset") {
     body.innerHTML = '<label class="flab">Voice <span style="color:var(--dim)" id="vcount-' +
       n + '"></span></label><div style="display:flex;gap:7px">' +
@@ -1031,7 +1060,10 @@ function renderSpeakerBody(n) {
       '<textarea rows="3" data-instruct="' + n +
       '" placeholder="A gentle female voice with a high pitch, speaking slowly">' +
       esc(s.instruct) + "</textarea>" +
-      '<div class="note">Needs the 1.7B VoiceDesign model — one button on the Models page.</div>';
+      '<div class="note">' + (isMoss()
+        ? "Needs MOSS-VoiceGenerator — a Delay 8B model, so about 18 GB of VRAM. Tick it on the Models page."
+        : "Needs the 1.7B VoiceDesign model — one button on the Models page.") +
+      "</div>";
     body.querySelector("[data-instruct]").addEventListener("input", function (e) {
       S.speakers[n].instruct = e.target.value; saveDraft(); });
   }
@@ -1039,10 +1071,11 @@ function renderSpeakerBody(n) {
 function setSource(n, kind) {
   S.speakers[n].kind = kind;
   var caps = S.voices.capabilities || {};
+  var kit = isMoss() ? "MOSS-TTS" : "Qwen-TTS";
   if (kind === "clone" && caps.clone === false)
-    toast("This ComfyUI has no VoiceCloneNode — update the Qwen-TTS nodes.", true);
+    toast("This ComfyUI cannot clone a voice — update the " + kit + " nodes.", true);
   if (kind === "design" && caps.design === false)
-    toast("This ComfyUI has no VoiceDesignNode — update the Qwen-TTS nodes.", true);
+    toast("This ComfyUI cannot design a voice — update the " + kit + " nodes.", true);
   $("spk-" + n).querySelectorAll("[data-src] button").forEach(function (b) {
     b.classList.toggle("on", b.dataset.v === kind); });
   renderSpeakerBody(n);
@@ -1062,24 +1095,74 @@ async function uploadRef(n, input) {
   } catch (e) { toast(e.message, true); }
   input.value = "";
 }
+function isMoss() { return S.engine === "moss"; }
+
 async function loadVoices() {
   try {
-    S.voices = await api("/api/voices");
+    S.voices = await api("/api/voices?engine=" + encodeURIComponent(S.engine));
     fillSelect($("model-sel"), S.voices.models || [], "");
     fillSelect($("attn-sel"), S.voices.attentions || ["auto"], "auto");
+    // MOSS has no attention picker on any of its nodes — it resolves flash
+    // attention itself from the card. An empty select reading "auto" is fine;
+    // a stale Qwen list next to a MOSS take is not.
+    $("rowAttn").hidden = isMoss();
     renderSpeakers();
   } catch (e) { renderSpeakers(); }
 }
+
+function fillEngines(list, current) {
+  var sel = $("engine-sel");
+  var have = list && list.length ? list
+    : [{ id: "qwen", label: "Qwen3-TTS", enabled: true }];
+  sel.innerHTML = "";
+  have.forEach(function (e) {
+    if (e.enabled === false) return;
+    var o = document.createElement("option");
+    o.value = e.id;
+    o.textContent = e.label;
+    o.title = e.blurb || "";
+    sel.appendChild(o);
+  });
+  if (!sel.options.length) {
+    sel.innerHTML = '<option value="qwen">Qwen3-TTS</option>';
+  }
+  sel.value = current;
+  if (sel.value !== current) sel.value = sel.options[0].value;
+}
+
+async function setEngine(id) {
+  if (id === S.engine) return;
+  S.engine = id;
+  S.voices = {};
+  saveDraft();
+  // Remembered server-side so a reload, and the next /api/status, come back
+  // on the engine that is showing rather than snapping to Qwen.
+  try {
+    await api("/api/config", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ engine: id }) });
+  } catch (e) { /* the picker still works for this run */ }
+  await refreshStatus();
+  await loadVoices();
+}
+/* Values may be plain strings (Qwen's model_choice enum) or {value,label}
+   pairs (MOSS repo ids, which want a readable name beside them). */
 function fillSelect(sel, values, preferred) {
   var keep = sel.value;
   sel.innerHTML = "";
-  if (!values.length) { sel.innerHTML = '<option value="">auto</option>'; return; }
+  if (!values || !values.length) {
+    sel.innerHTML = '<option value="">auto</option>'; return;
+  }
+  var ids = values.map(function (v) {
+    return typeof v === "string" ? v : v.value; });
   values.forEach(function (v) {
     var o = document.createElement("option");
-    o.value = v; o.textContent = v; sel.appendChild(o);
+    o.value = typeof v === "string" ? v : v.value;
+    o.textContent = typeof v === "string" ? v : (v.label || v.value);
+    sel.appendChild(o);
   });
-  sel.value = values.indexOf(keep) >= 0 ? keep
-    : (values.indexOf(preferred) >= 0 ? preferred : values[0]);
+  sel.value = ids.indexOf(keep) >= 0 ? keep
+    : (ids.indexOf(preferred) >= 0 ? preferred : ids[0]);
 }
 
 /* ========================= run ========================= */
@@ -1090,9 +1173,15 @@ function collectSpeaker(n) {
 }
 function body(lines, title) {
   return {
+    engine: S.engine,
+    // On MOSS the picker holds the loader's own display names, and the server
+    // maps one back to a repo id; on Qwen it is model_choice. Two different
+    // fields, because they are two different things.
+    moss_model: isMoss() ? $("model-sel").value : "",
     mode: S.mode, style: $("style-input").value.trim(), title: title || $("takeTitle").value.trim(),
     lines: lines, speakers: { 1: collectSpeaker(1), 2: collectSpeaker(2) },
-    model: $("model-sel").value, attention: $("attn-sel").value,
+    model: isMoss() ? "" : $("model-sel").value,
+    attention: isMoss() ? "auto" : $("attn-sel").value,
     unload: $("segUnload").querySelector("button.on").dataset.v === "on",
     pause: parseFloat($("pause-sl").value), temperature: parseFloat($("temp-sl").value)
   };
@@ -1485,7 +1574,7 @@ function waitForTask(id) {
   });
 }
 async function installAllMissing() {
-  var order = ["git", "comfyui", "node", "torch", "node_reqs"];
+  var order = ["git", "comfyui", "node", "node_moss", "torch", "node_reqs"];
   try {
     var d = await api("/api/deps");
     var missing = order.filter(function (id) {
@@ -1594,9 +1683,13 @@ async function loadHf() {
     $("hf-repo").value = s.repo;
     $("hf-token-note").textContent = s.token_set
       ? "A token is saved (" + s.token_hint + "). Leave the box empty to keep it."
-      : "No token saved. The Qwen repos are public.";
+      : "No token saved. The Qwen and MOSS repos are public.";
+    // The two layouts are not the same shape and saying so here is cheaper
+    // than someone moving a MOSS folder into the Qwen tree and wondering why
+    // the node downloads it again.
     $("models-dir-note").textContent = s.models_dir
-      ? "Stored in " + s.models_dir + "/qwen-tts/Qwen/"
+      ? "Stored in " + s.models_dir + "/qwen-tts/Qwen/ and " +
+        s.models_dir + "/moss-tts/"
       : "No models folder set yet — run setup first.";
     var box = $("curated-list");
     box.innerHTML = "";
@@ -1604,7 +1697,8 @@ async function loadHf() {
       var el = document.createElement("div");
       el.className = "fitem";
       el.innerHTML = '<div class="n"><b>' + esc(c.repo.split("/")[1]) + "</b><span>" +
-        esc(c.note) + " · " + esc(c.params) + '</span></div><div class="right">' +
+        esc(c.engine_label || "") + " · " + esc(c.note) + " · " + esc(c.params) +
+        '</span></div><div class="right">' +
         '<span class="state ' + (c.installed ? "ok"
           : c.role === "required" ? "missing" : c.role === "wanted" ? "wanted" : "") +
         '">' + (c.installed ? "installed" : esc(c.role)) + "</span></div>";
@@ -1738,7 +1832,10 @@ async function runSetup() {
       body: JSON.stringify({ mode: opt.mode, comfy_dir: opt.dir,
         want_clone: $("opt-clone").checked,
         want_17b: $("opt-17b").checked,
-        want_voicedesign: $("opt-design").checked }) });
+        want_voicedesign: $("opt-design").checked,
+        want_moss: $("opt-moss").checked,
+        want_moss_8b: $("opt-moss-8b").checked,
+        want_moss_design: $("opt-moss-design").checked }) });
     pollSetup();
   } catch (e) { toast(e.message, true); }
 }
@@ -1790,13 +1887,19 @@ async function refreshStatus() {
   var st;
   try { st = await api("/api/status"); } catch (e) { return; }
   var was = S.status && S.status.ready;
+  var wasEngine = S.status && S.status.engine;
   S.status = st;
+  if (st.engine) S.engine = st.engine;
+  fillEngines(st.engines, S.engine);
+  // The engine's own name, so "Nodes not loaded" says whose.
+  var eng = (st.engines || []).filter(function (e) { return e.id === S.engine; })[0];
+  S.engineLabel = eng ? eng.label : "the engine";
   var pill = $("enginePill");
   pill.classList.toggle("on", !!st.ready);
   pill.classList.toggle("off", !st.comfy_online);
   pill.querySelector("span").textContent = st.ready ? "Engine ready"
     : !st.comfy_online ? "Engine offline"
-    : !st.nodes_ready ? "Nodes not loaded"
+    : !st.nodes_ready ? (S.engineLabel || "Engine") + " nodes not loaded"
     : st.missing_models.length ? "Models missing"
     : st.models_known === false ? "No models folder" : "Engine loading";
   $("modelsTag").hidden = !(st.missing_models && st.missing_models.length);
@@ -1810,7 +1913,7 @@ async function refreshStatus() {
   $("cfg-models").value = c.models_dir || "";
   $("cfg-auto").checked = !!c.auto_start_comfy;
   $("cfg-note").textContent = st.schema_error || "";
-  if (st.ready && !was) loadVoices();
+  if ((st.ready && !was) || (wasEngine && wasEngine !== st.engine)) loadVoices();
   if (!st.setup_complete && !S.setupSeen) { S.setupSeen = true; openSetup(); }
 }
 
@@ -1832,6 +1935,8 @@ function wire() {
     });
   });
   $("btnAdd").addEventListener("click", function () { addBlock(); });
+  $("engine-sel").addEventListener("change", function (e) {
+    setEngine(e.target.value); });
   $("btnRun").addEventListener("click", runScript);
   $("btnStop").addEventListener("click", stopAll);
   $("style-input").addEventListener("input", function () { updateRaw(); saveDraft(); });

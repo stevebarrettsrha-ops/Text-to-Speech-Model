@@ -248,16 +248,79 @@ try {
   /* -------------------------------------------------------------- models */
   await page.click('.nav[data-view="models"]');
   await sleep(1400);
-  const curated = (await page.$$('#curated-list .fitem')).length;
-  is(curated === 6, 'all six model folders are listed', String(curated));
+  const curated = await page.$$eval('#curated-list .fitem',
+    e => e.map(x => x.querySelector('span').textContent.split(' · ')[0]));
+  // Six Qwen folders and four MOSS ones, each row saying which engine it is
+  // for — the two sets live in different folder shapes and are not
+  // interchangeable.
+  is(curated.filter(x => x === 'Qwen3-TTS').length === 6
+       && curated.filter(x => x === 'MOSS-TTS').length === 4,
+     'both engines\' model folders are listed', curated.join(', '));
   const installed = await page.$$eval('#curated-list .state.ok', e => e.length);
-  is(installed >= 4, 'installed folders are marked', `${installed} installed`);
+  is(installed >= 7, 'installed folders are marked', `${installed} installed`);
+
+  /* ------------------------------------------------------- the two engines */
+  await page.click('.nav[data-view="create"]');
+  await sleep(600);
+  const engines = await page.$$eval('#engine-sel option',
+    e => e.map(x => ({ id: x.value, label: x.textContent })));
+  is(engines.length === 2 && engines.some(e => e.id === 'qwen')
+       && engines.some(e => e.id === 'moss'),
+     'both engines are offered', engines.map(e => e.label).join(', '));
+
+  // MOSS has no speaker enum on any node, so "Preset" would open an empty
+  // dropdown. The same slot has to become the model's own voice instead.
+  await page.selectOption('#engine-sel', 'moss');
+  await sleep(2500);
+  const mossSrc = await page.$$eval('[data-src="1"] button',
+    e => e.map(x => x.textContent.trim()));
+  is(mossSrc[0] === 'Own voice', 'MOSS drops the preset speaker list',
+     mossSrc.join('/'));
+  is(/no preset speakers/i.test(await page.textContent('[data-body="1"]')),
+     'and says why rather than showing an empty picker');
+  is(await page.$eval('#rowAttn', e => e.hidden),
+     'the attention picker is hidden on MOSS, which has none');
+  const mossModels = await page.$$eval('#model-sel option',
+    e => e.map(x => x.value));
+  is(mossModels.some(v => v.startsWith('OpenMOSS-Team/')),
+     'the model picker carries MOSS repo ids', mossModels.join(', '));
+  const mossStatus = await app.api('/api/status?engine=moss');
+  is(mossStatus.ready === true && mossStatus.capabilities.preset === false,
+     'MOSS reports ready with no presets',
+     JSON.stringify(mossStatus.capabilities));
+
+  // A take on MOSS, through the real page, on the two-node graph.
+  await page.click('.nav[data-view="create"]');
+  await sleep(400);
+  const beforeMoss = (await takes()).length;
+  await page.click('#btnRun');
+  for (let i = 0; i < 90; i++) {
+    await sleep(700);
+    if ((await takes()).length > beforeMoss) break;
+  }
+  const mossTake = (await takes()).find(t => t.engine === 'moss');
+  is(!!mossTake, 'MOSS produces a take', mossTake && mossTake.title);
+  const mossLog = await app.comfyApi('/mock/log');
+  const mossQueued = (mossLog.log || []).filter(l => l.includes('MossTTS'));
+  is(mossQueued.some(l => l.includes('MossTTSModelLoader')
+                       && l.includes('MossTTSGenerate') && l.includes('|local')),
+     'the MOSS graph is loader + generator, pointed at a local folder',
+     mossQueued[mossQueued.length - 1] || 'none');
+
+  await page.selectOption('#engine-sel', 'qwen');
+  await sleep(2000);
+  is((await page.$$eval('[data-src="1"] button',
+       e => e.map(x => x.textContent.trim())))[0] === 'Preset',
+     'switching back restores the preset speakers');
 
   /* -------------------------------------------------------------- engine */
   await page.click('.nav[data-view="engine"]');
   await sleep(2500);
   const deps = (await page.$$('#dep-list .fitem')).length;
   is(deps >= 6, 'the dependency list renders', `${deps} rows`);
+  const depIds = (await app.api('/api/deps')).items.map(i => i.id);
+  is(depIds.includes('node') && depIds.includes('node_moss'),
+     'each engine has its own node row', depIds.join(', '));
 
   // torch 2.14.0+cpu landed on a machine with an RTX 4060 in it, because the
   // only test for a GPU was shutil.which("nvidia-smi"). The panel now says
@@ -326,6 +389,8 @@ try {
   // step that starts the engine — on the one screen where order is the point.
   is(steps[0].startsWith('Check Python') && steps[steps.length - 1].startsWith('Start ComfyUI'),
      'setup steps are in the order they run', steps.join(' | '));
+  is(steps.some(s => /speech nodes/i.test(s)),
+     'the node step covers both engines, not just Qwen', steps[2]);
   // Escape deliberately will not dismiss a setup that has run — the panel is
   // closed with its own button, which is what a person would press.
   await page.click(setupDone ? '#setup-done' : '#setup-hide');

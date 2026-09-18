@@ -879,12 +879,18 @@ class NodesNotLoaded(unittest.TestCase):
         def has(self, _cls):
             return self.loaded
 
+        def engine_ready(self, _engine):
+            return self.loaded
+
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="sb-deps-"))
         (self.root / "main.py").write_text("")
         node = self.root / "custom_nodes" / bootstrap.NODE_DIR_NAME
         node.mkdir(parents=True)
         (node / "nodes.py").write_text("")
+        moss = self.root / "custom_nodes" / bootstrap.MOSS_NODE_DIR_NAME
+        moss.mkdir(parents=True)
+        (moss / "__init__.py").write_text("")
         (self.root / "models").mkdir()
         self.cfg = {"comfy_dir": str(self.root),
                     "models_dir": str(self.root / "models"),
@@ -909,6 +915,285 @@ class NodesNotLoaded(unittest.TestCase):
         item = self._node_item(True)
         self.assertEqual(item["state"], "ok")
         self.assertEqual(item["action"], "update")
+
+    def test_each_engine_gets_its_own_row(self):
+        items = manager.dependencies(self.cfg, self.Engine(True))
+        rows = {i["id"]: i["label"] for i in items}
+        self.assertEqual(rows.get("node"), "Qwen3-TTS nodes")
+        self.assertEqual(rows.get("node_moss"), "MOSS-TTS nodes")
+
+    def test_an_engine_turned_off_is_not_reported_as_missing(self):
+        items = manager.dependencies(dict(self.cfg, want_moss=False),
+                                     self.Engine(True))
+        moss = [i for i in items if i["id"] == "node_moss"][0]
+        self.assertEqual(moss["state"], "off")
+        self.assertIsNone(moss["action"])
+
+
+# --------------------------------------------------------------------------- #
+# MOSS-TTS, the second engine
+# --------------------------------------------------------------------------- #
+MOSS_VARIANTS = ["MOSS-TTS (Delay 8B)", "MOSS-TTS (Local 1.7B)",
+                 "MOSS-TTSD v1.0", "MOSS-VoiceGenerator", "MOSS-SoundEffect"]
+
+MOSS_SCHEMA = {
+    "MossTTSModelLoader": {"input": {"required": {
+        "model_variant": [MOSS_VARIANTS, {"default": MOSS_VARIANTS[0]}],
+        "local_model_path": ["STRING", {"default": ""}],
+        "codec_local_path": ["STRING", {"default": ""}]}}},
+    "MossTTSGenerate": {"input": {
+        "required": {"moss_pipe": ["MOSS_TTS_PIPE"],
+                     "language": [["auto", "zh", "en"], {"default": "auto"}],
+                     "text": ["STRING", {"default": ""}],
+                     "seed": ["INT", {"default": 0}],
+                     "temperature": ["FLOAT", {"default": 1.7}],
+                     "top_p": ["FLOAT", {"default": 0.8}]},
+        "optional": {"reference_audio": ["AUDIO"]}}},
+    "MossTTSVoiceDesign": {"input": {"required": {
+        "moss_pipe": ["MOSS_TTS_PIPE"],
+        "language": [["auto", "zh", "en"], {"default": "auto"}],
+        "text": ["STRING", {"default": ""}],
+        "instruction": ["STRING", {"default": ""}],
+        "seed": ["INT", {"default": 0}]}}},
+    "LoadAudio": {"input": {"required": {"audio": [["ref.wav"], {}]}}},
+    **SAVE,
+}
+
+MOSS_DIRS = {
+    "OpenMOSS-Team/MOSS-TTS-Local-Transformer": "/m/moss-tts/Local",
+    "OpenMOSS-Team/MOSS-Audio-Tokenizer": "/m/moss-tts/Codec",
+    "OpenMOSS-Team/MOSS-VoiceGenerator": "/m/moss-tts/VG",
+}
+MOSS_OPTS = {"engine": "moss", "moss_dirs": MOSS_DIRS, "temperature": 1.0,
+             "top_p": 0.9, "prefer_wav": True}
+
+
+class ModelFolderLayout(unittest.TestCase):
+    """The two engines do not agree on where a model folder goes, and neither
+    layout is a preference — each is where that node looks."""
+
+    ROOT = Path("/models")
+
+    def test_qwen_nests_by_org(self):
+        self.assertEqual(
+            bootstrap.model_dir(self.ROOT, "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
+            self.ROOT / "qwen-tts" / "Qwen" / "Qwen3-TTS-12Hz-0.6B-Base")
+
+    def test_moss_flattens_the_slash(self):
+        # The MOSS loader builds its cache path as repo_id.replace("/", "--").
+        # A folder in the Qwen shape is invisible to it, and it downloads a
+        # second copy of a model that is already on disk.
+        self.assertEqual(
+            bootstrap.model_dir(self.ROOT,
+                                "OpenMOSS-Team/MOSS-TTS-Local-Transformer"),
+            self.ROOT / "moss-tts"
+            / "OpenMOSS-Team--MOSS-TTS-Local-Transformer")
+
+    def test_a_repo_knows_its_own_engine(self):
+        self.assertEqual(bootstrap.engine_of("Qwen/Qwen3-TTS-Tokenizer-12Hz"),
+                         "qwen")
+        self.assertEqual(bootstrap.engine_of("OpenMOSS-Team/MOSS-TTS"), "moss")
+        # Something neither table knows falls back rather than raising.
+        self.assertEqual(bootstrap.engine_of("Someone/Else"), "qwen")
+
+    def test_the_node_marker_differs_too(self):
+        root = Path(tempfile.mkdtemp(prefix="sb-nodes-"))
+        try:
+            (root / "custom_nodes" / "ComfyUI-Qwen-TTS").mkdir(parents=True)
+            (root / "custom_nodes" / "ComfyUI-Qwen-TTS" / "nodes.py").write_text("")
+            (root / "custom_nodes" / "comfyui-moss-tts").mkdir(parents=True)
+            self.assertTrue(bootstrap.node_installed(root, "qwen"))
+            # The MOSS repo has no nodes.py at all — its classes live under
+            # nodes/, so checking for that file would call it never installed.
+            self.assertFalse(bootstrap.node_installed(root, "moss"))
+            (root / "custom_nodes" / "comfyui-moss-tts" / "__init__.py").write_text("")
+            self.assertTrue(bootstrap.node_installed(root, "moss"))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class WhichModelsAreWanted(unittest.TestCase):
+    def test_both_engines_are_asked_for_by_default(self):
+        got = bootstrap.wanted_models(dict(bootstrap.DEFAULT_CONFIG))
+        self.assertEqual({m["engine"] for m in got}, {"qwen", "moss"})
+        self.assertIn("OpenMOSS-Team/MOSS-TTS-Local-Transformer",
+                      [m["repo"] for m in got])
+
+    def test_the_delay_8b_models_are_a_tick_not_a_default(self):
+        # ~18 GB of VRAM each. Downloading tens of gigabytes someone cannot
+        # run is worse than not having them.
+        cfg = dict(bootstrap.DEFAULT_CONFIG)
+        repos = [m["repo"] for m in bootstrap.wanted_models(cfg)]
+        self.assertNotIn("OpenMOSS-Team/MOSS-TTS", repos)
+        cfg["want_moss_8b"] = True
+        self.assertIn("OpenMOSS-Team/MOSS-TTS",
+                      [m["repo"] for m in bootstrap.wanted_models(cfg)])
+
+    def test_turning_moss_off_leaves_only_qwen(self):
+        cfg = dict(bootstrap.DEFAULT_CONFIG, want_moss=False)
+        self.assertEqual({m["engine"] for m in bootstrap.wanted_models(cfg)},
+                         {"qwen"})
+
+    def test_one_engine_is_not_the_other_engine_s_problem(self):
+        # With MOSS selected, a missing Qwen folder is not what stands between
+        # this script and a take.
+        root = Path(tempfile.mkdtemp(prefix="sb-models-"))
+        try:
+            cfg = dict(bootstrap.DEFAULT_CONFIG)
+            only_moss = bootstrap.missing_models(root, cfg, "moss")
+            self.assertTrue(only_moss)
+            self.assertEqual({m["engine"] for m in only_moss}, {"moss"})
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class MossGraphs(unittest.TestCase):
+    """MOSS splits into a loader and a generator, and every choice about which
+    checkpoint that is comes off the node's own enum."""
+
+    def setUp(self):
+        self.c = client_for(MOSS_SCHEMA)
+
+    def test_the_variant_is_read_off_the_node_not_typed_in(self):
+        for repo, want in (
+                ("OpenMOSS-Team/MOSS-TTS-Local-Transformer",
+                 "MOSS-TTS (Local 1.7B)"),
+                ("OpenMOSS-Team/MOSS-TTS", "MOSS-TTS (Delay 8B)"),
+                ("OpenMOSS-Team/MOSS-VoiceGenerator", "MOSS-VoiceGenerator")):
+            with self.subTest(repo=repo):
+                self.assertEqual(self.c.moss_variant_for(repo), want)
+
+    def test_a_renamed_variant_list_gives_nothing_rather_than_a_wrong_one(self):
+        c = client_for({**MOSS_SCHEMA, "MossTTSModelLoader": {"input": {
+            "required": {"model_variant": [["something else"], {}],
+                         "local_model_path": ["STRING", {"default": ""}],
+                         "codec_local_path": ["STRING", {"default": ""}]}}}})
+        self.assertEqual(c.moss_variant_for("OpenMOSS-Team/MOSS-TTS"), "")
+        # …and the graph then leaves model_variant on the node's own default
+        # rather than sending a value it would reject.
+        g = c.build_line({"text": "Hi."}, {"kind": "preset"}, MOSS_OPTS)
+        self.assertEqual(g["prompt"]["1"]["inputs"]["model_variant"],
+                         "something else")
+
+    def test_the_models_own_voice_needs_neither_clip_nor_description(self):
+        g = self.c.build_line({"text": "Hi."}, {"kind": "preset"}, MOSS_OPTS)
+        self.assertEqual(sorted(g["prompt"]), ["1", "3", "4"])
+        self.assertEqual(g["prompt"]["4"]["class_type"], "MossTTSGenerate")
+        self.assertNotIn("reference_audio", g["prompt"]["4"]["inputs"])
+        self.assertEqual(g["prompt"]["4"]["inputs"]["moss_pipe"], ["1", 0])
+
+    def test_a_cloned_voice_loads_its_clip(self):
+        g = self.c.build_line({"text": "Hi."},
+                              {"kind": "clone", "ref_audio": "ref.wav"},
+                              MOSS_OPTS)
+        self.assertEqual(g["prompt"]["2"]["class_type"], "LoadAudio")
+        self.assertEqual(g["prompt"]["4"]["inputs"]["reference_audio"],
+                         ["2", 0])
+
+    def test_cloning_with_no_clip_is_a_sentence(self):
+        with self.assertRaises(comfy.ComfyError):
+            self.c.build_line({"text": "Hi."}, {"kind": "clone"}, MOSS_OPTS)
+
+    def test_a_designed_voice_loads_the_only_model_that_can_do_it(self):
+        # MossTTSVoiceDesign prints a warning and misbehaves on anything but
+        # MOSS-VoiceGenerator, so the loader is pointed at it whatever the
+        # model picker says — the same reasoning as Qwen forcing 1.7B.
+        g = self.c.build_line({"text": "Hi."},
+                              {"kind": "design", "instruct": "A low narrator"},
+                              dict(MOSS_OPTS,
+                                   moss_model="OpenMOSS-Team/MOSS-TTS"))
+        self.assertEqual(g["prompt"]["1"]["inputs"]["model_variant"],
+                         "MOSS-VoiceGenerator")
+        self.assertEqual(g["prompt"]["1"]["inputs"]["local_model_path"],
+                         "/m/moss-tts/VG")
+        self.assertEqual(g["prompt"]["4"]["class_type"], "MossTTSVoiceDesign")
+        self.assertEqual(g["prompt"]["4"]["inputs"]["instruction"],
+                         "A low narrator")
+
+    def test_a_folder_that_is_not_there_is_sent_as_empty(self):
+        # The loader treats local_model_path as a path only when it can stat
+        # it, and as a HuggingFace repo id otherwise — so a folder that has not
+        # been downloaded would become snapshot_download("D:\\...\\MOSS-TTS"),
+        # which is not a repo id and fails. "" lets the node fetch it instead.
+        g = self.c.build_line({"text": "Hi."}, {"kind": "preset"},
+                              dict(MOSS_OPTS, moss_dirs={}))
+        self.assertEqual(g["prompt"]["1"]["inputs"]["local_model_path"], "")
+        self.assertEqual(g["prompt"]["1"]["inputs"]["codec_local_path"], "")
+
+    def test_every_line_gets_its_own_seed(self):
+        seeds = {self.c.build_line({"text": "Hi."}, {"kind": "preset"},
+                                   MOSS_OPTS)["prompt"]["4"]["inputs"]["seed"]
+                 for _ in range(8)}
+        self.assertGreater(len(seeds), 1)
+
+    def test_an_empty_line_is_refused_before_anything_is_queued(self):
+        with self.assertRaises(comfy.ComfyError):
+            self.c.build_line({"text": "   "}, {"kind": "preset"}, MOSS_OPTS)
+
+    def test_moss_nodes_that_are_not_loaded_say_so_about_moss(self):
+        c = client_for({**SAVE})
+        self.assertFalse(c.engine_ready("moss"))
+        with self.assertRaises(comfy.ComfyError) as caught:
+            c.build_line({"text": "Hi."}, {"kind": "preset"}, MOSS_OPTS)
+        self.assertIn("MOSS-TTS", str(caught.exception))
+
+    def test_moss_reports_no_preset_speakers_rather_than_an_empty_list(self):
+        caps = self.c.capabilities("moss")
+        self.assertFalse(caps["preset"])
+        self.assertTrue(caps["own_voice"])
+        self.assertTrue(caps["clone"])
+
+    def test_the_engines_do_not_answer_for_each_other(self):
+        qwen_only = client_for({"CustomVoiceNode": custom_voice(), **SAVE})
+        self.assertTrue(qwen_only.engine_ready("qwen"))
+        self.assertFalse(qwen_only.engine_ready("moss"))
+        self.assertTrue(self.c.engine_ready("moss"))
+        self.assertFalse(self.c.engine_ready("qwen"))
+
+
+class BothEnginesOnDisk(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="sb-disk-"))
+        self.cfg = {"models_dir": str(self.root)}
+        for repo in ("Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+                     "OpenMOSS-Team/MOSS-TTS-Local-Transformer"):
+            d = bootstrap.model_dir(self.root, repo)
+            d.mkdir(parents=True)
+            (d / "config.json").write_text("{}")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_both_layouts_are_listed(self):
+        rows = {r["repo"]: r["engine"] for r in manager.local_models(self.cfg)}
+        # Walking the nested shape over a flat folder lists nothing, which is
+        # how a downloaded MOSS model reads as never downloaded.
+        self.assertEqual(rows.get("OpenMOSS-Team/MOSS-TTS-Local-Transformer"),
+                         "moss")
+        self.assertEqual(rows.get("Qwen/Qwen3-TTS-12Hz-0.6B-Base"), "qwen")
+
+    def test_installed_is_checked_in_the_right_place(self):
+        self.assertTrue(bootstrap.model_installed(
+            self.root, "OpenMOSS-Team/MOSS-TTS-Local-Transformer"))
+        self.assertFalse(bootstrap.model_installed(
+            self.root, "OpenMOSS-Team/MOSS-VoiceGenerator"))
+
+    def test_deleting_a_moss_folder_stays_inside_its_own_root(self):
+        manager.delete_model(self.cfg, "OpenMOSS-Team/MOSS-TTS-Local-Transformer")
+        self.assertFalse((self.root / "moss-tts").joinpath(
+            "OpenMOSS-Team--MOSS-TTS-Local-Transformer").exists())
+        for bad in ("../../etc", "OpenMOSS-Team/../../../etc", "nope"):
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                manager.delete_model(self.cfg, bad)
+
+    def test_the_models_page_lists_both_engines(self):
+        rows = manager.curated(self.cfg)
+        self.assertEqual({r["engine"] for r in rows}, {"qwen", "moss"})
+        moss = [r for r in rows
+                if r["repo"] == "OpenMOSS-Team/MOSS-TTS-Local-Transformer"][0]
+        self.assertEqual(moss["role"], "required")
+        self.assertTrue(moss["installed"])
+        self.assertEqual(moss["engine_label"], "MOSS-TTS")
 
 
 if __name__ == "__main__":

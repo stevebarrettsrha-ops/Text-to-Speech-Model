@@ -21,9 +21,8 @@ import uuid
 from pathlib import Path
 
 import bootstrap
-from bootstrap import (APP_DIR, NODE_DIR_NAME, NODE_REPO,
-                       QWEN_SUBDIR, comfy_python, have_git, portable_python,
-                       qwen_model_dir, venv_python)
+from bootstrap import (APP_DIR, ENGINES, comfy_python, have_git,
+                       portable_python, venv_python)
 
 DEFAULT_ENDPOINT = bootstrap.HF_BASE
 
@@ -197,24 +196,34 @@ def dependencies(cfg: dict, client=None) -> list[dict]:
         items.append({"id": "comfyui", "label": "ComfyUI", "state": "missing",
                       "detail": "Not installed yet.", "action": "install"})
 
-    if comfy_dir and bootstrap.node_installed(comfy_dir):
-        loaded = client.has("CustomVoiceNode") if client else None
+    # One row per engine. The ids are what /api/deps/<id>/install takes, so
+    # they are the engine ids rather than a single "node".
+    for eid, eng in ENGINES.items():
+        dep_id = "node" if eid == "qwen" else f"node_{eid}"
+        if not bootstrap.engine_enabled(cfg, eid):
+            items.append({"id": dep_id, "label": f"{eng['label']} nodes",
+                          "state": "off",
+                          "detail": "Turned off in Settings.", "action": None})
+            continue
+        if not (comfy_dir and bootstrap.node_installed(comfy_dir, eid)):
+            items.append({"id": dep_id, "label": f"{eng['label']} nodes",
+                          "state": "missing",
+                          "detail": f"{eng['node_repo']} is not installed.",
+                          "action": "install"})
+            continue
+        loaded = client.engine_ready(eid) if client else None
         items.append({
-            "id": "node", "label": "Qwen-TTS nodes",
+            "id": dep_id, "label": f"{eng['label']} nodes",
             "state": "ok" if loaded is not False else "warn",
             # ComfyUI reads custom_nodes once, at startup, so the usual cause
             # is an engine that was already running when they were installed.
             # Restart is the fix and the diagnosis both: if they still do not
             # load, that task imports them and reports the real exception.
-            "detail": (str(comfy_dir / "custom_nodes" / NODE_DIR_NAME)
+            "detail": (str(comfy_dir / "custom_nodes" / eng["node_dir"])
                        if loaded is not False else
                        "Installed, but this ComfyUI started before they were. "
                        "Restart it so it loads them."),
             "action": "update" if loaded is not False else "restart"})
-    else:
-        items.append({"id": "node", "label": "Qwen-TTS nodes", "state": "missing",
-                      "detail": "flybirdxx/ComfyUI-Qwen-TTS is not installed.",
-                      "action": "install"})
 
     py_comfy = comfy_python(cfg)
     if py_comfy:
@@ -314,9 +323,10 @@ def dependencies(cfg: dict, client=None) -> list[dict]:
 # --------------------------------------------------------------------------- #
 def install_dependency(dep_id: str, cfg: dict, opts: dict) -> Task:
     titles = {"git": "Install Git", "comfyui": "Install ComfyUI",
-              "node": "Install the Qwen-TTS nodes",
+              "node": "Install the Qwen3-TTS nodes",
+              "node_moss": "Install the MOSS-TTS nodes",
               "torch": "Install PyTorch",
-              "node_reqs": "Install the Qwen-TTS packages"}
+              "node_reqs": "Install the speech packages"}
 
     def run(task: Task) -> None:
         if dep_id == "git":
@@ -324,7 +334,9 @@ def install_dependency(dep_id: str, cfg: dict, opts: dict) -> Task:
         elif dep_id == "comfyui":
             _install_comfyui(task, cfg)
         elif dep_id == "node":
-            _install_node(task, cfg)
+            _install_node(task, cfg, "qwen")
+        elif dep_id.startswith("node_") and dep_id[5:] in ENGINES:
+            _install_node(task, cfg, dep_id[5:])
         elif dep_id == "torch":
             _install_torch(task, cfg, opts)
         elif dep_id == "node_reqs":
@@ -381,23 +393,24 @@ def _install_comfyui(task: Task, cfg: dict) -> None:
     task.set(detail=str(target))
 
 
-def _install_node(task: Task, cfg: dict) -> None:
+def _install_node(task: Task, cfg: dict, engine: str = "qwen") -> None:
+    eng = ENGINES[engine]
     comfy_dir = Path(cfg.get("comfy_dir") or "")
     if not (comfy_dir / "main.py").exists():
         raise RuntimeError("Install ComfyUI first.")
     if not have_git():
         raise RuntimeError("Install Git first.")
-    node_path = comfy_dir / "custom_nodes" / NODE_DIR_NAME
+    node_path = comfy_dir / "custom_nodes" / eng["node_dir"]
     if node_path.exists():
-        task.set(detail="Updating the Qwen-TTS nodes…")
+        task.set(detail=f"Updating the {eng['label']} nodes…")
         stream(["git", "-C", str(node_path), "pull", "--ff-only"], task)
     else:
         node_path.parent.mkdir(parents=True, exist_ok=True)
-        task.set(detail="Downloading the Qwen-TTS nodes…")
-        if stream(["git", "clone", "--depth", "1", NODE_REPO, str(node_path)],
-                  task) != 0:
+        task.set(detail=f"Downloading the {eng['label']} nodes…")
+        if stream(["git", "clone", "--depth", "1", eng["node_repo"],
+                   str(node_path)], task) != 0:
             raise RuntimeError("git clone failed — see the log.")
-    _install_node_reqs(task, cfg)
+    _install_node_reqs(task, cfg, engine)
     task.set(detail="Installed. Restart ComfyUI so it loads the new nodes.")
 
 
@@ -447,16 +460,25 @@ def _install_torch(task: Task, cfg: dict, opts: dict) -> None:
     task.set(detail="PyTorch installed.")
 
 
-def _install_node_reqs(task: Task, cfg: dict) -> None:
+def _install_node_reqs(task: Task, cfg: dict, engine: str = "") -> None:
+    """Requirements for one engine, or for every engine that is installed."""
     comfy_dir = Path(cfg.get("comfy_dir") or "")
     py = comfy_python(cfg)
     if not py:
         raise RuntimeError("Install ComfyUI and PyTorch first.")
-    reqs = comfy_dir / "custom_nodes" / NODE_DIR_NAME / "requirements.txt"
-    if not reqs.exists():
-        raise RuntimeError("The Qwen-TTS nodes are not installed yet.")
-    task.set(detail="Installing the Qwen-TTS requirements…")
-    bootstrap.pip_install(py, ["-r", str(reqs)], task.log, _reporter(task))
+    todo = [ENGINES[engine]] if engine else [
+        e for e in ENGINES.values()
+        if bootstrap.engine_enabled(cfg, e["id"])
+        and (comfy_dir / "custom_nodes" / e["node_dir"]
+             / "requirements.txt").exists()]
+    if not todo:
+        raise RuntimeError("No speech nodes are installed yet.")
+    for eng in todo:
+        reqs = comfy_dir / "custom_nodes" / eng["node_dir"] / "requirements.txt"
+        if not reqs.exists():
+            raise RuntimeError(f"The {eng['label']} nodes are not installed yet.")
+        task.set(detail=f"Installing the {eng['label']} requirements…")
+        bootstrap.pip_install(py, ["-r", str(reqs)], task.log, _reporter(task))
     task.set(detail="Packages installed. Restart ComfyUI.")
 
 
@@ -467,7 +489,7 @@ def hf_browse(cfg: dict, repo: str, revision: str = "main") -> dict:
     files = bootstrap.hf_tree(cfg, repo, revision)
     keep = bootstrap.wanted_files(files)
     keep_paths = {f["path"] for f in keep}
-    target = qwen_model_dir(Path(cfg["models_dir"]), repo) \
+    target = bootstrap.model_dir(Path(cfg["models_dir"]), repo) \
         if cfg.get("models_dir") else None
     for f in files:
         f["needed"] = f["path"] in keep_paths
@@ -485,14 +507,17 @@ def hf_download_repo(cfg: dict, repo: str) -> Task:
     if any(t.meta.get("repo") == repo for t in TASKS.running("download")):
         raise RuntimeError(f"{repo} is already downloading.")
 
+    engine = bootstrap.engine_of(repo)
+
     def run(task: Task) -> None:
-        task.log(f"{repo} → {qwen_model_dir(models_dir, repo)}")
+        task.log(f"{repo} → {bootstrap.model_dir(models_dir, repo, engine)}")
 
         def detail(text: str, pct: float) -> None:
             task.set(detail=text, pct=pct)
 
         bootstrap.download_repo(cfg, repo, models_dir, on_detail=detail,
-                                should_cancel=lambda: task.cancel)
+                                should_cancel=lambda: task.cancel,
+                                engine=engine)
         if task.cancel:
             task.set(state="cancelled",
                      detail="Cancelled — what downloaded is kept, starting "
@@ -503,17 +528,37 @@ def hf_download_repo(cfg: dict, repo: str) -> Task:
     return spawn("download", repo.split("/")[-1], run, {"repo": repo})
 
 
+def _folder_row(repo: str, engine: str, folder: Path) -> dict:
+    size = sum(f.stat().st_size for f in folder.rglob("*") if f.is_file())
+    return {"repo": repo, "engine": engine, "size": size,
+            "partial": any(f.suffix == ".part" for f in folder.rglob("*")),
+            "path": str(folder)}
+
+
 def local_models(cfg: dict) -> list[dict]:
-    root = Path(cfg["models_dir"]) / QWEN_SUBDIR if cfg.get("models_dir") else None
+    """Every model folder on disk, in both engines' layouts.
+
+    The two are read differently on purpose: Qwen nests <Org>/<Name>, MOSS
+    flattens to <Org>--<Name>. Walking one shape over the other lists nothing,
+    which is how a downloaded MOSS folder would read as never downloaded.
+    """
+    base = Path(cfg["models_dir"]) if cfg.get("models_dir") else None
     out: list[dict] = []
-    if not root or not root.is_dir():
+    if not base:
         return out
-    for org in sorted(p for p in root.iterdir() if p.is_dir()):
-        for folder in sorted(p for p in org.iterdir() if p.is_dir()):
-            size = sum(f.stat().st_size for f in folder.rglob("*") if f.is_file())
-            partial = any(f.suffix == ".part" for f in folder.rglob("*"))
-            out.append({"repo": f"{org.name}/{folder.name}", "size": size,
-                        "partial": partial, "path": str(folder)})
+    for eid, eng in ENGINES.items():
+        root = base / eng["subdir"]
+        if not root.is_dir():
+            continue
+        if eng["layout"] == "flat":
+            for folder in sorted(p for p in root.iterdir() if p.is_dir()):
+                out.append(_folder_row(folder.name.replace("--", "/", 1), eid,
+                                       folder))
+        else:
+            for org in sorted(p for p in root.iterdir() if p.is_dir()):
+                for folder in sorted(p for p in org.iterdir() if p.is_dir()):
+                    out.append(_folder_row(f"{org.name}/{folder.name}", eid,
+                                           folder))
     return out
 
 
@@ -522,8 +567,9 @@ def delete_model(cfg: dict, repo: str) -> None:
         raise RuntimeError("No models folder is set.")
     if "/" not in repo or ".." in repo:
         raise RuntimeError("That path is not allowed.")
-    root = (Path(cfg["models_dir"]) / QWEN_SUBDIR).resolve()
-    target = qwen_model_dir(Path(cfg["models_dir"]), repo).resolve()
+    engine = bootstrap.engine_of(repo)
+    root = (Path(cfg["models_dir"]) / ENGINES[engine]["subdir"]).resolve()
+    target = bootstrap.model_dir(Path(cfg["models_dir"]), repo, engine).resolve()
     if not str(target).startswith(str(root)):
         raise RuntimeError("That path is outside the models folder.")
     if not target.is_dir():
@@ -531,16 +577,21 @@ def delete_model(cfg: dict, repo: str) -> None:
     shutil.rmtree(target)
 
 
+REQUIRED_GROUPS = ("core", "preset", "moss_core")
+
+
 def curated(cfg: dict) -> list[dict]:
-    """Every folder in the Qwen3-TTS collection, with what it is for and
-    whether this setup has asked for it."""
+    """Every folder both engines know about, with what it is for and whether
+    this setup has asked for it."""
     models_dir = Path(cfg["models_dir"]) if cfg.get("models_dir") else None
     wanted = {m["repo"] for m in bootstrap.wanted_models(cfg)}
     out = []
-    for m in bootstrap.MODEL_REPOS:
-        out.append({**m,
-                    "role": "required" if m["group"] in ("core", "preset")
-                            else "wanted" if m["repo"] in wanted else "optional",
-                    "installed": bool(models_dir)
-                    and bootstrap.model_installed(models_dir, m["repo"])})
+    for eid, eng in ENGINES.items():
+        for m in eng["models"]:
+            out.append({**m, "engine": eid, "engine_label": eng["label"],
+                        "role": "required" if m["group"] in REQUIRED_GROUPS
+                                else "wanted" if m["repo"] in wanted
+                                else "optional",
+                        "installed": bool(models_dir)
+                        and bootstrap.model_installed(models_dir, m["repo"], eid)})
     return out
