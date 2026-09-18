@@ -118,12 +118,18 @@ GROUP_FLAG = {"core": None, "preset": None, "clone": "want_clone",
 # utils/constants.py MODEL_VARIANTS — keep them in step with that file, not
 # with its README, exactly as MODEL_REPOS tracks the Qwen node's HF_MODEL_MAP.
 #
-# Only the Local 1.7B is core. Every other MOSS checkpoint is the Delay 8B
-# architecture and wants about 18 GB of VRAM, which no 8 GB card will hold;
-# the node's own README calls the 1.7B "the only model fast enough for
-# practical iterative use on a single consumer GPU". So the big ones are a
-# tick, not a default — downloading tens of gigabytes someone cannot run is
-# worse than not having them.
+# Sizes come from OpenMOSS's own model table, NOT from the ComfyUI node's
+# README: that README lists MOSS-VoiceGenerator as "Delay 8B, ~18 GB", which
+# conflates the architecture with the size. `MossTTSDelay` is the
+# architecture; OpenMOSS publishes VoiceGenerator at 1.7B. Believing the node
+# README put voice design behind a warning that it would not run on an 8 GB
+# card, when it fits about as comfortably as the Local 1.7B does.
+#
+# The genuinely 8B checkpoints do want roughly 18 GB through this node, which
+# loads bf16 weights with AutoModel.from_pretrained. OpenMOSS's own llama.cpp
+# path fits 8B on an 8 GB card with Q4_K_M weights and staged loading, but the
+# ComfyUI node implements none of that — no GGUF, no ONNX, no low-memory mode
+# — so through Script Builder the 8B stays a tick rather than a default.
 MOSS_MODEL_REPOS = [
     {"repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer", "group": "moss_core",
      "params": "codec",
@@ -131,11 +137,12 @@ MOSS_MODEL_REPOS = [
     {"repo": "OpenMOSS-Team/MOSS-TTS-Local-Transformer", "group": "moss_core",
      "params": "1.7B",
      "note": "Speech and zero-shot cloning. ~5 GB of VRAM, and the fast one."},
-    {"repo": "OpenMOSS-Team/MOSS-TTS", "group": "moss_hq", "params": "8B",
-     "note": "Delay 8B — better, far slower, and wants ~18 GB of VRAM."},
     {"repo": "OpenMOSS-Team/MOSS-VoiceGenerator", "group": "moss_design",
-     "params": "8B",
-     "note": "Builds a voice from a description. Delay 8B, ~18 GB of VRAM."},
+     "params": "1.7B",
+     "note": "Builds a voice from a description. ~5 GB of VRAM."},
+    {"repo": "OpenMOSS-Team/MOSS-TTS", "group": "moss_hq", "params": "8B",
+     "note": "Delay 8B — better, far slower, and ~18 GB of VRAM through "
+             "this node."},
 ]
 
 MOSS_CODEC_REPO = "OpenMOSS-Team/MOSS-Audio-Tokenizer"
@@ -156,7 +163,10 @@ DEFAULT_CONFIG = {
     "want_voicedesign": False,
     "want_moss": True,
     "want_moss_8b": False,
-    "want_moss_design": False,
+    # On by default: MOSS has no preset speakers, so describing a voice is one
+    # of only two ways to pin one down, and at 1.7B it runs on the same card
+    # as the base model.
+    "want_moss_design": True,
     "engine": "qwen",
     "setup_complete": False,
 }

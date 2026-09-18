@@ -652,14 +652,14 @@
           <input type="checkbox" id="opt-17b"></div>
         <div class="switch"><label for="opt-moss">MOSS-TTS as a second engine</label>
           <input type="checkbox" id="opt-moss" checked></div>
-        <div class="switch"><label for="opt-moss-8b"
-          title="Delay 8B — about 18 GB of VRAM, and slow on one card">MOSS
-          Delay 8B (needs ~18 GB VRAM)</label>
-          <input type="checkbox" id="opt-moss-8b"></div>
         <div class="switch"><label for="opt-moss-design"
-          title="MOSS-VoiceGenerator is a Delay 8B model too">MOSS voice design
-          (needs ~18 GB VRAM)</label>
-          <input type="checkbox" id="opt-moss-design"></div>
+          title="MOSS-VoiceGenerator, 1.7B — about the same card as the base model">MOSS
+          voice design</label>
+          <input type="checkbox" id="opt-moss-design" checked></div>
+        <div class="switch"><label for="opt-moss-8b"
+          title="The 8B needs about 18 GB through these nodes, which load bf16 weights">MOSS
+          8B (needs ~18 GB VRAM)</label>
+          <input type="checkbox" id="opt-moss-8b"></div>
       </div>
       <div class="rowbtn">
         <button class="btn go" id="btnRunSetup">Start setup</button>
@@ -1062,7 +1062,7 @@ function renderSpeakerBody(n) {
       '" placeholder="A gentle female voice with a high pitch, speaking slowly">' +
       esc(s.instruct) + "</textarea>" +
       '<div class="note">' + (isMoss()
-        ? "Needs MOSS-VoiceGenerator — a Delay 8B model, so about 18 GB of VRAM. Tick it on the Models page."
+        ? "Needs MOSS-VoiceGenerator — 1.7B, the same size as the base model. One button on the Models page."
         : "Needs the 1.7B VoiceDesign model — one button on the Models page.") +
       "</div>";
     body.querySelector("[data-instruct]").addEventListener("input", function (e) {

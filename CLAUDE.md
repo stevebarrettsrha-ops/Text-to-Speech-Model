@@ -204,7 +204,7 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 100 unit tests, standard library only
+npm run test:units       # 102 unit tests, standard library only
 npm test                 # 68 checks driving the real page in headless Chromium
 ```
 
@@ -244,12 +244,27 @@ explicitly because it is the usual cause of IMPORT FAILED. MOSS asks only for
 `>=4.40.0`, so the Qwen floor is the binding one when both are installed into
 the same interpreter, which they are.
 
-MOSS models: `OpenMOSS-Team/MOSS-Audio-Tokenizer` and
-`OpenMOSS-Team/MOSS-TTS-Local-Transformer` are required; `MOSS-TTS` (Delay 8B)
-and `MOSS-VoiceGenerator` are optional and want ~18 GB of VRAM each. The repo
-ids in `MOSS_MODEL_REPOS` are the ones in the node's own
+MOSS models: `OpenMOSS-Team/MOSS-Audio-Tokenizer`,
+`MOSS-TTS-Local-Transformer` (1.7B) and `MOSS-VoiceGenerator` (1.7B) are the
+default set and all three run on 8 GB; `MOSS-TTS` (8B) is the only optional
+one. The repo ids in `MOSS_MODEL_REPOS` are the ones in the node's own
 `utils/constants.py` `MODEL_VARIANTS` — keep them in step with that file, the
 same way `MODEL_REPOS` tracks the Qwen node's `HF_MODEL_MAP`.
+
+25. **Model sizes come from OpenMOSS's table, never from the ComfyUI node's
+   README.** That README lists MOSS-VoiceGenerator as "Delay 8B, ~18 GB",
+   conflating the architecture with the size — `MossTTSDelay` is the
+   architecture and OpenMOSS publishes VoiceGenerator at 1.7B. Believing it put
+   MOSS voice design behind a warning that it would not run on an 8 GB card
+   when it fits as easily as the base model does. Rule 3's reasoning again: the
+   upstream source is the truth, a downstream README is a copy that drifts.
+26. **The 8B is optional because of this node, not because of the model.**
+   `MossTTSModelLoader` loads bf16 weights through
+   `AutoModel.from_pretrained`, so 8B wants ~18 GB here. OpenMOSS's own
+   llama.cpp path fits it on 8 GB with Q4_K_M weights, staged loading and a
+   quantized KV cache; the ComfyUI node implements no part of that — no GGUF,
+   no ONNX, no `low_memory`. Say which of the two is the limit when explaining
+   it, or the next person removes the tick and runs out of VRAM.
 
 Models: `Qwen/Qwen3-TTS-12Hz-0.6B-Base` and `Qwen/Qwen3-TTS-Tokenizer-12Hz` are
 required; the 1.7B Base and 1.7B VoiceDesign folders are optional. They live in

@@ -9,7 +9,7 @@ Two engines, switched from the picker on the Create page:
 |---|---|---|
 | Preset speakers | nine, read off the node | none — see below |
 | Clone from a clip | yes | yes |
-| Voice from a description | yes, 1.7B | yes, needs the 8B VoiceGenerator |
+| Voice from a description | yes, 1.7B | yes, 1.7B VoiceGenerator |
 | Smallest useful model | 0.9B | 1.7B, about 5 GB of VRAM |
 
 The layout is the Script Builder file you already had: raw structure on the
@@ -53,10 +53,10 @@ Nothing goes into your system Python.
 
 - Python 3.10 or newer (on Debian and Ubuntu, `python3-venv` too)
 - Git
-- An NVIDIA GPU with 8 GB or more is comfortable for Qwen3-TTS and for MOSS's
-  1.7B. MOSS's Delay 8B models want about 18 GB and are left un-ticked by
-  default. Less works with **Free GPU memory after each run** switched on. CPU
-  works but is slow.
+- An NVIDIA GPU with 8 GB or more runs everything downloaded by default:
+  Qwen3-TTS, MOSS's 1.7B and MOSS-VoiceGenerator. Only the MOSS 8B is out of
+  reach through these nodes, and it is left un-ticked. Less works with **Free
+  GPU memory after each run** switched on. CPU works but is slow.
 
 ### Model folders
 
@@ -99,15 +99,27 @@ Pulled into `ComfyUI/models/moss-tts/`:
 |---|---|---|---|
 | `OpenMOSS-Team--MOSS-Audio-Tokenizer` | codec | — | Shared codec; every MOSS model needs it |
 | `OpenMOSS-Team--MOSS-TTS-Local-Transformer` | 1.7B | ~5 GB | Speech and cloning, and the fast one |
+| `OpenMOSS-Team--MOSS-VoiceGenerator` | 1.7B | ~5 GB | Voice from a description |
 | `OpenMOSS-Team--MOSS-TTS` | 8B | ~18 GB | Delay 8B — better, far slower |
-| `OpenMOSS-Team--MOSS-VoiceGenerator` | 8B | ~18 GB | Voice from a description |
 
-Only the codec and the 1.7B are downloaded by default. The other two are Delay
-8B models wanting roughly 18 GB of VRAM, which no 8 GB card will hold, and the
-node's own README calls the 1.7B "the only model fast enough for practical
-iterative use on a single consumer GPU" — so they are a tick on the setup sheet
-and a button on the Models page, not a default. Downloading tens of gigabytes
-you cannot run is worse than not having them.
+The codec, the 1.7B and VoiceGenerator are downloaded by default: all three run
+on an 8 GB card, and since MOSS has no preset speakers, describing a voice is
+one of only two ways to pin one down.
+
+**Sizes come from [OpenMOSS's own model table](https://github.com/OpenMOSS/MOSS-TTS#released-models),
+not from the ComfyUI node's README**, which lists MOSS-VoiceGenerator as
+"Delay 8B, ~18 GB". `MossTTSDelay` is the *architecture*; OpenMOSS publishes
+VoiceGenerator at 1.7B. Taking the node README at its word had voice design
+hidden behind a warning that it would not run on 8 GB, when it fits about as
+comfortably as the base model.
+
+The 8B is a tick rather than a default, and the reason is this node rather than
+the model: it loads bf16 weights through `AutoModel.from_pretrained`, so 8B
+really does want ~18 GB here. OpenMOSS's own llama.cpp path fits the 8B on an
+8 GB card with Q4_K_M weights, staged loading and a quantized KV cache
+(`configs/llama_cpp/trt-8gb.yaml`), but the ComfyUI node implements none of it
+— no GGUF, no ONNX, no low-memory mode. If you want the 8B on 8 GB today, that
+is OpenMOSS's CLI, outside ComfyUI.
 
 The repo names come from the nodes' own source — `HF_MODEL_MAP` for Qwen,
 `utils/constants.py` for MOSS — not from either README, which list fewer.
@@ -244,7 +256,7 @@ run without touching the first one's takes.
 
 ```bash
 node tests/check.mjs     # everything compiles and the inline script parses
-npm run test:units       # 100 unit tests, standard library only
+npm run test:units       # 102 unit tests, standard library only
 npm install && npx playwright install chromium
 npm test                 # 68 checks driving the real page in headless Chromium
 ```

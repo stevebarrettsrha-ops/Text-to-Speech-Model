@@ -1039,15 +1039,35 @@ class WhichModelsAreWanted(unittest.TestCase):
         self.assertIn("OpenMOSS-Team/MOSS-TTS-Local-Transformer",
                       [m["repo"] for m in got])
 
-    def test_the_delay_8b_models_are_a_tick_not_a_default(self):
-        # ~18 GB of VRAM each. Downloading tens of gigabytes someone cannot
-        # run is worse than not having them.
+    def test_only_the_real_8b_is_held_back(self):
+        # ~18 GB through this node, which loads bf16 weights. Downloading tens
+        # of gigabytes someone cannot run is worse than not having them.
         cfg = dict(bootstrap.DEFAULT_CONFIG)
         repos = [m["repo"] for m in bootstrap.wanted_models(cfg)]
         self.assertNotIn("OpenMOSS-Team/MOSS-TTS", repos)
         cfg["want_moss_8b"] = True
         self.assertIn("OpenMOSS-Team/MOSS-TTS",
                       [m["repo"] for m in bootstrap.wanted_models(cfg)])
+
+    def test_voice_design_is_not_mistaken_for_an_8b(self):
+        # The ComfyUI node's README calls MOSS-VoiceGenerator "Delay 8B,
+        # ~18 GB", conflating the architecture with the size. OpenMOSS
+        # publishes it at 1.7B, and believing the node README hid MOSS voice
+        # design behind a warning that it would not run on an 8 GB card.
+        entry = next(m for m in bootstrap.MOSS_MODEL_REPOS
+                     if m["repo"] == "OpenMOSS-Team/MOSS-VoiceGenerator")
+        self.assertEqual(entry["params"], "1.7B")
+        self.assertNotIn("18 GB", entry["note"])
+        # …and because it fits, it is fetched by default: MOSS has no preset
+        # speakers, so a description is one of only two ways to pin a voice.
+        self.assertIn("OpenMOSS-Team/MOSS-VoiceGenerator",
+                      [m["repo"] for m in
+                       bootstrap.wanted_models(dict(bootstrap.DEFAULT_CONFIG))])
+
+    def test_everything_fetched_by_default_fits_an_8gb_card(self):
+        for m in bootstrap.wanted_models(dict(bootstrap.DEFAULT_CONFIG)):
+            with self.subTest(repo=m["repo"]):
+                self.assertNotIn("8B", m["params"])
 
     def test_turning_moss_off_leaves_only_qwen(self):
         cfg = dict(bootstrap.DEFAULT_CONFIG, want_moss=False)
