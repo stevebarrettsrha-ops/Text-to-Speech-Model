@@ -8,6 +8,7 @@ names say what would break rather than what the function is called.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import struct
@@ -154,7 +155,12 @@ class ModelDeletes(unittest.TestCase):
         self.outside = self.root / "elsewhere"
         self.outside.mkdir()
         (self.outside / "f.txt").write_text("x")
-        self.cfg = {"models_dir": str(self.models)}
+        # Qwen's own install, since that is whose folder a Qwen repo lives in.
+        self.cfg = dict(bootstrap.DEFAULT_CONFIG)
+        self.cfg["engines"] = {
+            eid: dict(bootstrap.engine_defaults(eid),
+                      comfy_dir=str(self.root), models_dir=str(self.models))
+            for eid in bootstrap.ENGINES}
 
     def test_traversal_is_refused(self):
         for repo in ("Qwen/../../checkpoints", "Qwen/../../../elsewhere",
@@ -400,6 +406,20 @@ SAVE = {"SaveAudioAdvanced": {"input": {"required": {
 
 OPTS = {"style": "warm", "model": "0.6B", "attention": "sdpa", "unload": True,
         "temperature": 0.7, "prefer_wav": True}
+
+
+def split_cfg(root: Path, **extra) -> dict:
+    """A config in the per-engine shape: each engine its own ComfyUI folder,
+    its own models folder and its own port."""
+    cfg = dict(bootstrap.DEFAULT_CONFIG, **extra)
+    cfg["engines"] = {}
+    for eid, eng in bootstrap.ENGINES.items():
+        d = root / eng["dir_name"]
+        (d / "models").mkdir(parents=True, exist_ok=True)
+        cfg["engines"][eid] = dict(bootstrap.engine_defaults(eid),
+                                   comfy_dir=str(d),
+                                   models_dir=str(d / "models"))
+    return cfg
 
 
 def client_for(schema):
@@ -885,24 +905,22 @@ class NodesNotLoaded(unittest.TestCase):
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="sb-deps-"))
-        (self.root / "main.py").write_text("")
-        node = self.root / "custom_nodes" / bootstrap.NODE_DIR_NAME
-        node.mkdir(parents=True)
-        (node / "nodes.py").write_text("")
-        moss = self.root / "custom_nodes" / bootstrap.MOSS_NODE_DIR_NAME
-        moss.mkdir(parents=True)
-        (moss / "__init__.py").write_text("")
-        (self.root / "models").mkdir()
-        self.cfg = {"comfy_dir": str(self.root),
-                    "models_dir": str(self.root / "models"),
-                    "comfy_url": "http://127.0.0.1:1"}
+        self.cfg = split_cfg(self.root)
+        # Each engine has its own ComfyUI with its own node pack in it.
+        for eid, eng in bootstrap.ENGINES.items():
+            d = Path(self.cfg["engines"][eid]["comfy_dir"])
+            (d / "main.py").write_text("")
+            node = d / "custom_nodes" / eng["node_dir"]
+            node.mkdir(parents=True)
+            (node / eng["node_marker"]).write_text("")
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
 
     def _node_item(self, loaded):
-        items = manager.dependencies(self.cfg, self.Engine(loaded))
-        return next(i for i in items if i["id"] == "node")
+        clients = {e: self.Engine(loaded) for e in bootstrap.ENGINES}
+        items = manager.dependencies(self.cfg, clients)
+        return next(i for i in items if i["id"] == "node_qwen")
 
     def test_an_engine_without_the_classes_offers_a_restart(self):
         item = self._node_item(False)
@@ -917,11 +935,17 @@ class NodesNotLoaded(unittest.TestCase):
         self.assertEqual(item["state"], "ok")
         self.assertEqual(item["action"], "update")
 
-    def test_each_engine_gets_its_own_row(self):
-        items = manager.dependencies(self.cfg, self.Engine(True))
-        rows = {i["id"]: i["label"] for i in items}
-        self.assertEqual(rows.get("node"), "Qwen3-TTS nodes")
-        self.assertEqual(rows.get("node_moss"), "MOSS-TTS nodes")
+    def test_each_engine_gets_its_own_row_for_everything(self):
+        clients = {e: self.Engine(True) for e in bootstrap.ENGINES}
+        rows = {i["id"] for i in manager.dependencies(self.cfg, clients)}
+        # Nothing below ComfyUI is shared any more, so nothing below ComfyUI
+        # gets one row for both.
+        for base in ("comfyui", "node", "torch", "node_reqs", "models",
+                     "engine"):
+            for eid in ("qwen", "moss"):
+                with self.subTest(row=f"{base}_{eid}"):
+                    self.assertIn(f"{base}_{eid}", rows)
+        self.assertEqual({"python", "git"} & rows, {"python", "git"})
 
     def test_a_comfyui_we_do_not_own_is_not_reported_as_missing(self):
         # "Connect to a ComfyUI I start myself" never records a comfy_dir, so
@@ -929,26 +953,29 @@ class NodesNotLoaded(unittest.TestCase):
         # with an Install button, in front of someone whose engine was working
         # perfectly and whose pill said Engine ready. The running schema is the
         # better witness: if the classes are loaded, they are installed.
-        items = manager.dependencies({"models_dir": self.cfg["models_dir"],
-                                      "comfy_url": "http://127.0.0.1:1"},
-                                     self.Engine(True))
-        rows = {i["id"]: i for i in items if i["id"] in ("node", "node_moss")}
+        bare = dict(bootstrap.DEFAULT_CONFIG)
+        items = manager.dependencies(bare, {e: self.Engine(True)
+                                            for e in bootstrap.ENGINES})
+        rows = {i["id"]: i for i in items
+                if i["id"] in ("node_qwen", "node_moss")}
         self.assertEqual({r["state"] for r in rows.values()}, {"ok"})
         self.assertTrue(all(r["action"] is None for r in rows.values()))
-        self.assertIn("ComfyUI you are running", rows["node"]["detail"])
+        self.assertIn("ComfyUI you are running", rows["node_qwen"]["detail"])
 
     def test_with_no_folder_and_no_engine_they_really_are_missing(self):
-        items = manager.dependencies({"models_dir": self.cfg["models_dir"],
-                                      "comfy_url": "http://127.0.0.1:1"}, None)
-        rows = {i["id"]: i for i in items if i["id"] in ("node", "node_moss")}
+        items = manager.dependencies(dict(bootstrap.DEFAULT_CONFIG), None)
+        rows = {i["id"]: i for i in items
+                if i["id"] in ("node_qwen", "node_moss")}
         self.assertEqual({r["state"] for r in rows.values()}, {"missing"})
 
     def test_an_engine_turned_off_is_not_reported_as_missing(self):
         items = manager.dependencies(dict(self.cfg, want_moss=False),
-                                     self.Engine(True))
-        moss = [i for i in items if i["id"] == "node_moss"][0]
+                                     {e: self.Engine(True)
+                                      for e in bootstrap.ENGINES})
+        moss = [i for i in items if i["id"] == "comfyui_moss"][0]
         self.assertEqual(moss["state"], "off")
         self.assertIsNone(moss["action"])
+        self.assertFalse([i for i in items if i["id"] == "torch_moss"])
 
 
 # --------------------------------------------------------------------------- #
@@ -1195,10 +1222,12 @@ class MossGraphs(unittest.TestCase):
 class BothEnginesOnDisk(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="sb-disk-"))
-        self.cfg = {"models_dir": str(self.root)}
+        self.cfg = split_cfg(self.root)
         for repo in ("Qwen/Qwen3-TTS-12Hz-0.6B-Base",
                      "OpenMOSS-Team/MOSS-TTS-Local-Transformer"):
-            d = bootstrap.model_dir(self.root, repo)
+            eid = bootstrap.engine_of(repo)
+            d = bootstrap.model_dir(
+                bootstrap.engine_models_dir(self.cfg, eid), repo, eid)
             d.mkdir(parents=True)
             (d / "config.json").write_text("{}")
 
@@ -1214,15 +1243,25 @@ class BothEnginesOnDisk(unittest.TestCase):
         self.assertEqual(rows.get("Qwen/Qwen3-TTS-12Hz-0.6B-Base"), "qwen")
 
     def test_installed_is_checked_in_the_right_place(self):
+        moss = bootstrap.engine_models_dir(self.cfg, "moss")
         self.assertTrue(bootstrap.model_installed(
-            self.root, "OpenMOSS-Team/MOSS-TTS-Local-Transformer"))
+            moss, "OpenMOSS-Team/MOSS-TTS-Local-Transformer"))
         self.assertFalse(bootstrap.model_installed(
-            self.root, "OpenMOSS-Team/MOSS-VoiceGenerator"))
+            moss, "OpenMOSS-Team/MOSS-VoiceGenerator"))
+
+    def test_each_engine_keeps_its_models_in_its_own_install(self):
+        qwen = bootstrap.engine_models_dir(self.cfg, "qwen")
+        moss = bootstrap.engine_models_dir(self.cfg, "moss")
+        self.assertNotEqual(qwen, moss)
+        # Neither can see the other's: separate ComfyUIs, separate folders.
+        self.assertFalse(bootstrap.model_installed(
+            qwen, "OpenMOSS-Team/MOSS-TTS-Local-Transformer"))
 
     def test_deleting_a_moss_folder_stays_inside_its_own_root(self):
         manager.delete_model(self.cfg, "OpenMOSS-Team/MOSS-TTS-Local-Transformer")
-        self.assertFalse((self.root / "moss-tts").joinpath(
-            "OpenMOSS-Team--MOSS-TTS-Local-Transformer").exists())
+        self.assertFalse(bootstrap.model_dir(
+            bootstrap.engine_models_dir(self.cfg, "moss"),
+            "OpenMOSS-Team/MOSS-TTS-Local-Transformer", "moss").exists())
         for bad in ("../../etc", "OpenMOSS-Team/../../../etc", "nope"):
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
                 manager.delete_model(self.cfg, bad)
@@ -1381,20 +1420,18 @@ class SelfTestSteps(unittest.TestCase):
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="sb-self-"))
-        self.models = self.root / "models"
-        self.models.mkdir()
-        self.cfg = {"comfy_url": "http://127.0.0.1:1",
-                    "models_dir": str(self.models), "comfy_dir": "",
-                    "want_moss": True, "want_clone": False,
-                    "want_moss_design": False}
+        self.cfg = split_cfg(self.root, want_clone=False,
+                             want_moss_design=False)
+        self.models = bootstrap.engine_models_dir(self.cfg, "moss")
         self.task = manager.Task("selftest", "Test")
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
 
     def _seed(self, engine, weights=True):
+        root = bootstrap.engine_models_dir(self.cfg, engine)
         for m in bootstrap.wanted_models(self.cfg, engine):
-            d = bootstrap.model_dir(self.models, m["repo"], engine)
+            d = bootstrap.model_dir(root, m["repo"], engine)
             d.mkdir(parents=True, exist_ok=True)
             (d / "config.json").write_text("{}")
             if weights:
@@ -1466,6 +1503,96 @@ class SelfTestSteps(unittest.TestCase):
         for suffix in (".safetensors", ".bin", ".gguf", ".onnx", ".npy"):
             with self.subTest(suffix=suffix):
                 self.assertIn(suffix, manager.WEIGHT_SUFFIXES)
+
+
+
+class SeparateInstalls(unittest.TestCase):
+    """Each engine gets its own ComfyUI, environment, models folder and port,
+    because that is the only way one engine's packages cannot break the
+    other's."""
+
+    def test_nothing_below_comfyui_is_shared(self):
+        seen = {}
+        for eid, eng in bootstrap.ENGINES.items():
+            comfy = Path("/app") / eng["dir_name"]
+            seen[eid] = {
+                "comfy": comfy,
+                "venv": bootstrap.venv_python(comfy).parents[1],
+                "nodes": comfy / "custom_nodes" / eng["node_dir"],
+                "models": comfy / "models" / eng["subdir"],
+                "port": eng["port"],
+            }
+        a, b = seen["qwen"], seen["moss"]
+        for key in a:
+            with self.subTest(part=key):
+                self.assertNotEqual(a[key], b[key])
+
+    def test_the_two_environments_do_not_collide(self):
+        # They sit under the same parent, so a bare "comfy-venv" beside both
+        # would be one environment shared by both — the thing the layout is
+        # for. The name has to carry the install.
+        q = bootstrap.venv_python(Path("/app/ComfyUI-Qwen3-TTS"))
+        m = bootstrap.venv_python(Path("/app/ComfyUI-MOSS-TTS"))
+        self.assertNotEqual(q.parents[1], m.parents[1])
+        self.assertIn("Qwen", str(q))
+        self.assertIn("MOSS", str(m))
+
+    def test_a_single_install_config_becomes_qwen_s(self):
+        # Every install before the split had one ComfyUI with both node packs
+        # in it, and its settings at the top level. Those are Qwen's now; MOSS
+        # starts from defaults, which means its own install to fetch.
+        old = dict(bootstrap.DEFAULT_CONFIG,
+                   comfy_url="http://127.0.0.1:9000",
+                   comfy_dir="/somewhere/ComfyUI",
+                   models_dir="/somewhere/ComfyUI/models",
+                   python="/somewhere/py", setup_complete=True)
+        bootstrap._migrate(old)
+        self.assertEqual(old["engines"]["qwen"]["comfy_dir"],
+                         "/somewhere/ComfyUI")
+        self.assertEqual(old["engines"]["qwen"]["comfy_url"],
+                         "http://127.0.0.1:9000")
+        self.assertEqual(old["engines"]["moss"]["comfy_dir"], "")
+        self.assertEqual(old["engines"]["moss"]["comfy_url"],
+                         "http://127.0.0.1:8189")
+
+    def test_a_fresh_install_claims_neither(self):
+        fresh = dict(bootstrap.DEFAULT_CONFIG)
+        bootstrap._migrate(fresh)
+        self.assertEqual(fresh["engines"]["qwen"]["comfy_dir"], "")
+        self.assertEqual(fresh["engines"]["moss"]["comfy_dir"], "")
+
+    def test_migrating_twice_changes_nothing(self):
+        cfg = dict(bootstrap.DEFAULT_CONFIG, comfy_dir="/a/ComfyUI",
+                   setup_complete=True)
+        bootstrap._migrate(cfg)
+        first = json.dumps(cfg["engines"], sort_keys=True)
+        bootstrap._migrate(cfg)
+        self.assertEqual(json.dumps(cfg["engines"], sort_keys=True), first)
+
+    def test_a_missing_port_is_healed_not_inherited(self):
+        cfg = dict(bootstrap.DEFAULT_CONFIG)
+        cfg["engines"] = {"qwen": {}, "moss": {}}
+        self.assertEqual(bootstrap.engine_cfg(cfg, "moss")["comfy_url"],
+                         "http://127.0.0.1:8189")
+
+    def test_each_engine_looks_for_models_in_its_own_comfyui(self):
+        cfg = dict(bootstrap.DEFAULT_CONFIG)
+        cfg["engines"] = {
+            "qwen": dict(bootstrap.engine_defaults("qwen"),
+                         comfy_dir="/a/ComfyUI-Qwen3-TTS"),
+            "moss": dict(bootstrap.engine_defaults("moss"),
+                         comfy_dir="/a/ComfyUI-MOSS-TTS")}
+        self.assertEqual(bootstrap.engine_models_dir(cfg, "qwen"),
+                         Path("/a/ComfyUI-Qwen3-TTS/models"))
+        self.assertEqual(bootstrap.engine_models_dir(cfg, "moss"),
+                         Path("/a/ComfyUI-MOSS-TTS/models"))
+
+    def test_running_both_at_once_is_off_by_default(self):
+        # Two ComfyUIs that have both generated each hold their models in
+        # their own VRAM, and unload_all_models only reaches inside one
+        # process. On 8 GB the second engine is the one that fails to
+        # allocate, so the default is one at a time.
+        self.assertFalse(bootstrap.DEFAULT_CONFIG["run_both_engines"])
 
 
 if __name__ == "__main__":

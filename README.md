@@ -132,6 +132,33 @@ take, and two of the five cannot be fetched at any speed:
 Add `?check=1` and the two HuggingFace repos are looked up rather than taken on
 trust. Nothing in first launch assumes any of this is present.
 
+### Two engines, two installs
+
+Each engine gets its own everything, so neither can break the other:
+
+| | Qwen3-TTS | MOSS-TTS |
+|---|---|---|
+| ComfyUI | `ComfyUI-Qwen3-TTS/` | `ComfyUI-MOSS-TTS/` |
+| Python environment | `comfy-venv-ComfyUI-Qwen3-TTS/` | `comfy-venv-ComfyUI-MOSS-TTS/` |
+| Nodes | `custom_nodes/ComfyUI-Qwen-TTS` | `custom_nodes/comfyui-moss-tts` |
+| Models | `ComfyUI-Qwen3-TTS/models/qwen-tts/` | `ComfyUI-MOSS-TTS/models/moss-tts/` |
+| Port | 8188 | 8189 |
+
+First launch builds both. It costs disk — two ComfyUI clones and two PyTorch
+installs, on the order of 10 GB before any models — and buys isolation: Qwen
+wants `transformers` 4.57.3 or 5.0+, MOSS wants 4.40+, and nothing either node
+pack pulls in can disturb the other.
+
+**Only the engine you are using runs.** Two ComfyUIs that have both generated
+each hold their models in their own process's video memory, and neither can
+free the other's — on an 8 GB card the second one is what fails to allocate.
+Switching engines stops one and starts the other, which costs a ComfyUI start.
+If your card has room, turn on **Run both engines at once** and switching
+becomes instant.
+
+Upgrading from a single install? Your existing ComfyUI becomes Qwen's, keeping
+its address, folder and models. MOSS then wants an install of its own.
+
 ### Does it actually work?
 
 The Engine page has **Test Qwen3-TTS** and **Test MOSS-TTS**. Each generates one
@@ -304,9 +331,9 @@ run without touching the first one's takes.
 
 ```bash
 node tests/check.mjs     # everything compiles and the inline script parses
-npm run test:units       # 122 unit tests, standard library only
+npm run test:units       # 131 unit tests, standard library only
 npm install && npx playwright install chromium
-npm test                 # 80 checks driving the real page in headless Chromium
+npm test                 # 81 checks driving the real page in headless Chromium
 ```
 
 None of it needs a GPU, a model download or the network: `tests/mock_comfy.py`

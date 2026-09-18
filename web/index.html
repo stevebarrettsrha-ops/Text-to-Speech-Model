@@ -645,11 +645,12 @@
 <!-- ===================== setup ===================== -->
 <div class="veil" id="veil-setup" hidden>
   <div class="sheet">
-    <h1>Set up the engine</h1>
-    <p class="lede">Script Builder speaks with Qwen3-TTS and MOSS-TTS on this machine,
-      through ComfyUI. The first run installs ComfyUI, adds both sets of nodes and
-      downloads the voices. After that it starts on its own, and you switch engines
-      on the Create page.</p>
+    <h1>Set up the engines</h1>
+    <p class="lede">Qwen3-TTS and MOSS-TTS each get their own ComfyUI, their own
+      Python environment and their own models folder, so neither engine's packages
+      can break the other's. Only the one you are using runs — two engines on one
+      card would each hold their models in video memory, and neither can free the
+      other's. Switch between them on the Create page.</p>
     <div id="setup-choice">
       <div class="pick" id="pick-list"></div>
       <div class="grid2">
@@ -1598,7 +1599,12 @@ function waitForTask(id) {
   });
 }
 async function installAllMissing() {
-  var order = ["git", "comfyui", "node", "node_moss", "torch", "node_reqs"];
+  // Each engine installs its own chain, in order, one engine after the other.
+  var order = ["git"];
+  ["qwen", "moss"].forEach(function (e) {
+    ["comfyui", "node", "torch", "node_reqs"].forEach(function (b) {
+      order.push(b + "_" + e); });
+  });
   try {
     var d = await api("/api/deps");
     var missing = order.filter(function (id) {
@@ -1618,7 +1624,7 @@ async function installAllMissing() {
     }
     // ComfyUI reads custom_nodes at startup, so whatever was just installed
     // is not loaded yet. The node row now carries the button that does it.
-    toast("All set. Press Restart engine so ComfyUI loads the nodes.");
+    toast("All set. Press Test on the Engine page to prove it works.");
   } catch (e) { toast(e.message, true); }
 }
 async function runSelfTest(engine, btn) {
@@ -1675,7 +1681,8 @@ function renderSelfTest(engine, t) {
 }
 async function restartEngine() {
   try {
-    var r = await api("/api/comfy/restart", { method: "POST" });
+    var r = await api("/api/comfy/restart?engine=" +
+      encodeURIComponent(S.engine), { method: "POST" });
     S.taskId = r.task.id; S.taskCursor = 0; $("task-log").textContent = "";
     pollTasks();
     toast("Restarting ComfyUI so it loads the nodes. The first start is slow.");
@@ -1685,8 +1692,10 @@ async function restartEngine() {
 }
 async function startEngine() {
   try {
-    await api("/api/comfy/start", { method: "POST" });
-    toast("Starting ComfyUI. The first start is slow.");
+    await api("/api/comfy/start?engine=" + encodeURIComponent(S.engine),
+      { method: "POST" });
+    toast("Starting " + (S.engineLabel || "the engine") +
+          ". The first start is slow.");
   } catch (e) { toast(e.message, true); }
 }
 var taskTimer = null;
@@ -2000,6 +2009,11 @@ async function refreshStatus() {
   $("runLabel").textContent = blocker(st).label;
   $("gpuMetric").querySelector("span").textContent =
     st.ready ? "ready" : st.comfy_online ? "loading" : "offline";
+  // Only one engine is kept running, so its port is worth showing: two
+  // ComfyUIs that have both generated would each hold models in their own
+  // VRAM, and neither can free the other's.
+  var mine = (st.installs || {})[S.engine];
+  $("cfg-url").placeholder = mine ? mine.comfy_url : "http://127.0.0.1:8188";
   var c = st.config || {};
   $("cfg-url").value = c.comfy_url || "";
   $("cfg-dir").value = c.comfy_dir || "";
@@ -2123,6 +2137,7 @@ function wire() {
     await api("/api/config", { method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ comfy_url: $("cfg-url").value.trim(),
+        for_engine: S.engine,
         comfy_dir: $("cfg-dir").value.trim(),
         models_dir: $("cfg-models").value.trim(),
         auto_start_comfy: $("cfg-auto").checked }) });

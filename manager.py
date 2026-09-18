@@ -174,7 +174,53 @@ def no_cuda_reason(version: str) -> str:
     return f"torch {version} — no NVIDIA GPU found, speech will be slow."
 
 
-def dependencies(cfg: dict, client=None) -> list[dict]:
+def _torch_row(py_comfy: str, suffix: str, label: str) -> dict:
+    """PyTorch as this engine's own environment has it."""
+    if not py_comfy:
+        return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
+                "state": "unknown", "detail": "Install ComfyUI first.",
+                "action": "install"}
+    kind = "portable python_embeded" if "python_embeded" in py_comfy \
+        else "virtual environment"
+    code, out = _probe(py_comfy,
+                       "import torch,json;"
+                       "print(json.dumps({'v':torch.__version__,"
+                       "'cuda':torch.cuda.is_available(),"
+                       "'dev':(torch.cuda.get_device_name(0) "
+                       "if torch.cuda.is_available() else '')}))")
+    if code != 0:
+        return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
+                "state": "missing", "detail": f"Not installed in the {kind}.",
+                "action": "install"}
+    import json as _json
+    try:
+        d = _json.loads(out.splitlines()[-1])
+    except Exception:  # noqa: BLE001
+        return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
+                "state": "unknown", "detail": out[-140:], "action": "install"}
+    if d["cuda"]:
+        return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
+                "state": "ok", "detail": f"torch {d['v']} — GPU: {d['dev']}",
+                "action": "reinstall"}
+    return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
+            "state": "warn", "detail": no_cuda_reason(d["v"]),
+            "action": "reinstall"}
+
+
+def dependencies(cfg: dict, clients=None, engine: str = "") -> list[dict]:
+    """What each engine needs, engine by engine.
+
+    They no longer share anything below ComfyUI — separate clones, separate
+    environments, separate model folders, separate ports — so the report is
+    per engine too. Python and Git are the only rows left that both use.
+
+    `clients` is {engine id: ComfyClient} for the engines that are answering;
+    a bare client is taken as the selected engine's, which is what callers
+    written before the split still pass.
+    """
+    if clients is not None and not isinstance(clients, dict):
+        clients = {engine or bootstrap.DEFAULT_ENGINE: clients}
+    clients = clients or {}
     items: list[dict] = []
 
     try:
@@ -191,176 +237,166 @@ def dependencies(cfg: dict, client=None) -> list[dict]:
                   "detail": git or "Needed to download ComfyUI and the nodes.",
                   "action": None if git else "install"})
 
-    comfy_dir = Path(cfg["comfy_dir"]) if cfg.get("comfy_dir") else None
-    if comfy_dir and (comfy_dir / "main.py").exists():
-        items.append({"id": "comfyui", "label": "ComfyUI", "state": "ok",
-                      "detail": str(comfy_dir), "action": "update"})
-    else:
-        items.append({"id": "comfyui", "label": "ComfyUI", "state": "missing",
-                      "detail": "Not installed yet.", "action": "install"})
-
-    # One row per engine. The ids are what /api/deps/<id>/install takes, so
-    # they are the engine ids rather than a single "node".
     for eid, eng in ENGINES.items():
-        dep_id = "node" if eid == "qwen" else f"node_{eid}"
+        label, suffix = eng["label"], "_" + eid
         if not bootstrap.engine_enabled(cfg, eid):
-            items.append({"id": dep_id, "label": f"{eng['label']} nodes",
-                          "state": "off",
+            items.append({"id": "comfyui" + suffix,
+                          "label": f"ComfyUI · {label}", "state": "off",
                           "detail": "Turned off in Settings.", "action": None})
             continue
+        slot = bootstrap.engine_cfg(cfg, eid)
+        client = clients.get(eid)
+        comfy_dir = Path(slot["comfy_dir"]) if slot.get("comfy_dir") else None
+
+        # Its own ComfyUI ------------------------------------------------- #
+        if comfy_dir and (comfy_dir / "main.py").exists():
+            items.append({"id": "comfyui" + suffix,
+                          "label": f"ComfyUI · {label}", "state": "ok",
+                          "detail": str(comfy_dir), "action": "update"})
+        else:
+            items.append({"id": "comfyui" + suffix,
+                          "label": f"ComfyUI · {label}", "state": "missing",
+                          "detail": f"{label} has no ComfyUI of its own yet — "
+                                    f"it would go in {APP_DIR / eng['dir_name']}.",
+                          "action": "install"})
+
+        # Its own nodes ---------------------------------------------------- #
         loaded = client.engine_ready(eid) if client else None
         if not (comfy_dir and bootstrap.node_installed(comfy_dir, eid)):
             if loaded:
-                # The running ComfyUI has the classes, so they are installed —
-                # we simply cannot see where, because this is someone's own
-                # ComfyUI and setup was never told its folder. Reporting that
-                # as "missing" put two red rows and an Install button in front
-                # of someone whose engine was working perfectly.
-                items.append({"id": dep_id, "label": f"{eng['label']} nodes",
+                items.append({"id": "node" + suffix, "label": f"{label} nodes",
                               "state": "ok",
-                              "detail": "Loaded by the ComfyUI you are running. "
-                                        "Set its folder in Settings to manage "
-                                        "them from here.",
+                              "detail": "Loaded by the ComfyUI you are "
+                                        "running. Set its folder in Settings "
+                                        "to manage them from here.",
                               "action": None})
-                continue
-            items.append({"id": dep_id, "label": f"{eng['label']} nodes",
-                          "state": "missing",
-                          "detail": f"{eng['node_repo']} is not installed.",
-                          "action": "install"})
-            continue
-        items.append({
-            "id": dep_id, "label": f"{eng['label']} nodes",
-            "state": "ok" if loaded is not False else "warn",
-            # ComfyUI reads custom_nodes once, at startup, so the usual cause
-            # is an engine that was already running when they were installed.
-            # Restart is the fix and the diagnosis both: if they still do not
-            # load, that task imports them and reports the real exception.
-            "detail": (str(comfy_dir / "custom_nodes" / eng["node_dir"])
-                       if loaded is not False else
-                       "Installed, but this ComfyUI started before they were. "
-                       "Restart it so it loads them."),
-            "action": "update" if loaded is not False else "restart"})
-
-    py_comfy = comfy_python(cfg)
-    if py_comfy:
-        kind = "portable python_embeded" if "python_embeded" in py_comfy \
-            else "virtual environment"
-        code, out = _probe(py_comfy,
-                           "import torch,json;"
-                           "print(json.dumps({'v':torch.__version__,"
-                           "'cuda':torch.cuda.is_available(),"
-                           "'dev':(torch.cuda.get_device_name(0) "
-                           "if torch.cuda.is_available() else '')}))")
-        if code != 0:
-            items.append({"id": "torch", "label": "PyTorch", "state": "missing",
-                          "detail": f"Not installed in the {kind}.",
-                          "action": "install"})
+            else:
+                items.append({"id": "node" + suffix, "label": f"{label} nodes",
+                              "state": "missing",
+                              "detail": f"{eng['node_repo']} is not installed.",
+                              "action": "install"})
         else:
-            import json as _json
-            try:
-                d = _json.loads(out.splitlines()[-1])
-                if d["cuda"]:
-                    items.append({"id": "torch", "label": "PyTorch", "state": "ok",
-                                  "detail": f"torch {d['v']} — GPU: {d['dev']}",
-                                  "action": "reinstall"})
-                else:
-                    items.append({"id": "torch", "label": "PyTorch",
-                                  "state": "warn",
-                                  "detail": no_cuda_reason(d["v"]),
-                                  "action": "reinstall"})
-            except Exception:
-                items.append({"id": "torch", "label": "PyTorch", "state": "unknown",
-                              "detail": out[-140:], "action": "install"})
-    else:
-        items.append({"id": "torch", "label": "PyTorch", "state": "unknown",
-                      "detail": "Install ComfyUI first.", "action": "install"})
-
-    # The node's own packages. transformers is the one that actually breaks:
-    # Qwen3-TTS wants 4.57.3, or 5.0 and up.
-    if py_comfy:
-        code, out = _probe(py_comfy,
-                           "import transformers,librosa,accelerate;"
-                           "print(transformers.__version__)")
-        if code != 0:
-            items.append({"id": "node_reqs", "label": "Qwen-TTS packages",
-                          "state": "missing",
-                          "detail": "transformers, librosa or accelerate is "
-                                    "missing.", "action": "install"})
-        else:
-            ver = out.splitlines()[-1].strip()
-            major = int(ver.split(".")[0]) if ver[:1].isdigit() else 0
-            good = ver.startswith("4.57.3") or major >= 5
             items.append({
-                "id": "node_reqs", "label": "Qwen-TTS packages",
-                "state": "ok" if good else "warn",
-                "detail": f"transformers {ver}" + ("" if good else
-                          " — Qwen3-TTS needs 4.57.3, or 5.0 and up."),
-                "action": "install"})
-    else:
-        items.append({"id": "node_reqs", "label": "Qwen-TTS packages",
-                      "state": "unknown", "detail": "Install ComfyUI first.",
-                      "action": "install"})
+                "id": "node" + suffix, "label": f"{label} nodes",
+                "state": "ok" if loaded is not False else "warn",
+                "detail": (str(comfy_dir / "custom_nodes" / eng["node_dir"])
+                           if loaded is not False else
+                           "Installed, but this ComfyUI started before they "
+                           "were. Restart it so it loads them."),
+                "action": "update" if loaded is not False else "restart"})
 
-    models_dir = Path(cfg["models_dir"]) if cfg.get("models_dir") else None
-    if models_dir and models_dir.is_dir():
-        missing = bootstrap.missing_models(models_dir, cfg)
-        need = [m for m in missing if m["group"] in ("core", "preset")]
-        if need:
-            items.append({"id": "models", "label": "Voices and models",
-                          "state": "missing",
-                          "detail": "Missing: " + ", ".join(m["repo"] for m in need),
-                          "action": "models"})
-        elif missing:
-            items.append({"id": "models", "label": "Voices and models",
-                          "state": "warn",
-                          "detail": "Optional: " + ", ".join(m["repo"]
-                                                             for m in missing),
-                          "action": "models"})
+        # Its own environment ---------------------------------------------- #
+        py_comfy = comfy_python(cfg, eid)
+        items.append(_torch_row(py_comfy, suffix, label))
+
+        if py_comfy:
+            code, out = _probe(py_comfy,
+                               "import transformers,librosa;"
+                               "print(transformers.__version__)")
+            if code != 0:
+                items.append({"id": "node_reqs" + suffix,
+                              "label": f"Speech packages · {label}",
+                              "state": "missing",
+                              "detail": "transformers or librosa is missing.",
+                              "action": "install"})
+            else:
+                ver = out.splitlines()[-1].strip()
+                major = int(ver.split(".")[0]) if ver[:1].isdigit() else 0
+                # Qwen3-TTS is the strict one: 4.57.3, or 5.0 and up. MOSS asks
+                # only for 4.40+, and now that they no longer share an
+                # environment each is judged on its own floor.
+                good = (ver.startswith("4.57.3") or major >= 5) if eid == "qwen" \
+                    else (major >= 5 or ver >= "4.40")
+                items.append({
+                    "id": "node_reqs" + suffix,
+                    "label": f"Speech packages · {label}",
+                    "state": "ok" if good else "warn",
+                    "detail": f"transformers {ver}" + ("" if good else
+                              " — Qwen3-TTS needs 4.57.3, or 5.0 and up."),
+                    "action": "install"})
         else:
-            items.append({"id": "models", "label": "Voices and models",
-                          "state": "ok", "detail": "All folders present.",
-                          "action": "models"})
-    else:
-        items.append({"id": "models", "label": "Voices and models",
-                      "state": "unknown", "detail": "Set the models folder first.",
-                      "action": "models"})
+            items.append({"id": "node_reqs" + suffix,
+                          "label": f"Speech packages · {label}",
+                          "state": "unknown", "detail": "Install ComfyUI first.",
+                          "action": "install"})
 
-    online = bootstrap.comfy_online(cfg["comfy_url"])
-    items.append({"id": "engine", "label": "Engine",
-                  "state": "ok" if online else "missing",
-                  "detail": cfg["comfy_url"] if online
-                  else "ComfyUI is not answering.",
-                  "action": None if online else "start"})
+        # Its own models ---------------------------------------------------- #
+        models_dir = bootstrap.engine_models_dir(cfg, eid)
+        if models_dir and models_dir.is_dir():
+            missing = bootstrap.missing_models(models_dir, cfg, eid)
+            need = [m for m in missing
+                    if m["group"] in ("core", "preset", "moss_core")]
+            if need:
+                items.append({"id": "models" + suffix,
+                              "label": f"Voices and models · {label}",
+                              "state": "missing",
+                              "detail": "Missing: " + ", ".join(m["repo"] for m in need),
+                              "action": "models"})
+            elif missing:
+                items.append({"id": "models" + suffix,
+                              "label": f"Voices and models · {label}",
+                              "state": "warn",
+                              "detail": "Optional: " + ", ".join(m["repo"]
+                                                                 for m in missing),
+                              "action": "models"})
+            else:
+                items.append({"id": "models" + suffix,
+                              "label": f"Voices and models · {label}",
+                              "state": "ok", "detail": "All folders present.",
+                              "action": "models"})
+        else:
+            items.append({"id": "models" + suffix,
+                          "label": f"Voices and models · {label}",
+                          "state": "unknown",
+                          "detail": "Set up this engine first.",
+                          "action": "models"})
+
+        # Is it up ----------------------------------------------------------- #
+        online = bootstrap.comfy_online(slot["comfy_url"])
+        items.append({"id": "engine" + suffix, "label": f"Engine · {label}",
+                      "state": "ok" if online else "off",
+                      "detail": slot["comfy_url"] + ("" if online else
+                                " — not running. Only the engine you are "
+                                "using is kept up, so the other is not on the "
+                                "card."),
+                      "action": None if online else "start"})
     return items
 
 
-# --------------------------------------------------------------------------- #
-# installers
-# --------------------------------------------------------------------------- #
 def install_dependency(dep_id: str, cfg: dict, opts: dict) -> Task:
-    titles = {"git": "Install Git", "comfyui": "Install ComfyUI",
-              "node": "Install the Qwen3-TTS nodes",
-              "node_moss": "Install the MOSS-TTS nodes",
-              "torch": "Install PyTorch",
-              "node_reqs": "Install the speech packages"}
+    """Install one thing for one engine.
+
+    Ids carry the engine — "torch_moss", "node_qwen" — because nothing below
+    ComfyUI is shared any more. A bare id without a suffix is Qwen's, which is
+    what a page written before the split would send.
+    """
+    base, _, eid = dep_id.rpartition("_")
+    if eid not in ENGINES:
+        base, eid = dep_id, bootstrap.DEFAULT_ENGINE
+    label = ENGINES[eid]["label"]
+    titles = {"git": "Install Git",
+              "comfyui": f"Install ComfyUI for {label}",
+              "node": f"Install the {label} nodes",
+              "torch": f"Install PyTorch for {label}",
+              "node_reqs": f"Install the {label} packages"}
+    opts = dict(opts, engine=eid)
 
     def run(task: Task) -> None:
-        if dep_id == "git":
+        if base == "git":
             _install_git(task)
-        elif dep_id == "comfyui":
-            _install_comfyui(task, cfg)
-        elif dep_id == "node":
-            _install_node(task, cfg, "qwen")
-        elif dep_id.startswith("node_") and dep_id[5:] in ENGINES:
-            _install_node(task, cfg, dep_id[5:])
-        elif dep_id == "torch":
+        elif base == "comfyui":
+            _install_comfyui(task, cfg, eid)
+        elif base == "node":
+            _install_node(task, cfg, eid)
+        elif base == "torch":
             _install_torch(task, cfg, opts)
-        elif dep_id == "node_reqs":
-            _install_node_reqs(task, cfg)
+        elif base == "node_reqs":
+            _install_node_reqs(task, cfg, eid)
         else:
             raise RuntimeError(f"Nothing to install for '{dep_id}'.")
 
-    return spawn("dependency", titles.get(dep_id, dep_id), run, {"dep": dep_id})
+    return spawn("dependency", titles.get(base, dep_id), run,
+                 {"dep": dep_id, "engine": eid})
 
 
 def _reporter(task: Task):
@@ -391,10 +427,12 @@ def _install_git(task: Task) -> None:
                     "reported as missing.")
 
 
-def _install_comfyui(task: Task, cfg: dict) -> None:
+def _install_comfyui(task: Task, cfg: dict, engine: str = "qwen") -> None:
     if not have_git():
         raise RuntimeError("Install Git first.")
-    target = Path(cfg["comfy_dir"]) if cfg.get("comfy_dir") else APP_DIR / "ComfyUI"
+    slot = bootstrap.engine_cfg(cfg, engine)
+    target = Path(slot["comfy_dir"]) if slot.get("comfy_dir") \
+        else APP_DIR / ENGINES[engine]["dir_name"]
     if (target / "main.py").exists():
         task.set(detail="Updating ComfyUI…")
         stream(["git", "-C", str(target), "pull", "--ff-only"], task)
@@ -403,15 +441,15 @@ def _install_comfyui(task: Task, cfg: dict) -> None:
         if stream(["git", "clone", "--depth", "1", bootstrap.COMFY_REPO,
                    str(target)], task) != 0:
             raise RuntimeError("git clone failed — see the log.")
-    cfg["comfy_dir"] = str(target)
-    cfg["models_dir"] = cfg.get("models_dir") or str(target / "models")
+    slot["comfy_dir"] = str(target)
+    slot["models_dir"] = slot.get("models_dir") or str(target / "models")
     bootstrap.save_config(cfg)
     task.set(detail=str(target))
 
 
 def _install_node(task: Task, cfg: dict, engine: str = "qwen") -> None:
     eng = ENGINES[engine]
-    comfy_dir = Path(cfg.get("comfy_dir") or "")
+    comfy_dir = Path(bootstrap.engine_cfg(cfg, engine).get("comfy_dir") or "")
     if not (comfy_dir / "main.py").exists():
         raise RuntimeError("Install ComfyUI first.")
     if not have_git():
@@ -431,7 +469,9 @@ def _install_node(task: Task, cfg: dict, engine: str = "qwen") -> None:
 
 
 def _install_torch(task: Task, cfg: dict, opts: dict) -> None:
-    comfy_dir = Path(cfg.get("comfy_dir") or "")
+    engine = opts.get("engine") or "qwen"
+    slot = bootstrap.engine_cfg(cfg, engine)
+    comfy_dir = Path(slot.get("comfy_dir") or "")
     if not (comfy_dir / "main.py").exists():
         raise RuntimeError("Install ComfyUI first.")
     target = portable_python(comfy_dir)
@@ -477,9 +517,10 @@ def _install_torch(task: Task, cfg: dict, opts: dict) -> None:
 
 
 def _install_node_reqs(task: Task, cfg: dict, engine: str = "") -> None:
-    """Requirements for one engine, or for every engine that is installed."""
-    comfy_dir = Path(cfg.get("comfy_dir") or "")
-    py = comfy_python(cfg)
+    """Requirements for one engine's own ComfyUI."""
+    engine = engine or "qwen"
+    comfy_dir = Path(bootstrap.engine_cfg(cfg, engine).get("comfy_dir") or "")
+    py = comfy_python(cfg, engine)
     if not py:
         raise RuntimeError("Install ComfyUI and PyTorch first.")
     todo = [ENGINES[engine]] if engine else [
@@ -576,12 +617,13 @@ def selftest(cfg: dict, client, engine: str, task: Task, tail=None) -> None:
     started_lines = len(tail(4000)) if tail else 0
 
     # 1. is anything there ---------------------------------------------- #
-    if not bootstrap.comfy_online(cfg["comfy_url"]):
+    here = bootstrap.engine_cfg(cfg, engine)
+    if not bootstrap.comfy_online(here["comfy_url"]):
         steps.fail("engine", "ComfyUI is answering",
-                   f"Nothing at {cfg['comfy_url']}. Start it from the Engine "
+                   f"Nothing at {here['comfy_url']}. Start it from the Engine "
                    "panel first.")
         raise RuntimeError("ComfyUI is not running.")
-    steps.ok("engine", "ComfyUI is answering", cfg["comfy_url"])
+    steps.ok("engine", "ComfyUI is answering", here["comfy_url"])
 
     # 2. did it load these nodes ----------------------------------------- #
     # Forced: the schema is cached for two minutes, and the whole point of
@@ -596,9 +638,10 @@ def selftest(cfg: dict, client, engine: str, task: Task, tail=None) -> None:
         raise
     if not client.engine_ready(engine):
         why = ""
-        if cfg.get("comfy_dir"):
-            why = bootstrap.node_import_error(bootstrap.comfy_python(cfg),
-                                              Path(cfg["comfy_dir"]), engine)
+        if here.get("comfy_dir"):
+            why = bootstrap.node_import_error(
+                bootstrap.comfy_python(cfg, engine),
+                Path(here["comfy_dir"]), engine)
         steps.fail("nodes", f"{eng['label']} nodes are loaded",
                    why or "ComfyUI has none of this engine's classes. If they "
                           "are installed, it started before they were — press "
@@ -607,7 +650,7 @@ def selftest(cfg: dict, client, engine: str, task: Task, tail=None) -> None:
     steps.ok("nodes", f"{eng['label']} nodes are loaded")
 
     # 3. are the folders there, and whole -------------------------------- #
-    models_dir = Path(cfg["models_dir"]) if cfg.get("models_dir") else None
+    models_dir = bootstrap.engine_models_dir(cfg, engine)
     if not models_dir or not models_dir.is_dir():
         steps.fail("models", "Model folders are on disk",
                    "No models folder is set — run setup, or set it in Settings.")
@@ -750,8 +793,8 @@ def hf_browse(cfg: dict, repo: str, revision: str = "main") -> dict:
     files = bootstrap.hf_tree(cfg, repo, revision)
     keep = bootstrap.wanted_files(files)
     keep_paths = {f["path"] for f in keep}
-    target = bootstrap.model_dir(Path(cfg["models_dir"]), repo) \
-        if cfg.get("models_dir") else None
+    root = bootstrap.engine_models_dir(cfg, bootstrap.engine_of(repo))
+    target = bootstrap.model_dir(root, repo) if root else None
     for f in files:
         f["needed"] = f["path"] in keep_paths
         f["installed"] = bool(target and (target / f["path"]).exists())
@@ -762,13 +805,14 @@ def hf_browse(cfg: dict, repo: str, revision: str = "main") -> dict:
 
 
 def hf_download_repo(cfg: dict, repo: str) -> Task:
-    if not cfg.get("models_dir"):
-        raise RuntimeError("Set the ComfyUI models folder before downloading.")
-    models_dir = Path(cfg["models_dir"])
+    engine = bootstrap.engine_of(repo)
+    models_dir = bootstrap.engine_models_dir(cfg, engine)
+    if not models_dir:
+        raise RuntimeError(
+            f"{ENGINES[engine]['label']} has no models folder yet — set that "
+            "engine up first, or set its folder in Settings.")
     if any(t.meta.get("repo") == repo for t in TASKS.running("download")):
         raise RuntimeError(f"{repo} is already downloading.")
-
-    engine = bootstrap.engine_of(repo)
 
     def run(task: Task) -> None:
         task.log(f"{repo} → {bootstrap.model_dir(models_dir, repo, engine)}")
@@ -797,17 +841,19 @@ def _folder_row(repo: str, engine: str, folder: Path) -> dict:
 
 
 def local_models(cfg: dict) -> list[dict]:
-    """Every model folder on disk, in both engines' layouts.
+    """Every model folder on disk, each engine read in its own install.
 
-    The two are read differently on purpose: Qwen nests <Org>/<Name>, MOSS
-    flattens to <Org>--<Name>. Walking one shape over the other lists nothing,
-    which is how a downloaded MOSS folder would read as never downloaded.
+    Two things differ per engine and both matter: where the folder lives —
+    each ComfyUI has its own models directory now — and its shape. Qwen nests
+    <Org>/<Name>, MOSS flattens to <Org>--<Name>. Walking one shape over the
+    other lists nothing, which is how a downloaded MOSS folder would read as
+    never downloaded.
     """
-    base = Path(cfg["models_dir"]) if cfg.get("models_dir") else None
     out: list[dict] = []
-    if not base:
-        return out
     for eid, eng in ENGINES.items():
+        base = bootstrap.engine_models_dir(cfg, eid)
+        if not base:
+            continue
         root = base / eng["subdir"]
         if not root.is_dir():
             continue
@@ -824,13 +870,14 @@ def local_models(cfg: dict) -> list[dict]:
 
 
 def delete_model(cfg: dict, repo: str) -> None:
-    if not cfg.get("models_dir"):
-        raise RuntimeError("No models folder is set.")
     if "/" not in repo or ".." in repo:
         raise RuntimeError("That path is not allowed.")
     engine = bootstrap.engine_of(repo)
-    root = (Path(cfg["models_dir"]) / ENGINES[engine]["subdir"]).resolve()
-    target = bootstrap.model_dir(Path(cfg["models_dir"]), repo, engine).resolve()
+    base = bootstrap.engine_models_dir(cfg, engine)
+    if not base:
+        raise RuntimeError("No models folder is set for that engine.")
+    root = (base / ENGINES[engine]["subdir"]).resolve()
+    target = bootstrap.model_dir(base, repo, engine).resolve()
     if not str(target).startswith(str(root)):
         raise RuntimeError("That path is outside the models folder.")
     if not target.is_dir():
@@ -844,12 +891,12 @@ REQUIRED_GROUPS = ("core", "preset", "moss_core")
 def curated(cfg: dict, vram_mb: int = 0) -> list[dict]:
     """Every folder both engines know about, with what it is for, whether this
     setup has asked for it, and whether the card can actually run it."""
-    models_dir = Path(cfg["models_dir"]) if cfg.get("models_dir") else None
     wanted = {m["repo"] for m in bootstrap.wanted_models(cfg)}
     if not vram_mb:
         vram_mb = bootstrap.nvidia_gpu().get("vram_mb") or 0
     out = []
     for eid, eng in ENGINES.items():
+        root = bootstrap.engine_models_dir(cfg, eid)
         for m in eng["models"]:
             out.append({**m, "engine": eid, "engine_label": eng["label"],
                         "role": "required" if m["group"] in REQUIRED_GROUPS
@@ -860,6 +907,6 @@ def curated(cfg: dict, vram_mb: int = 0) -> list[dict]:
                         # nvidia-smi was missing is rule 5b in a new coat.
                         "fits": bootstrap.fits_vram(m.get("vram_gb") or 0,
                                                     vram_mb),
-                        "installed": bool(models_dir)
-                        and bootstrap.model_installed(models_dir, m["repo"], eid)})
+                        "installed": bool(root)
+                        and bootstrap.model_installed(root, m["repo"], eid)})
     return out

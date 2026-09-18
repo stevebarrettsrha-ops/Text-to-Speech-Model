@@ -38,8 +38,79 @@ app = Flask(__name__, static_folder=None)
 
 cfg = load_config()
 progress = Progress()
-comfy_proc = ComfyProcess()
-client = ComfyClient(cfg["comfy_url"])
+# One ComfyUI per engine, each its own process on its own port with its own
+# environment — the whole point of the split. Two of them that have both
+# generated will each be holding models in their own VRAM, and neither can free
+# the other's: ComfyUI's unload_all_models only reaches inside one process. On
+# an 8 GB card that is an out-of-memory waiting to happen, so only the engine
+# being used is left running, and `activate` is what enforces it.
+PROCS = {eid: ComfyProcess() for eid in bootstrap.ENGINES}
+CLIENTS = {eid: ComfyClient(bootstrap.engine_url(cfg, eid))
+           for eid in bootstrap.ENGINES}
+# Held across "stop the other, start this one, generate", so two takes started
+# together cannot leave both engines resident.
+engine_lock = threading.RLock()
+
+
+def current_engine() -> str:
+    eid = cfg.get("engine") or bootstrap.DEFAULT_ENGINE
+    return eid if eid in bootstrap.ENGINES else bootstrap.DEFAULT_ENGINE
+
+
+def for_engine(engine: str = "") -> ComfyClient:
+    eid = engine or current_engine()
+    c = CLIENTS[eid]
+    c.url = bootstrap.engine_url(cfg, eid)
+    return c
+
+
+def proc_for(engine: str = "") -> ComfyProcess:
+    return PROCS[engine or current_engine()]
+
+
+def engine_online(engine: str = "") -> bool:
+    return comfy_online(bootstrap.engine_url(cfg, engine or current_engine()))
+
+
+def activate(engine: str, prog=None, wait: bool = True) -> str:
+    """Make this the engine that is running, and the only one.
+
+    Returns "" when it is up, or a sentence saying why it is not. Stopping the
+    others is not tidiness: a ComfyUI that has generated keeps its model in
+    VRAM until something in *its* process frees it, so two live engines on an
+    8 GB card means the second one fails to allocate.
+    """
+    with engine_lock:
+        if not cfg.get("run_both_engines"):
+            for other, proc in PROCS.items():
+                if other != engine and proc.alive():
+                    (prog or progress).log(
+                        f"Stopping {bootstrap.ENGINES[other]['label']} so "
+                        f"{bootstrap.ENGINES[engine]['label']} has the card "
+                        "to itself.")
+                    proc.stop()
+        url = bootstrap.engine_url(cfg, engine)
+        if comfy_online(url):
+            return ""
+        slot = bootstrap.engine_cfg(cfg, engine)
+        py = bootstrap.comfy_python(cfg, engine)
+        if not slot.get("comfy_dir") or not py:
+            return (f"{bootstrap.ENGINES[engine]['label']} has no ComfyUI set "
+                    "up yet — run setup for it from the Engine panel.")
+        if not slot.get("auto_start", True):
+            return (f"{bootstrap.ENGINES[engine]['label']}'s ComfyUI is not "
+                    f"running at {url}, and Script Builder is set not to "
+                    "start it.")
+        try:
+            PROCS[engine].start(py, Path(slot["comfy_dir"]),
+                                comfy_port(url), prog or progress)
+        except RuntimeError as exc:
+            return str(exc)
+        if wait and not bootstrap.wait_for_comfy(url, timeout=900):
+            return (f"{bootstrap.ENGINES[engine]['label']}'s ComfyUI did not "
+                    "come up.\n" + "\n".join(PROCS[engine].tail(20)))
+        for_engine(engine).schema(force=True)
+        return ""
 
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
@@ -145,18 +216,25 @@ def zip_clips(paths: list[Path], dest: Path) -> None:
 # --------------------------------------------------------------------------- #
 # generation job
 # --------------------------------------------------------------------------- #
-def wait_for_prompt(prompt_id: str, job_id: str, timeout: int = 900) -> list[dict]:
+def wait_for_prompt(prompt_id: str, job_id: str, engine: str,
+                    timeout: int = 900) -> list[dict]:
+    """Wait on one line, on the engine that queued it.
+
+    The engine has to be passed in: there are two clients now, and reading the
+    selected one here would poll the wrong ComfyUI the moment someone switched
+    engines mid-take.
+    """
     started = time.time()
     while True:
         time.sleep(1.0)
         with jobs_lock:
             if jobs[job_id].get("cancelled"):
-                client.interrupt()
+                for_engine(engine).interrupt()
                 raise ComfyError("Cancelled")
-        err = client.failed(prompt_id)
+        err = for_engine(engine).failed(prompt_id)
         if err:
             raise ComfyError(err)
-        outs = client.outputs(prompt_id)
+        outs = for_engine(engine).outputs(prompt_id)
         if outs:
             return outs
         if time.time() - started > timeout:
@@ -184,7 +262,7 @@ def moss_dirs() -> dict:
     not a repo id and fails. A folder that is absent is left out here, and the
     node then fetches the model itself.
     """
-    base = Path(cfg["models_dir"]) if cfg.get("models_dir") else None
+    base = bootstrap.engine_models_dir(cfg, "moss")
     if not base:
         return {}
     out = {}
@@ -241,13 +319,13 @@ def run_job(job_id: str, payload: dict) -> None:
                       pct=round(i / max(len(lines), 1) * 100, 1),
                       line_index=i)
 
-            built = client.build_line(line, voice, opts)
-            prompt_id = client.queue(built["prompt"])
-            outs = wait_for_prompt(prompt_id, job_id)
+            built = for_engine(engine).build_line(line, voice, opts)
+            prompt_id = for_engine(engine).queue(built["prompt"])
+            outs = wait_for_prompt(prompt_id, job_id, engine)
             item = outs[0]
             ext = Path(item["filename"]).suffix or ".wav"
             dest = folder / f"line_{i:03d}{ext}"
-            with client.view(item) as resp:
+            with for_engine(engine).view(item) as resp:
                 resp.raise_for_status()
                 with open(dest, "wb") as fh:
                     for chunk in resp.iter_content(1024 * 256):
@@ -324,18 +402,22 @@ def web_asset(name: str):
 # --------------------------------------------------------------------------- #
 @app.get("/api/status")
 def api_status():
-    online = comfy_online(cfg["comfy_url"])
-    models_dir = Path(cfg["models_dir"]) if cfg.get("models_dir") else None
+    engine = request.args.get("engine") or cfg.get("engine") \
+        or bootstrap.DEFAULT_ENGINE
+    if engine not in bootstrap.ENGINES:
+        engine = bootstrap.DEFAULT_ENGINE
+    # Everything below is about *this* engine's install: its ComfyUI, its
+    # models folder, its port. The other engine's state is its own business
+    # and is reported separately in engine_nodes.
+    slot = bootstrap.engine_cfg(cfg, engine)
+    online = comfy_online(slot["comfy_url"])
+    models_dir = bootstrap.engine_models_dir(cfg, engine)
     # Whether the voices could be checked at all, which is not the same as
     # finding none missing. With no models folder set there is nowhere to look,
     # and an empty "missing" list used to read as "all present" — so a machine
     # with ComfyUI up, the nodes loaded and not one voice on disk reported the
     # engine ready and let someone press Read.
     models_known = bool(models_dir and models_dir.is_dir())
-    engine = request.args.get("engine") or cfg.get("engine") \
-        or bootstrap.DEFAULT_ENGINE
-    if engine not in bootstrap.ENGINES:
-        engine = bootstrap.DEFAULT_ENGINE
     payload = {
         "comfy_online": online,
         "engine": engine,
@@ -348,26 +430,38 @@ def api_status():
         "setup_running": bool(progress.running),
         "models_known": models_known,
         "detected": detect_comfy_dirs(),
-        "config": {k: cfg.get(k) for k in
-                   ("comfy_url", "comfy_dir", "models_dir", "managed",
-                    "auto_start_comfy", "torch_index", "want_clone",
-                    "want_17b", "want_voicedesign", "want_moss",
-                    "want_moss_8b", "want_moss_design", "engine")},
+        "config": dict({k: cfg.get(k) for k in
+                        ("torch_index", "want_clone", "want_17b",
+                         "want_voicedesign", "want_moss", "want_moss_8b",
+                         "want_moss_design", "engine", "run_both_engines")},
+                       # The selected engine's own install, flattened under the
+                       # names the page has always used, so one panel edits one
+                       # engine rather than a shape it has to understand.
+                       comfy_url=slot["comfy_url"],
+                       comfy_dir=slot["comfy_dir"],
+                       models_dir=slot["models_dir"],
+                       managed=slot["managed"],
+                       auto_start_comfy=slot["auto_start"]),
+        "installs": {e: dict(bootstrap.engine_cfg(cfg, e),
+                             running=PROCS[e].alive(),
+                             online=comfy_online(
+                                 bootstrap.engine_cfg(cfg, e)["comfy_url"]))
+                     for e in bootstrap.ENGINES},
         "nodes_ready": False, "ready": False,
     }
     # Readiness is per engine: with MOSS selected, a missing Qwen folder is
     # not what stands between this script and a take, and reporting it as one
     # sends people to download a model they are not about to use.
-    missing = [m["repo"] for m in
-               bootstrap.missing_models(models_dir, cfg, engine)] \
+    missing = [m["repo"] for m in bootstrap.engine_missing(cfg, engine)] \
         if models_known else []
     payload["missing_models"] = missing
     if online:
         try:
-            payload["nodes_ready"] = client.engine_ready(engine)
-            payload["capabilities"] = client.capabilities(engine)
+            payload["nodes_ready"] = for_engine(engine).engine_ready(engine)
+            payload["capabilities"] = for_engine(engine).capabilities(engine)
             payload["engine_nodes"] = {
-                e: client.engine_ready(e) for e in bootstrap.ENGINES}
+                e: (for_engine(e).engine_ready(e) if engine_online(e) else False)
+                for e in bootstrap.ENGINES}
         except Exception as exc:  # noqa: BLE001
             payload["schema_error"] = str(exc)
     payload["ready"] = bool(online and payload["nodes_ready"]
@@ -377,10 +471,14 @@ def api_status():
 
 @app.get("/api/voices")
 def api_voices():
-    if not comfy_online(cfg["comfy_url"]):
-        return jsonify({"error": "ComfyUI is not running."}), 503
-    engine = request.args.get("engine") or cfg.get("engine") \
-        or bootstrap.DEFAULT_ENGINE
+    want = request.args.get("engine") or current_engine()
+    if want not in bootstrap.ENGINES:
+        want = bootstrap.DEFAULT_ENGINE
+    if not engine_online(want):
+        return jsonify({"error": f"{bootstrap.ENGINES[want]['label']}'s "
+                                 "ComfyUI is not running."}), 503
+    client = for_engine(want)
+    engine = want
     try:
         if engine == "moss":
             # No speaker enum exists on any MOSS node, so an empty list here is
@@ -430,17 +528,26 @@ def api_setup_start():
     if progress.running:
         return jsonify({"error": "Setup is already running."}), 409
     body = request.get_json(silent=True) or {}
-    for key in ("comfy_url", "models_dir", "want_clone", "want_17b",
-                "want_voicedesign", "want_moss", "want_moss_8b",
-                "want_moss_design"):
+    for key in ("want_clone", "want_17b", "want_voicedesign", "want_moss",
+                "want_moss_8b", "want_moss_design"):
         if key in body:
             cfg[key] = body[key]
-    cfg["comfy_url"] = clean_url(cfg.get("comfy_url")) or client.url
-    client.url = cfg["comfy_url"]
+    # An address or folder in the setup body belongs to one engine's install.
+    # "qwen_comfy_url" names it outright; a bare "comfy_url" is the older shape
+    # and means the default engine, which is the only one that existed then.
+    for eid in bootstrap.ENGINES:
+        slot = bootstrap.engine_cfg(cfg, eid)
+        for key in ("comfy_url", "models_dir"):
+            value = body.get(f"{eid}_{key}") or (
+                body.get(key) if eid == bootstrap.DEFAULT_ENGINE else "")
+            if value:
+                slot[key] = value
+        slot["comfy_url"] = clean_url(slot["comfy_url"]) \
+            or f"http://127.0.0.1:{bootstrap.ENGINES[eid]['port']}"
     save_config(cfg)
     progress.__init__()
     threading.Thread(target=bootstrap.run_setup,
-                     args=(cfg, progress, comfy_proc, body.get("comfy_dir", ""),
+                     args=(cfg, progress, PROCS, body.get("comfy_dir", ""),
                            body.get("mode", "auto")), daemon=True).start()
     return jsonify({"ok": True})
 
@@ -448,22 +555,21 @@ def api_setup_start():
 @app.get("/api/setup/state")
 def api_setup_state():
     snap = progress.snapshot(int(request.args.get("since", 0)))
-    snap["comfy_tail"] = comfy_proc.tail(12)
+    snap["comfy_tail"] = [l for e in bootstrap.ENGINES
+                          for l in PROCS[e].tail(6)]
     return jsonify(snap)
 
 
 @app.post("/api/comfy/start")
 def api_comfy_start():
-    if comfy_online(cfg["comfy_url"]):
+    engine = request.args.get("engine") or current_engine()
+    if engine not in bootstrap.ENGINES:
+        return jsonify({"error": f"There is no '{engine}' engine."}), 400
+    if engine_online(engine):
         return jsonify({"ok": True, "already": True})
-    py = bootstrap.comfy_python(cfg)
-    if not cfg.get("comfy_dir") or not py:
-        return jsonify({"error": "Run setup first."}), 400
-    try:
-        comfy_proc.start(py, Path(cfg["comfy_dir"]),
-                         comfy_port(cfg["comfy_url"]), progress)
-    except RuntimeError as exc:
-        return jsonify({"error": str(exc)}), 400
+    why = activate(engine, wait=False)
+    if why:
+        return jsonify({"error": why}), 400
     return jsonify({"ok": True})
 
 
@@ -476,10 +582,15 @@ def api_comfy_restart():
     "Installed but ComfyUI has not loaded them" is not something anyone can act
     on from a launcher with no console. This is the act.
     """
-    py = bootstrap.comfy_python(cfg)
-    if not cfg.get("comfy_dir") or not py:
+    engine = request.args.get("engine") or current_engine()
+    if engine not in bootstrap.ENGINES:
+        return jsonify({"error": f"There is no '{engine}' engine."}), 400
+    slot = bootstrap.engine_cfg(cfg, engine)
+    comfy_proc = PROCS[engine]
+    py = bootstrap.comfy_python(cfg, engine)
+    if not slot.get("comfy_dir") or not py:
         return jsonify({"error": "Run setup first."}), 400
-    url = cfg["comfy_url"]
+    url = slot["comfy_url"]
     if comfy_online(url) and not comfy_proc.alive():
         return jsonify({"error": "Something else started that ComfyUI, so "
                                  "Script Builder cannot restart it. Restart it "
@@ -494,16 +605,17 @@ def api_comfy_restart():
                     break
                 time.sleep(1)
         task.set(detail="Starting ComfyUI — the first start is slow…")
-        comfy_proc.start(py, Path(cfg["comfy_dir"]), comfy_port(url), progress)
+        comfy_proc.start(py, Path(slot["comfy_dir"]), comfy_port(url),
+                         progress)
         if not bootstrap.wait_for_comfy(url, timeout=900):
             raise RuntimeError("ComfyUI did not come back.\n"
                                + "\n".join(comfy_proc.tail(25)))
         # force=True: the schema is cached for two minutes, and two minutes of
         # "still missing" after a restart that fixed it is the wrong answer.
+        client = for_engine(engine)
         client.schema(force=True)
-        wanted = [e for e in bootstrap.ENGINES
-                  if bootstrap.engine_enabled(cfg, e)
-                  and bootstrap.node_installed(Path(cfg["comfy_dir"]), e)]
+        wanted = [engine] if bootstrap.node_installed(
+            Path(slot["comfy_dir"]), engine) else []
         short = [e for e in wanted if not client.engine_ready(e)]
         if not short:
             task.set(detail="Restarted — " + (", ".join(
@@ -517,14 +629,16 @@ def api_comfy_restart():
                 task.log(line)
         reasons = []
         for eid in short:
-            why = bootstrap.node_import_error(py, Path(cfg["comfy_dir"]), eid)
+            why = bootstrap.node_import_error(py, Path(slot["comfy_dir"]), eid)
             reasons.append(f"{bootstrap.ENGINES[eid]['label']}: "
                            + (why or "imports fine by hand, so something else "
                                      "in custom_nodes is failing first"))
         raise RuntimeError("; ".join(reasons))
 
     return jsonify({"ok": True,
-                    "task": manager.spawn("engine", "Restart ComfyUI",
+                    "task": manager.spawn(
+                        "engine",
+                        f"Restart {bootstrap.ENGINES[engine]['label']}",
                                           run).view()})
 
 
@@ -548,10 +662,14 @@ def api_selftest(engine: str):
     # Only our own ComfyUI's console is ours to read; someone else's belongs
     # to them, and the test says so rather than reporting an empty tail as a
     # clean run.
-    tail = comfy_proc.tail if comfy_proc.alive() else None
+    # One engine on the card at a time — the same rule the take path follows.
+    why = activate(engine)
+    if why:
+        return jsonify({"error": why}), 400
+    tail = PROCS[engine].tail if PROCS[engine].alive() else None
 
     def run(task: manager.Task) -> None:
-        manager.selftest(cfg, client, engine, task, tail)
+        manager.selftest(cfg, for_engine(engine), engine, task, tail)
 
     label = bootstrap.ENGINES[engine]["label"]
     return jsonify({"ok": True,
@@ -569,7 +687,7 @@ def api_moss_8b():
     claimed first launch could fetch its way to a working 8B would be lying.
     The two HuggingFace repos are looked up rather than taken on trust.
     """
-    vram = gpu_vram(client if comfy_online(cfg["comfy_url"]) else None)
+    vram = gpu_vram(for_engine() if engine_online() else None)
     entry = next((m for m in bootstrap.ENGINES["moss"]["models"]
                   if m["repo"] == "OpenMOSS-Team/MOSS-TTS"), {})
     body = {
@@ -596,13 +714,24 @@ def api_moss_8b():
 @app.post("/api/config")
 def api_config():
     body = request.get_json(silent=True) or {}
-    for key in ("comfy_url", "comfy_dir", "models_dir", "auto_start_comfy",
-                "torch_index", "want_clone", "want_17b", "want_voicedesign",
-                "want_moss", "want_moss_8b", "want_moss_design", "engine"):
+    # An engine can be named, so Settings can edit either install; without one
+    # the edit lands on whichever engine is selected.
+    target = body.get("for_engine") or body.get("engine") or current_engine()
+    if target not in bootstrap.ENGINES:
+        target = bootstrap.DEFAULT_ENGINE
+    slot = bootstrap.engine_cfg(cfg, target)
+    for key, into in (("comfy_url", "comfy_url"), ("comfy_dir", "comfy_dir"),
+                      ("models_dir", "models_dir"),
+                      ("auto_start_comfy", "auto_start")):
+        if key in body:
+            slot[into] = body[key]
+    slot["comfy_url"] = clean_url(slot.get("comfy_url")) \
+        or f"http://127.0.0.1:{bootstrap.ENGINES[target]['port']}"
+    for key in ("torch_index", "want_clone", "want_17b", "want_voicedesign",
+                "want_moss", "want_moss_8b", "want_moss_design", "engine",
+                "run_both_engines"):
         if key in body:
             cfg[key] = body[key]
-    cfg["comfy_url"] = clean_url(cfg.get("comfy_url")) or client.url
-    client.url = cfg["comfy_url"]
     save_config(cfg)
     return jsonify({"ok": True})
 
@@ -612,16 +741,19 @@ def api_config():
 # --------------------------------------------------------------------------- #
 @app.get("/api/deps")
 def api_deps():
-    live = client if comfy_online(cfg["comfy_url"]) else None
+    # Every engine that is answering, so each row is judged against its own
+    # ComfyUI rather than the selected one's.
+    live = {e: for_engine(e) for e in bootstrap.ENGINES if engine_online(e)}
+    any_live = live.get(current_engine()) or next(iter(live.values()), None)
     # The GPU answer is cached — it costs a PowerShell query on Windows and
     # cannot change without a reboot. Recheck asks again anyway, because
     # installing the driver is exactly what someone does between two presses.
     gpu = dict(bootstrap.nvidia_gpu(refresh=request.args.get("fresh") == "1"))
-    if not gpu.get("vram_mb") and live:
+    if not gpu.get("vram_mb") and any_live:
         # nvidia-smi missing but ComfyUI running: it carries its own CUDA and
         # knows the card, which is exactly the gap rule 5b is about.
-        gpu["vram_mb"] = live.vram_mb()
-    return jsonify({"items": manager.dependencies(cfg, live),
+        gpu["vram_mb"] = any_live.vram_mb()
+    return jsonify({"items": manager.dependencies(cfg, live, current_engine()),
                     "torch_index": cfg.get("torch_index", ""),
                     "gpu": gpu,
                     "torch_auto": bootstrap.torch_index({})})
@@ -671,11 +803,12 @@ def api_hf_settings():
                     "token_hint": ("…" + token[-4:]) if len(token) > 4 else "",
                     "repo": cfg.get("hf_repo") or bootstrap.MODEL_REPOS[0]["repo"],
                     "curated": manager.curated(cfg, gpu_vram(
-                        client if comfy_online(cfg["comfy_url"]) else None)),
+                        for_engine() if engine_online() else None)),
                     "vram_mb": gpu_vram(
-                        client if comfy_online(cfg["comfy_url"]) else None),
+                        for_engine() if engine_online() else None),
                     "gpu_name": bootstrap.nvidia_gpu().get("name", ""),
-                    "models_dir": cfg.get("models_dir", "")})
+                    "models_dir": str(bootstrap.engine_models_dir(
+                        cfg, current_engine()) or "")})
 
 
 @app.post("/api/hf/settings")
@@ -688,7 +821,8 @@ def api_hf_settings_save():
     if body.get("repo"):
         cfg["hf_repo"] = body["repo"].strip()
     if body.get("models_dir"):
-        cfg["models_dir"] = body["models_dir"].strip()
+        bootstrap.engine_cfg(cfg, current_engine())["models_dir"] = \
+            body["models_dir"].strip()
     save_config(cfg)
     return jsonify({"ok": True})
 
@@ -721,7 +855,8 @@ def api_hf_download():
 @app.get("/api/hf/local")
 def api_hf_local():
     return jsonify({"models": manager.local_models(cfg),
-                    "models_dir": cfg.get("models_dir", "")})
+                    "models_dir": str(bootstrap.engine_models_dir(
+                        cfg, current_engine()) or "")})
 
 
 @app.delete("/api/hf/local")
@@ -744,9 +879,16 @@ def api_speak():
              if (l.get("text") or "").strip()]
     if not lines:
         return jsonify({"error": "Write at least one line of dialogue."}), 400
-    if not comfy_online(cfg["comfy_url"]):
-        return jsonify({"error": "ComfyUI is not running. Start it from the "
-                                 "Engine panel."}), 503
+    want = payload.get("engine") or current_engine()
+    if want not in bootstrap.ENGINES:
+        want = bootstrap.DEFAULT_ENGINE
+    # Bring this engine up and put the other one down before a single line is
+    # queued. Two ComfyUIs that have both generated each hold their models in
+    # their own VRAM and neither can free the other's, so on 8 GB the second
+    # take is the one that fails to allocate.
+    why = activate(want)
+    if why:
+        return jsonify({"error": why}), 503
     payload["lines"] = lines
     job_id = uuid.uuid4().hex[:12]
     with jobs_lock:
@@ -779,7 +921,7 @@ def api_job_cancel(job_id: str):
     with jobs_lock:
         if job_id in jobs:
             jobs[job_id]["cancelled"] = True
-    client.interrupt()
+    for_engine().interrupt()
     return jsonify({"ok": True})
 
 
@@ -789,7 +931,8 @@ def api_upload_reference():
         return jsonify({"error": "No file received."}), 400
     try:
         return jsonify({"ok": True,
-                        "name": client.upload_audio(request.files["file"])})
+                        "name": for_engine().upload_audio(
+                            request.files["file"])})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 500
 
@@ -868,17 +1011,16 @@ def main() -> None:
     if swept:
         progress.log(f"Cleared {swept} unfinished take folder(s).")
     if cfg.get("setup_complete") and cfg.get("auto_start_comfy", True) \
-            and cfg.get("comfy_dir") and bootstrap.comfy_python(cfg) \
-            and not comfy_online(cfg["comfy_url"]):
-        progress.log("Restarting ComfyUI from the last setup…")
-        # An engine that cannot be started is an engine the Engine panel
-        # reports as offline, never a reason the whole app fails to boot.
-        try:
-            comfy_proc.start(bootstrap.comfy_python(cfg),
-                             Path(cfg["comfy_dir"]),
-                             comfy_port(cfg["comfy_url"]), progress)
-        except RuntimeError as exc:
-            progress.log(f"Could not restart ComfyUI: {exc}")
+            and not engine_online():
+        # Only the engine that is selected. The other would sit on the card
+        # for nothing, and on 8 GB that is the difference between a take and
+        # an out-of-memory. An engine that cannot start is an engine the
+        # Engine panel reports as offline, never a reason the app fails to
+        # boot.
+        progress.log("Starting the engine this library was last set to…")
+        why = activate(current_engine(), wait=False)
+        if why:
+            progress.log(f"Could not start it: {why}")
     url = f"http://127.0.0.1:{PORT}"
     print(f"\n  Script Builder  →  {url}\n")
     if os.environ.get("SCRIPT_BUILDER_NO_BROWSER") != "1":
@@ -886,7 +1028,8 @@ def main() -> None:
     try:
         app.run(host="127.0.0.1", port=PORT, threaded=True, debug=False)
     finally:
-        comfy_proc.stop()
+        for proc in PROCS.values():
+            proc.stop()
 
 
 if __name__ == "__main__":

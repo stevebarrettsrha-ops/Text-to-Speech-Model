@@ -237,6 +237,40 @@
    `AutoProcessor.from_pretrained` instead. Where someone else started
    ComfyUI, that step reports skipped rather than passing on an empty tail.
 
+30. **Each engine gets its own ComfyUI, and nothing below it is shared.**
+   `ComfyUI-Qwen3-TTS` on 8188 and `ComfyUI-MOSS-TTS` on 8189, each a separate
+   clone with its own environment, its own node pack and its own models folder
+   inside it. Qwen wants `transformers` 4.57.3 or 5.0+, MOSS wants 4.40+, and
+   they resolved together — until the day they do not. Separate installs mean
+   one engine's requirements can never break the other's, and a broken node
+   install takes down one engine rather than both. `venv_python` names the
+   environment after the install (`comfy-venv-ComfyUI-MOSS-TTS`) because both
+   sit under the same parent and a bare `comfy-venv` would be one environment
+   shared by two — the thing this layout exists to prevent.
+30b. **Per-engine settings live in `cfg["engines"][id]`, and a single-install
+   config migrates into it.** `_migrate` gives the old top-level `comfy_dir`,
+   `comfy_url`, `models_dir` and `python` to Qwen — it is the engine the app
+   was built around and the one that ComfyUI was set up for — and starts MOSS
+   from defaults, which means its own install to fetch. It is idempotent, and
+   it leaves the old keys alone: deleting settings out from under someone who
+   might downgrade is not worth the tidiness.
+31. **Only the engine being used is left running.** Two ComfyUIs that have
+   both generated each hold their models in their own process's VRAM, and
+   `unload_all_models` only reaches inside one process — neither can free the
+   other's. On an 8 GB card the second engine is the one that fails to
+   allocate. `activate(engine)` stops the others and starts this one, and
+   `/api/speak` and the self-test both go through it before a single line is
+   queued, under `engine_lock` so two takes started together cannot leave both
+   resident. `run_both_engines` turns it off where there is memory to spare.
+31b. **`wait_for_prompt` is told which engine queued the line.** There are two
+   clients now, and reading the selected one inside the wait loop polls the
+   wrong ComfyUI the moment someone switches engines mid-take.
+32. **The dependency report is per engine, and so are the install ids.**
+   `comfyui_moss`, `torch_qwen`, `node_reqs_moss` — Python and Git are the only
+   rows left that both engines share. `install_dependency` reads the engine off
+   the suffix, and a bare id means the default engine, which is what a page
+   written before the split would send.
+
 ## Why line-by-line, not DialogueInferenceNode
 
 `DialogueInferenceNode` takes a `RoleBankNode`, which takes prompts from
@@ -250,8 +284,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 122 unit tests, standard library only
-npm test                 # 80 checks driving the real page in headless Chromium
+npm run test:units       # 131 unit tests, standard library only
+npm test                 # 81 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script
@@ -262,7 +296,10 @@ Nothing in the suite needs a GPU, a model download or the network.
 from both real node packs, and it runs ComfyUI's own graph validation, so a
 graph that passes here passes there. `POST /mock/hide/<engine>` drops one
 engine's classes, which is how "ComfyUI never loaded those nodes" is reproduced
-without breaking an install. `tests/mock_hf.py` answers for HuggingFace, with
+without breaking an install. The suite runs **two** stand-in ComfyUIs, one per engine on its own port,
+because that is the shape the app installs — and a MOSS graph arriving at
+Qwen's ComfyUI is a failure the single-stand-in version could not have seen.
+`tests/mock_hf.py` answers for HuggingFace, with
 `Range` support and switches to cut a transfer off mid-file or ignore a resume.
 
 `SCRIPT_BUILDER_DATA` moves `data/`, and the suite points it at a temporary

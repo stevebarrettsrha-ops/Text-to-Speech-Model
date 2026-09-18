@@ -175,6 +175,13 @@ DEFAULT_CONFIG = {
     # as the base model.
     "want_moss_design": True,
     "engine": "qwen",
+    # Off by default, and the reason is memory rather than taste: two ComfyUIs
+    # that have both generated each hold their models in their own VRAM, and
+    # ComfyUI's unload_all_models only reaches inside one process. On an 8 GB
+    # card the second engine is the one that fails to allocate. Turn it on
+    # where there is room to spare and switching engines stops costing a
+    # restart.
+    "run_both_engines": False,
     "setup_complete": False,
 }
 
@@ -195,6 +202,8 @@ ENGINES = {
         "node_repo": NODE_REPO,
         "node_dir": NODE_DIR_NAME,
         "node_marker": "nodes.py",
+        "dir_name": "ComfyUI-Qwen3-TTS",
+        "port": 8188,
         "subdir": QWEN_SUBDIR,
         "layout": "org",
         "models": MODEL_REPOS,
@@ -206,6 +215,8 @@ ENGINES = {
         "node_repo": MOSS_NODE_REPO,
         "node_dir": MOSS_NODE_DIR_NAME,
         "node_marker": "__init__.py",
+        "dir_name": "ComfyUI-MOSS-TTS",
+        "port": 8189,
         "subdir": MOSS_SUBDIR,
         "layout": "flat",
         "models": MOSS_MODEL_REPOS,
@@ -233,6 +244,54 @@ def engine_enabled(cfg: dict, engine: str) -> bool:
 # --------------------------------------------------------------------------- #
 # config
 # --------------------------------------------------------------------------- #
+def engine_defaults(engine: str) -> dict:
+    eng = ENGINES[engine]
+    return {"comfy_url": f"http://127.0.0.1:{eng['port']}",
+            "comfy_dir": "", "models_dir": "", "python": "",
+            "managed": True, "auto_start": True}
+
+
+def engine_cfg(cfg: dict, engine: str) -> dict:
+    """The install belonging to one engine, created on first ask.
+
+    Each engine gets its own ComfyUI, its own environment, its own models
+    folder and its own port, because that is the only way one engine's node
+    requirements cannot break the other's. `cfg["engines"][id]` is where that
+    lives; everything below reads through here rather than off the top level.
+    """
+    slot = cfg.setdefault("engines", {})
+    if engine not in slot:
+        slot[engine] = engine_defaults(engine)
+    else:
+        for k, v in engine_defaults(engine).items():
+            slot[engine].setdefault(k, v)
+    slot[engine]["comfy_url"] = (clean_url(slot[engine].get("comfy_url"))
+                                 or f"http://127.0.0.1:{ENGINES[engine]['port']}")
+    return slot[engine]
+
+
+def _migrate(cfg: dict) -> dict:
+    """Carry a single-install config into the per-engine shape.
+
+    Every install before this had one ComfyUI with both node packs in it, and
+    its settings sat at the top level. Those belong to Qwen now — it is the
+    engine the app was built around and the one that ComfyUI was set up for —
+    and MOSS starts from defaults, which means its own install to fetch. The
+    old keys are left where they are: they cost nothing, and deleting settings
+    out from under someone who might downgrade is not worth the tidiness.
+    """
+    if cfg.get("engines"):
+        return cfg
+    legacy = {k: cfg.get(k) for k in
+              ("comfy_url", "comfy_dir", "models_dir", "python", "managed")}
+    qwen = engine_defaults("qwen")
+    if cfg.get("setup_complete") and legacy.get("comfy_dir"):
+        qwen.update({k: v for k, v in legacy.items() if v not in (None, "")})
+        qwen["auto_start"] = bool(cfg.get("auto_start_comfy", True))
+    cfg["engines"] = {"qwen": qwen, "moss": engine_defaults("moss")}
+    return cfg
+
+
 def load_config() -> dict:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     cfg = dict(DEFAULT_CONFIG)
@@ -244,6 +303,9 @@ def load_config() -> dict:
     # Heal a URL saved before it was normalised — a trailing slash in here used
     # to keep the whole app from starting.
     cfg["comfy_url"] = clean_url(cfg.get("comfy_url")) or DEFAULT_COMFY_URL
+    cfg = _migrate(cfg)
+    for eid in ENGINES:
+        engine_cfg(cfg, eid)
     return cfg
 
 
@@ -385,7 +447,13 @@ def portable_python(comfy_dir: Path) -> Path | None:
 
 
 def venv_python(comfy_dir: Path) -> Path:
-    venv = comfy_dir.parent / "comfy-venv"
+    """The environment we build for one ComfyUI, named after it.
+
+    Named, because the two installs sit side by side under the same parent: a
+    bare "comfy-venv" beside both would be one environment shared by both, and
+    sharing it is the thing this whole layout exists to avoid.
+    """
+    venv = comfy_dir.parent / f"comfy-venv-{comfy_dir.name}"
     return venv / ("Scripts/python.exe" if platform.system() == "Windows"
                    else "bin/python")
 
@@ -444,10 +512,15 @@ def existing_python(comfy_dir: Path) -> str:
     return fallback
 
 
-def comfy_python(cfg: dict) -> str:
-    """Whichever interpreter ComfyUI runs on: portable first, then the
-    environment the install already has, then whatever setup recorded."""
-    comfy_dir = Path(cfg["comfy_dir"]) if cfg.get("comfy_dir") else None
+def comfy_python(cfg: dict, engine: str = "") -> str:
+    """Whichever interpreter one engine's ComfyUI runs on.
+
+    Portable first, then the environment that install already has, then
+    whatever setup recorded for it. With no engine named this reads the top
+    level, which is what callers that predate the split still pass.
+    """
+    slot = engine_cfg(cfg, engine) if engine else cfg
+    comfy_dir = Path(slot["comfy_dir"]) if slot.get("comfy_dir") else None
     if comfy_dir:
         p = portable_python(comfy_dir)
         if p:
@@ -455,7 +528,29 @@ def comfy_python(cfg: dict) -> str:
         found = existing_python(comfy_dir)
         if found:
             return found
-    return cfg.get("python") or ""
+    return slot.get("python") or ""
+
+
+def engine_models_dir(cfg: dict, engine: str) -> Path | None:
+    """Where one engine keeps its models — inside its own ComfyUI."""
+    slot = engine_cfg(cfg, engine)
+    if slot.get("models_dir"):
+        return Path(slot["models_dir"])
+    if slot.get("comfy_dir"):
+        return Path(slot["comfy_dir"]) / "models"
+    return None
+
+
+def engine_missing(cfg: dict, engine: str) -> list[dict]:
+    """What that engine still needs, looked for in its own models folder."""
+    root = engine_models_dir(cfg, engine)
+    if not root or not root.is_dir():
+        return list(wanted_models(cfg, engine))
+    return missing_models(root, cfg, engine)
+
+
+def engine_url(cfg: dict, engine: str) -> str:
+    return engine_cfg(cfg, engine)["comfy_url"]
 
 
 def have_git() -> bool:
@@ -1410,8 +1505,172 @@ def gguf_available(cfg: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # setup run
 # --------------------------------------------------------------------------- #
-def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
-              chosen_dir: str = "", mode: str = "auto") -> None:
+def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
+               procs: dict, py: str, mode: str, chosen: dict) -> None:
+    """One step of setup, for one engine. Raises with a sentence on failure."""
+    eng = ENGINES[engine]
+    slot = engine_cfg(cfg, engine)
+    label = eng["label"]
+
+    if step == "comfyui":
+        if mode == "external":
+            url = slot["comfy_url"]
+            if not comfy_online(url):
+                raise RuntimeError(
+                    f"Nothing is answering at {url} for {label}. Start that "
+                    "ComfyUI first, or let Script Builder install its own.")
+            slot["managed"] = False
+            if not slot.get("models_dir"):
+                raise RuntimeError(
+                    f"Set {label}'s models folder in Settings so its voices "
+                    "land where that ComfyUI looks.")
+            return
+        picked = chosen.get(engine) or ""
+        target = Path(picked) if picked else APP_DIR / eng["dir_name"]
+        slot["managed"] = not picked
+        if not (target / "main.py").exists():
+            if not have_git():
+                raise RuntimeError(
+                    "Git is not installed, so ComfyUI cannot be downloaded. "
+                    "Install Git from the Engine panel.")
+            prog.detail("comfyui", f"Downloading ComfyUI for {label}…")
+            res = _run(["git", "clone", "--depth", "1", COMFY_REPO, str(target)])
+            if res.returncode != 0:
+                raise RuntimeError("git clone failed: " +
+                                   (res.stderr or res.stdout)[-600:])
+        else:
+            prog.detail("comfyui", f"Updating {label}'s ComfyUI…")
+            _run(["git", "-C", str(target), "pull", "--ff-only"])
+        if not (target / "main.py").exists():
+            raise RuntimeError(f"No main.py in {target} — that folder is not "
+                               "a ComfyUI install.")
+        slot["comfy_dir"] = str(target)
+        slot["models_dir"] = str(target / "models")
+        return
+
+    comfy_dir = Path(slot["comfy_dir"]) if slot.get("comfy_dir") else None
+
+    if step == "node":
+        if comfy_dir is None:
+            return
+        node_path = comfy_dir / "custom_nodes" / eng["node_dir"]
+        if node_path.exists():
+            prog.detail("node", f"Updating the {label} nodes…")
+            _run(["git", "-C", str(node_path), "pull", "--ff-only"])
+        else:
+            if not have_git():
+                raise RuntimeError(f"Git is needed to install the {label} "
+                                   "nodes. Install it from the Engine panel.")
+            node_path.parent.mkdir(parents=True, exist_ok=True)
+            prog.detail("node", f"Downloading the {label} nodes…")
+            prog.log(f"git clone {eng['node_repo']}")
+            res = _run(["git", "clone", "--depth", "1", eng["node_repo"],
+                        str(node_path)])
+            if res.returncode != 0:
+                raise RuntimeError("git clone failed: " +
+                                   (res.stderr or res.stdout)[-600:])
+        return
+
+    if step == "deps":
+        if mode == "external" or comfy_dir is None:
+            return
+        say = lambda t, pct: prog.detail("deps", t, pct)  # noqa: E731
+        target = portable_python(comfy_dir)
+        if target:
+            prog.log(f"{label}: portable ComfyUI — installing into {target}")
+        elif not slot.get("managed"):
+            found = existing_python(comfy_dir)
+            if not found:
+                raise RuntimeError(
+                    f"Could not find the Python environment the ComfyUI at "
+                    f"{comfy_dir} runs on, so {label}'s requirements have "
+                    "nowhere to go.")
+            target = Path(found)
+            prog.log(f"{label}: that install runs on {target} — using it")
+        else:
+            vpy = venv_python(comfy_dir)
+            if not vpy.exists():
+                prog.detail("deps", f"Building {label}'s Python environment…")
+                # parents[1] is the environment root: <...>/comfy-venv-<name>,
+                # since vpy is <root>/bin/python or <root>/Scripts/python.exe.
+                res = _run([py, "-m", "venv", str(vpy.parents[1])])
+                if res.returncode != 0:
+                    raise RuntimeError("venv creation failed: " +
+                                       (res.stderr or res.stdout)[-600:])
+            target = vpy
+            prog.detail("deps", f"Installing PyTorch for {label} — the long "
+                                "one…")
+            pip_install(str(target), ["--upgrade", "pip", "wheel"],
+                        prog.log, say)
+            idx = torch_index(cfg)
+            gpu = nvidia_gpu()
+            prog.log(f"Graphics: {gpu['name'] or 'no NVIDIA GPU found'}")
+            drop_mismatched_torch(str(target), idx, prog.log)
+            args = ["torch", "torchaudio"]
+            if idx:
+                args += ["--index-url", idx]
+            pip_install(str(target), args, prog.log, say)
+            prog.detail("deps", f"Installing {label}'s ComfyUI requirements…")
+            pip_install(str(target), ["-r", str(comfy_dir / "requirements.txt")],
+                        prog.log, say)
+        slot["python"] = str(target)
+        reqs = comfy_dir / "custom_nodes" / eng["node_dir"] / "requirements.txt"
+        if reqs.exists():
+            prog.detail("deps", f"Installing the {label} requirements…")
+            pip_install(str(target), ["-r", str(reqs)], prog.log, say)
+        else:
+            prog.log(f"No requirements.txt in {eng['node_dir']} — skipping.")
+        return
+
+    if step == "launch":
+        url = slot["comfy_url"]
+        if mode == "external" or not slot.get("auto_start", True):
+            if not comfy_online(url):
+                raise RuntimeError(f"{label}'s ComfyUI is not answering at "
+                                   f"{url}.")
+            return
+        proc = procs[engine]
+        if comfy_online(url) and not proc.alive():
+            prog.log(f"Something is already answering at {url} for {label}; "
+                     "leaving it alone.")
+            return
+        if proc.alive():
+            # It was up when this run put the nodes in, and ComfyUI reads
+            # custom_nodes once, at startup — so it is running without them.
+            prog.detail("launch", f"Restarting {label}'s ComfyUI so it loads "
+                                  "the nodes…")
+            proc.stop()
+            for _ in range(30):
+                if not comfy_online(url):
+                    break
+                time.sleep(1)
+        prog.detail("launch", f"Starting {label}'s ComfyUI — the first start "
+                              "is slow…")
+        proc.start(slot["python"], Path(slot["comfy_dir"]), comfy_port(url),
+                   prog)
+        if not wait_for_comfy(url, timeout=900):
+            raise RuntimeError(f"{label}'s ComfyUI did not start within 15 "
+                               "minutes.\n" + "\n".join(proc.tail(25)))
+
+
+def run_setup(cfg: dict, prog: Progress, comfy, chosen_dir: str = "",
+              mode: str = "auto") -> None:
+    """Install and start every enabled engine, each in its own ComfyUI.
+
+    The six steps stay six steps and stay in run order — rule 10 — and each
+    one does both engines in turn. Splitting them per engine would double the
+    list and bury the order, which is the one thing this screen is for.
+
+    `comfy` is a dict of engine id -> ComfyProcess. A bare ComfyProcess is
+    still accepted and treated as Qwen's, because that is what every caller
+    passed before there were two.
+    """
+    procs = comfy if isinstance(comfy, dict) else {"qwen": comfy}
+    for eid in ENGINES:
+        procs.setdefault(eid, ComfyProcess())
+    chosen = {"qwen": chosen_dir} if chosen_dir else {}
+    engines = [e for e in ENGINES if engine_enabled(cfg, e)]
+
     prog.running = True
     prog.done = False
     prog.error = None
@@ -1426,215 +1685,51 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
             cfg["python"] = py
             prog.finish("python", py)
 
-        # 2. comfyui ------------------------------------------------------- #
-        prog.begin("comfyui")
-        if mode == "external":
-            url = cfg["comfy_url"]
-            if not comfy_online(url):
-                raise RuntimeError(f"Nothing is answering at {url}. Start "
-                                   "ComfyUI first, or let Script Builder "
-                                   "install its own.")
-            if not cfg.get("models_dir"):
-                raise RuntimeError("Set the ComfyUI models folder in Settings "
-                                   "so the voices land in the right place.")
-            cfg["managed"] = False
-            prog.finish("comfyui", url)
-            comfy_dir = Path(cfg["comfy_dir"]) if cfg.get("comfy_dir") else None
-        else:
-            if chosen_dir:
-                comfy_dir = Path(chosen_dir)
-                cfg["managed"] = False
-                prog.log(f"Using existing ComfyUI at {comfy_dir}")
+        # 2-4. one ComfyUI, one node pack and one environment each ---------- #
+        for step, done_note in (("comfyui", "ComfyUI"),
+                                ("node", "Nodes"),
+                                ("deps", "Dependencies")):
+            prog.begin(step)
+            for eid in engines:
+                _setup_one(cfg, prog, eid, step, procs, py, mode, chosen)
+                save_config(cfg)
+            if step == "comfyui":
+                prog.finish(step, " · ".join(
+                    f"{ENGINES[e]['label']} → {engine_cfg(cfg, e)['comfy_dir']}"
+                    or ENGINES[e]["label"] for e in engines))
+            elif step == "node":
+                prog.finish(step, " and ".join(ENGINES[e]["label"]
+                                               for e in engines))
             else:
-                comfy_dir = APP_DIR / "ComfyUI"
-                cfg["managed"] = True
-                if not (comfy_dir / "main.py").exists():
-                    if not have_git():
-                        raise RuntimeError(
-                            "Git is not installed, so ComfyUI cannot be "
-                            "downloaded. Install Git from the Engine panel, or "
-                            "point Script Builder at an existing ComfyUI.")
-                    prog.detail("comfyui", "Downloading ComfyUI…")
-                    res = _run(["git", "clone", "--depth", "1", COMFY_REPO,
-                                str(comfy_dir)])
-                    if res.returncode != 0:
-                        raise RuntimeError("git clone failed: " +
-                                           (res.stderr or res.stdout)[-600:])
-                else:
-                    prog.detail("comfyui", "Updating ComfyUI…")
-                    _run(["git", "-C", str(comfy_dir), "pull", "--ff-only"])
-            if not (comfy_dir / "main.py").exists():
-                raise RuntimeError(f"No main.py in {comfy_dir} — that folder is "
-                                   "not a ComfyUI install.")
-            cfg["comfy_dir"] = str(comfy_dir)
-            cfg["models_dir"] = str(comfy_dir / "models")
-            prog.finish("comfyui", str(comfy_dir))
-
-        models_dir = Path(cfg["models_dir"])
-
-        # 3. custom nodes ---------------------------------------------------- #
-        prog.begin("node")
-        wanted_engines = [e for e in ENGINES.values()
-                          if engine_enabled(cfg, e["id"])]
-        if comfy_dir is None:
-            prog.finish("node", "Install the speech nodes in your own ComfyUI")
-        else:
-            nodes_dir = comfy_dir / "custom_nodes"
-            landed = []
-            for eng in wanted_engines:
-                node_path = nodes_dir / eng["node_dir"]
-                if node_path.exists():
-                    prog.detail("node", f"Updating the {eng['label']} nodes…")
-                    _run(["git", "-C", str(node_path), "pull", "--ff-only"])
-                else:
-                    if not have_git():
-                        raise RuntimeError(
-                            f"Git is needed to install the {eng['label']} "
-                            "nodes. Install it from the Engine panel.")
-                    nodes_dir.mkdir(parents=True, exist_ok=True)
-                    prog.detail("node", f"Downloading the {eng['label']} nodes…")
-                    prog.log(f"git clone {eng['node_repo']}")
-                    res = _run(["git", "clone", "--depth", "1",
-                                eng["node_repo"], str(node_path)])
-                    if res.returncode != 0:
-                        raise RuntimeError("git clone failed: " +
-                                           (res.stderr or res.stdout)[-600:])
-                landed.append(eng["label"])
-            prog.finish("node", " and ".join(landed) + f" in {nodes_dir}")
-
-        # 4. dependencies --------------------------------------------------- #
-        prog.begin("deps")
-        if mode == "external":
-            prog.finish("deps", "Handled by your own ComfyUI install")
-        else:
-            comfy_dir = Path(cfg["comfy_dir"])
-            target = portable_python(comfy_dir)
-            if target:
-                prog.log(f"Portable ComfyUI detected — installing into {target}")
-            elif not cfg.get("managed"):
-                # Someone else's install already runs on its own environment,
-                # with torch in it. Building a second one beside it would cost
-                # gigabytes and put the node's requirements where ComfyUI never
-                # looks, so the nodes would still fail to import.
-                found = existing_python(comfy_dir)
-                if not found:
-                    raise RuntimeError(
-                        f"Could not find the Python environment that the "
-                        f"ComfyUI at {comfy_dir} runs on, so the Qwen-TTS "
-                        "requirements have nowhere to go. Start that ComfyUI "
-                        "yourself and pick 'Connect to a ComfyUI I start "
-                        "myself', or let Script Builder install its own.")
-                target = Path(found)
-                prog.log(f"That install runs on {target} — using it as it is")
-            else:
-                vpy = venv_python(comfy_dir)
-                if not vpy.exists():
-                    prog.detail("deps", "Creating the Python environment…")
-                    res = _run([py, "-m", "venv",
-                                str(comfy_dir.parent / "comfy-venv")])
-                    if res.returncode != 0:
-                        raise RuntimeError("venv creation failed: " +
-                                           (res.stderr or res.stdout)[-600:])
-                target = vpy
-                say = lambda t, pct: prog.detail("deps", t, pct)  # noqa: E731
-                prog.detail("deps", "Installing PyTorch — the long one…")
-                pip_install(str(target), ["--upgrade", "pip", "wheel"],
-                            prog.log, say)
-                idx = torch_index(cfg)
-                gpu = nvidia_gpu()
-                if gpu["name"]:
-                    prog.log(f"Graphics: {gpu['name']}"
-                             + ("" if gpu["driver"] else
-                                " (driver not answering — nvidia-smi did not "
-                                "run, so a CPU build may be the safe one)"))
-                else:
-                    prog.log("No NVIDIA GPU found — installing the CPU build.")
-                # A second setup run over an environment that already has the
-                # wrong build would otherwise change nothing: pip counts
-                # torch+cpu as satisfying `torch`.
-                drop_mismatched_torch(str(target), idx, prog.log)
-                args = ["torch", "torchaudio"]
-                if idx:
-                    args += ["--index-url", idx]
-                pip_install(str(target), args, prog.log, say)
-                prog.detail("deps", "Installing ComfyUI requirements…")
-                pip_install(str(target),
-                            ["-r", str(comfy_dir / "requirements.txt")],
-                            prog.log, say)
-            cfg["python"] = str(target)
-            for eng in ENGINES.values():
-                if not engine_enabled(cfg, eng["id"]):
-                    continue
-                node_reqs = (Path(cfg["comfy_dir"]) / "custom_nodes"
-                             / eng["node_dir"] / "requirements.txt")
-                if node_reqs.exists():
-                    prog.detail("deps",
-                                f"Installing the {eng['label']} requirements…")
-                    pip_install(str(target), ["-r", str(node_reqs)], prog.log,
-                                lambda t, pct: prog.detail("deps", t, pct))
-                else:
-                    prog.log(f"No requirements.txt in {eng['node_dir']} — "
-                             "skipping.")
-            prog.finish("deps", f"Installed into {Path(cfg['python']).name}")
+                prog.finish(step, " · ".join(
+                    f"{ENGINES[e]['label']} → "
+                    f"{Path(engine_cfg(cfg, e)['python']).name or 'its own'}"
+                    for e in engines))
 
         # 5. models --------------------------------------------------------- #
         prog.begin("models")
-        todo = missing_models(models_dir, cfg)
+        todo = [(eid, m) for eid in engines for m in engine_missing(cfg, eid)]
         if not todo:
             prog.finish("models", "Everything is already downloaded")
         else:
             prog.log(f"{len(todo)} model folder(s) to fetch")
-            for i, m in enumerate(todo):
+            for i, (eid, m) in enumerate(todo):
                 prog.detail("models", f"Downloading {m['repo']}…")
-                # download_repo has worked the percentage out all along; it
-                # used to be handed to a lambda that dropped it on the floor.
-                # Spread each folder across its share of the whole step, so
-                # the bar crosses the run once instead of restarting per repo.
                 span, base = 100.0 / len(todo), 100.0 * i / len(todo)
+                root = engine_models_dir(cfg, eid)
                 download_repo(
-                    cfg, m["repo"], models_dir, engine=m.get("engine", ""),
+                    cfg, m["repo"], root, engine=eid,
                     on_detail=lambda d, pct, _b=base, _s=span:
                         prog.detail("models", d, _b + (pct or 0) * _s / 100.0))
             prog.finish("models", "Voices and models ready")
 
         # 6. launch --------------------------------------------------------- #
         prog.begin("launch")
-        url = cfg["comfy_url"]
-        if mode == "external" or not cfg.get("auto_start_comfy", True):
-            if not comfy_online(url):
-                raise RuntimeError(f"ComfyUI is not answering at {url}.")
-        elif comfy_online(url):
-            # It was already up when this run installed the nodes into it, and
-            # ComfyUI reads custom_nodes once, at startup — so it is running
-            # without them, which is the "Nodes not loaded" the Engine panel
-            # then reports with nothing the user can do about it. Bounce it.
-            if comfy.alive():
-                prog.detail("launch", "Restarting ComfyUI so it loads the "
-                                      "Qwen-TTS nodes…")
-                prog.log("Restarting ComfyUI so it picks up the nodes")
-                comfy.stop()
-                for _ in range(30):
-                    if not comfy_online(url):
-                        break
-                    time.sleep(1)
-                comfy.start(cfg["python"], Path(cfg["comfy_dir"]),
-                            comfy_port(url), prog)
-                if not wait_for_comfy(url, timeout=900):
-                    raise RuntimeError(
-                        "ComfyUI did not come back after the restart.\n"
-                        + "\n".join(comfy.tail(25)))
-            else:
-                prog.log("ComfyUI is already running, and Script Builder did "
-                         "not start it — restart it yourself so it loads the "
-                         "Qwen-TTS nodes.")
-        else:
-            comfy.start(cfg["python"], Path(cfg["comfy_dir"]),
-                        comfy_port(url), prog)
-            prog.detail("launch", "Waiting for ComfyUI — the first start is slow…")
-            if not wait_for_comfy(url, timeout=900):
-                raise RuntimeError("ComfyUI did not start within 15 minutes.\n"
-                                   + "\n".join(comfy.tail(25)))
-        prog.finish("launch", url)
+        for eid in engines:
+            _setup_one(cfg, prog, eid, "launch", procs, py, mode, chosen)
+        prog.finish("launch", " · ".join(
+            f"{ENGINES[e]['label']} {engine_cfg(cfg, e)['comfy_url']}"
+            for e in engines))
 
         cfg["setup_complete"] = True
         save_config(cfg)

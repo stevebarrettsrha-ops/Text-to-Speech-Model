@@ -95,7 +95,10 @@ export async function boot({ log = console.log } = {}) {
   const comfyRoot = path.join(scratch, 'comfy');
   for (const d of [dataDir, modelsDir, comfyRoot]) mkdirSync(d, { recursive: true });
 
+  // One stand-in ComfyUI per engine, because that is the shape the app now
+  // installs: separate clones, separate environments, separate ports.
   const comfyPort = await freePort();
+  const mossPort = await freePort();
   const hfPort = await freePort();
   const appPort = await freePort();
   const procs = [];
@@ -140,20 +143,37 @@ export async function boot({ log = console.log } = {}) {
   }
 
   async function bringUp() {
-  start('mock-comfy', ['tests/mock_comfy.py', comfyRoot],
+  const mossRoot = path.join(scratch, 'comfy-moss');
+  mkdirSync(mossRoot, { recursive: true });
+  start('mock-comfy-qwen', ['tests/mock_comfy.py', comfyRoot],
         { MOCK_COMFY_PORT: String(comfyPort) });
+  start('mock-comfy-moss', ['tests/mock_comfy.py', mossRoot],
+        { MOCK_COMFY_PORT: String(mossPort) });
   start('mock-hf', ['tests/mock_hf.py'], { MOCK_HF_PORT: String(hfPort) });
   await waitFor(`http://127.0.0.1:${comfyPort}/system_stats`, 'mock ComfyUI',
                 120, procs);
+  await waitFor(`http://127.0.0.1:${mossPort}/system_stats`,
+                "MOSS's mock ComfyUI", 120, procs);
   await waitFor(`http://127.0.0.1:${hfPort}/api/models/Qwen/Qwen3-TTS-Tokenizer-12Hz/tree/main`,
                 'mock HuggingFace', 120, procs);
 
   // Point the app at the stand-ins. setup_complete is true because the setup
   // run itself is covered by its own check below.
+  const mossModels = path.join(scratch, 'models-moss');
+  mkdirSync(mossModels, { recursive: true });
   writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify({
-    comfy_url: `http://127.0.0.1:${comfyPort}`,
-    comfy_dir: '', models_dir: modelsDir, python: '', managed: false,
-    auto_start_comfy: false, torch_index: '', hf_token: '',
+    // The per-engine shape: each one its own ComfyUI on its own port with its
+    // own models folder. auto_start is off because these stand-ins are already
+    // up and the app must not try to launch a ComfyUI of its own over them.
+    engines: {
+      qwen: { comfy_url: `http://127.0.0.1:${comfyPort}`, comfy_dir: '',
+              models_dir: modelsDir, python: '', managed: false,
+              auto_start: false },
+      moss: { comfy_url: `http://127.0.0.1:${mossPort}`, comfy_dir: '',
+              models_dir: mossModels, python: '', managed: false,
+              auto_start: false },
+    },
+    torch_index: '', hf_token: '',
     hf_endpoint: `http://127.0.0.1:${hfPort}`,
     hf_repo: 'Qwen/Qwen3-TTS-12Hz-0.6B-Base',
     want_clone: true, want_17b: false, want_voicedesign: true,
@@ -181,6 +201,8 @@ export async function boot({ log = console.log } = {}) {
   const post = (p, body) => api(p, { method: 'POST', body: JSON.stringify(body) });
 
   // Seed the voices the app needs before it will call itself ready.
+  // Downloads land in whichever engine's folder the repo belongs to, which
+  // is the app's own routing doing the work.
   for (const repo of ['Qwen/Qwen3-TTS-Tokenizer-12Hz',
                       'Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice',
                       'Qwen/Qwen3-TTS-12Hz-0.6B-Base',
@@ -232,12 +254,14 @@ export async function boot({ log = console.log } = {}) {
   });
 
   // Through node:http like everything else here — see the note on request().
-  const comfyApi = async (p, opts) => JSON.parse(
-    (await request(`http://127.0.0.1:${comfyPort}${p}`, opts)).text);
+  const comfyApi = async (p, opts, engine = 'qwen') => JSON.parse(
+    (await request(`http://127.0.0.1:${engine === 'moss' ? mossPort : comfyPort}${p}`,
+                   opts)).text);
 
   return {
-    base, api, post, runTake, comfyApi, dataDir, modelsDir,
+    base, api, post, runTake, comfyApi, dataDir, modelsDir, mossModels,
     comfy: `http://127.0.0.1:${comfyPort}`,
+    mossComfy: `http://127.0.0.1:${mossPort}`,
     hf: `http://127.0.0.1:${hfPort}`,
     stop: teardown,
   };
