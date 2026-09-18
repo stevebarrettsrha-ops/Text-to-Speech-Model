@@ -71,6 +71,19 @@
    `sweep_orphan_takes()` clears what an earlier crash left.
 13. **The page carries its own favicon, inline.** The server has no static
    route, so without it every load asks for `/favicon.ico` and logs a 404.
+14. **Long work reports a percentage, and pip is asked what it supports.**
+   `pip_install` reads its pipe a character at a time, because pip redraws
+   progress with `\r` and iterating by line waits for a `\n` that only lands
+   once the download is over — which is why a 2.7 GB PyTorch showed
+   "Collecting torch" and then nothing for minutes. The numbers come from
+   `--progress-bar raw`, and whether to pass it is read out of `pip install
+   --help`, never inferred from a version: pip 24.0 takes only on/off and
+   exits with "invalid choice: 'raw'", so guessing there fails the install
+   rather than merely losing the bar. Where pip is too old, the file name,
+   its size and a running clock stand in. `Progress` steps carry a numeric
+   `pct` that is None until there is a real number — a bar sitting at 0% for
+   fifteen minutes reads as broken — and `download_repo`'s percentage is
+   spread across the folders so the bar crosses the step once.
 
 ## Why line-by-line, not DialogueInferenceNode
 

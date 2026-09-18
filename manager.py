@@ -305,6 +305,13 @@ def install_dependency(dep_id: str, cfg: dict, opts: dict) -> Task:
     return spawn("dependency", titles.get(dep_id, dep_id), run, {"dep": dep_id})
 
 
+def _reporter(task: Task):
+    """pip progress into the task the Engine panel is showing."""
+    def say(text: str, pct: float | None) -> None:
+        task.set(detail=text, **({"pct": pct} if pct is not None else {}))
+    return say
+
+
 def _install_git(task: Task) -> None:
     cmds = {"Windows": ["winget", "install", "--id", "Git.Git", "-e",
                         "--source", "winget", "--accept-package-agreements",
@@ -389,15 +396,18 @@ def _install_torch(task: Task, cfg: dict, opts: dict) -> None:
     if opts.get("torch_index") is not None:
         cfg["torch_index"] = opts["torch_index"]
     index = bootstrap.torch_index(cfg)
+    say = _reporter(task)
     task.set(detail="Installing PyTorch — this is the long one…")
-    bootstrap.pip_install(str(target), ["--upgrade", "pip", "wheel"], task.log)
+    bootstrap.pip_install(str(target), ["--upgrade", "pip", "wheel"],
+                          task.log, say)
     args = ["torch", "torchaudio"]
     if index:
         args += ["--index-url", index]
-    bootstrap.pip_install(str(target), args, task.log)
+    bootstrap.pip_install(str(target), args, task.log, say)
     task.set(detail="Installing ComfyUI requirements…")
     bootstrap.pip_install(str(target),
-                          ["-r", str(comfy_dir / "requirements.txt")], task.log)
+                          ["-r", str(comfy_dir / "requirements.txt")],
+                          task.log, say)
     task.set(detail="PyTorch installed.")
 
 
@@ -410,7 +420,7 @@ def _install_node_reqs(task: Task, cfg: dict) -> None:
     if not reqs.exists():
         raise RuntimeError("The Qwen-TTS nodes are not installed yet.")
     task.set(detail="Installing the Qwen-TTS requirements…")
-    bootstrap.pip_install(py, ["-r", str(reqs)], task.log)
+    bootstrap.pip_install(py, ["-r", str(reqs)], task.log, _reporter(task))
     task.set(detail="Packages installed. Restart ComfyUI.")
 
 

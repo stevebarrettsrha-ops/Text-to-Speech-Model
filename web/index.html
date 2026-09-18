@@ -310,7 +310,11 @@
   .step.running .mark{border-color:var(--accent);color:#cdbcff}
   .step.done .mark{background:var(--ok);border-color:var(--ok);color:#06210f}
   .step.error .mark{background:var(--err);border-color:var(--err);color:#2a0606}
+  .step .grow{flex:1;min-width:0}
   .step .lbl{font-size:13.5px;font-weight:500}
+  .step .pctnum{color:var(--accent);font-variant-numeric:tabular-nums;
+                font-weight:600;margin-left:6px}
+  .step .bar{margin-top:8px}
   .step .dt{font-size:12px;color:var(--dim);margin-top:2px;word-break:break-word}
   .step.error .dt{color:#ff9a9a}
   .pick{display:flex;flex-direction:column;gap:8px;margin:14px 0}
@@ -573,6 +577,7 @@
       <div class="panel">
         <h2>Activity</h2>
         <p class="sub" id="task-title">Nothing running.</p>
+        <div class="bar" id="task-bar" hidden><i style="width:0%"></i></div>
         <div class="log" id="task-log"></div>
         <div class="rowbtn"><button class="btn" id="btnCancelTask" hidden>Stop</button></div>
       </div>
@@ -1478,6 +1483,11 @@ async function pollTasks() {
       var t = await api("/api/tasks?id=" + S.taskId + "&since=" + S.taskCursor);
       S.taskCursor = t.cursor;
       $("task-title").textContent = t.title + " — " + (t.detail || t.state);
+      // The Engine panel runs the same pip installs the setup panel does, so
+      // it gets the same bar rather than a title that sits still for minutes.
+      var tb = $("task-bar");
+      tb.hidden = !(t.state === "running" && t.pct > 0);
+      tb.querySelector("i").style.width = Math.round(t.pct) + "%";
       if (t.lines.length) {
         var log = $("task-log");
         var bottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
@@ -1673,10 +1683,17 @@ async function pollSetup() {
   (st.steps || []).forEach(function (s) {
     var d = document.createElement("div");
     d.className = "step " + s.state;
+    // A bar only while there is a number to put in it. Drawn at 0% for a step
+    // that cannot measure itself, it reads as stuck rather than as working.
+    var bar = (s.state === "running" && typeof s.pct === "number")
+      ? '<div class="bar"><i style="width:' + s.pct.toFixed(1) + '%"></i></div>'
+      : "";
     d.innerHTML = '<span class="mark">' +
       (s.state === "done" ? "✓" : s.state === "error" ? "!" : "") +
-      '</span><div><div class="lbl">' + esc(s.label) + '</div><div class="dt">' +
-      esc(s.detail || "") + "</div></div>";
+      '</span><div class="grow"><div class="lbl">' + esc(s.label) +
+      (typeof s.pct === "number" && s.state === "running"
+        ? ' <span class="pctnum">' + Math.round(s.pct) + '%</span>' : "") +
+      '</div><div class="dt">' + esc(s.detail || "") + "</div>" + bar + "</div>";
     list.appendChild(d);
   });
   if (st.done) {

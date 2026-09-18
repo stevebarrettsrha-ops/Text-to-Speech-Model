@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -167,7 +168,11 @@ class Progress:
         self.done = False
         self.error: str | None = None
         self.step = ""
-        self.steps = {k: {"label": v, "state": "pending", "detail": ""}
+        # pct is None while a step has no measurable progress — a bar drawn at
+        # 0% for the whole of a fifteen-minute step reads as "stuck", so the
+        # page shows none until there is a number to put in it.
+        self.steps = {k: {"label": v, "state": "pending", "detail": "",
+                          "pct": None}
                       for k, v in self.STEPS}
 
     def log(self, msg: str) -> None:
@@ -182,14 +187,18 @@ class Progress:
             self.step = key
             self.steps[key]["state"] = "running"
             self.steps[key]["detail"] = detail
+            self.steps[key]["pct"] = None
 
-    def detail(self, key: str, detail: str) -> None:
+    def detail(self, key: str, detail: str, pct: float | None = None) -> None:
         with self._lock:
             self.steps[key]["detail"] = detail
+            if pct is not None:
+                self.steps[key]["pct"] = max(0.0, min(100.0, float(pct)))
 
     def finish(self, key: str, detail: str = "") -> None:
         with self._lock:
             self.steps[key]["state"] = "done"
+            self.steps[key]["pct"] = None
             if detail:
                 self.steps[key]["detail"] = detail
 
@@ -472,6 +481,18 @@ def wanted_files(files: list[dict]) -> list[dict]:
     return out
 
 
+def human_size(n: float) -> str:
+    """Bytes at a scale that reads. Fixing this at GB showed every repo under
+    ten megabytes as "0.00 of 0.00 GB"."""
+    if n >= 1e9:
+        return f"{n / 1e9:.2f} GB"
+    if n >= 1e6:
+        return f"{n / 1e6:.0f} MB"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f} kB"
+    return f"{int(n)} B"
+
+
 def download_file(cfg: dict, repo: str, path: str, dest: Path,
                   on_progress=None, should_cancel=None,
                   revision: str = "main", expected: int = 0) -> None:
@@ -552,8 +573,9 @@ def download_repo(cfg: dict, repo: str, models_dir: Path,
         def prog(got, tot, _f=f, _i=i, _done=done_bytes):
             if on_detail:
                 overall = (_done + got) / total_bytes * 100
-                on_detail(f"{repo} · file {_i}/{len(files)} · "
-                          f"{(_done + got)/1e9:.2f} of {total_bytes/1e9:.2f} GB",
+                on_detail(f"{repo.split('/')[-1]} · file {_i}/{len(files)} · "
+                          f"{human_size(_done + got)} of "
+                          f"{human_size(total_bytes)} ({overall:.0f}%)",
                           overall)
 
         download_file(cfg, repo, f["path"], dest, prog, should_cancel,
@@ -650,18 +672,150 @@ def wait_for_comfy(url: str, timeout: int = 900) -> bool:
 # --------------------------------------------------------------------------- #
 # pip
 # --------------------------------------------------------------------------- #
-def pip_install(python: str, args: list[str], log) -> None:
-    cmd = [python, "-m", "pip", "install"] + args
+def stream_lines(stream):
+    """What a subprocess writes, with a carriage return counting as a break.
+
+    pip redraws its progress over itself with \r. Iterating the pipe by line
+    waits for a \n that only arrives when the download has already finished,
+    which is why a 2.7 GB PyTorch showed "Collecting torch" and then nothing.
+    """
+    buffer = ""
+    while True:
+        char = stream.read(1)
+        if not char:
+            break
+        if char in ("\r", "\n"):
+            if buffer.strip():
+                yield buffer.strip()
+            buffer = ""
+        else:
+            buffer += char
+    if buffer.strip():
+        yield buffer.strip()
+
+
+def pip_progress(line: str, state: dict):
+    """One line of pip output -> (something worth reading, percent) or None.
+
+    `--progress-bar raw` prints "Progress 123 of 456" as it goes, and that is
+    the only account of a multi-gigabyte download that survives being piped:
+    pip draws no bar at all unless it is talking to a terminal.
+    """
+    if line.startswith("Downloading "):
+        parts = line.split()
+        state["what"] = (parts[1].split("-")[0] if len(parts) > 1
+                         else "package")
+        state["since"] = time.time()
+        # Shown as well as recorded: where pip is too old for raw progress
+        # this line and the clock below are the whole account of a download.
+        size = re.search(r"\(([\d.]+\s*[kKMG]?B)\)", line)
+        return (f"Downloading {state['what']}"
+                + (f" — {size.group(1)}" if size else ""), None)
+    if line.startswith("Installing collected packages"):
+        # Nothing is printed again until this finishes, and for a 2.7 GB
+        # PyTorch that is minutes of writing thousands of files. Say which
+        # part is slow rather than leaving the last download's name up.
+        state["what"] = "Unpacking and installing — the slow part"
+        return ("Unpacking and installing — the slow part", None)
+    if line.startswith(("Building", "Preparing", "Getting requirements")):
+        state["what"] = line[:60]
+        return (line[:60], None)
+    if not line.startswith("Progress "):
+        return None
+    parts = line.split()
+    try:
+        got, total = int(parts[1]), int(parts[3])
+    except (IndexError, ValueError):
+        return None
+    what = state.get("what", "package")
+    elapsed = max(time.time() - state.get("since", time.time()), 0.001)
+    speed = got / elapsed
+    if total <= 0:
+        return (f"{what} — {got / 1e6:.0f} MB so far", None)
+    size = (f"{got / 1e9:.2f} of {total / 1e9:.2f} GB" if total >= 1e9
+            else f"{got / 1e6:.0f} of {total / 1e6:.0f} MB")
+    # Clamped here so every consumer gets a sane number: Progress.detail
+    # clamps its own, but a Task on the Engine page takes what it is given and
+    # would set a bar to a negative width.
+    pct = max(0.0, min(100.0, got * 100.0 / total))
+    head = f"{what} — {size} ({pct:.0f}%)"
+    # A rate measured over the first fraction of a second is nonsense — one
+    # chunk arriving at once reads as several hundred MB/s.
+    if elapsed < 1.5 or speed <= 0:
+        return (head, pct)
+    left = (total - got) / speed
+    return (f"{head} · {speed / 1e6:.1f} MB/s · "
+            f"{int(left // 60)}m {int(left % 60):02d}s left", pct)
+
+
+def pip_raw_progress(python: str) -> list[str]:
+    """`--progress-bar raw` if this pip offers it, asked rather than guessed.
+
+    A version number is the wrong test: pip 24.0 takes only on/off and exits
+    with "invalid choice: 'raw'" — passing it there does not merely lose the
+    percentage, it fails the install. pip's own help lists the choices, so
+    read them.
+    """
+    try:
+        out = _run([str(python), "-m", "pip", "install", "--help"], timeout=60)
+        block = re.search(r"--progress-bar[^\n]*\n(?:\s{6,}[^\n]*\n)*",
+                          out.stdout or "")
+        if block and re.search(r"\braw\b", block.group(0)):
+            return ["--progress-bar", "raw"]
+    except Exception:  # noqa: BLE001
+        pass
+    return []
+
+
+def pip_install(python: str, args: list[str], log, on_detail=None) -> None:
+    """Run pip, reporting progress through on_detail(text, pct).
+
+    pct is None when there is no number to show — pip says nothing measurable
+    while it resolves dependencies or unpacks a wheel.
+    """
+    cmd = [python, "-m", "pip", "install"] + args + pip_raw_progress(python)
     log("$ " + " ".join(cmd[:8]) + (" …" if len(cmd) > 8 else ""))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+                            stderr=subprocess.STDOUT, text=True, bufsize=0)
     assert proc.stdout
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line.startswith(("Collecting", "Downloading", "Installing",
-                            "Successfully", "ERROR", "Building",
-                            "WARNING: ")):
-            log(line[:200])
+
+    state: dict = {}
+    last = [0.0]
+    last_pct = [-1.0]
+    started = time.time()
+    stop = threading.Event()
+
+    def tick() -> None:
+        # Unpacking a 2.7 GB wheel prints nothing for minutes. Keep a clock
+        # running so the panel never looks like it has died.
+        while not stop.wait(5):
+            if not on_detail or time.time() - last[0] < 5:
+                continue
+            waited = int(time.time() - started)
+            on_detail(f"{state.get('what') or 'Working'} — "
+                      f"{waited // 60}m {waited % 60:02d}s so far", None)
+
+    if on_detail:
+        threading.Thread(target=tick, daemon=True).start()
+    try:
+        for line in stream_lines(proc.stdout):
+            shown = pip_progress(line, state)
+            # Throttled by time, except when the percentage actually moved: a
+            # fast mirror can deliver a whole wheel in three bursts, and time
+            # alone would swallow every one of them and leave the bar at zero.
+            moved = (shown and shown[1] is not None
+                     and abs(shown[1] - last_pct[0]) >= 1.0)
+            if shown and on_detail and (moved or time.time() - last[0] > 0.4):
+                last[0] = time.time()
+                if shown[1] is not None:
+                    last_pct[0] = shown[1]
+                on_detail(shown[0], shown[1])
+            elif line.startswith(("Collecting", "Downloading", "Installing",
+                                  "Successfully", "ERROR", "Building",
+                                  "WARNING: ")):
+                log(line[:200])
+    finally:
+        stop.set()
     if proc.wait() != 0:
         raise RuntimeError("pip install failed — see the log.")
 
@@ -803,23 +957,26 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
                         raise RuntimeError("venv creation failed: " +
                                            (res.stderr or res.stdout)[-600:])
                 target = vpy
+                say = lambda t, pct: prog.detail("deps", t, pct)  # noqa: E731
                 prog.detail("deps", "Installing PyTorch — the long one…")
-                pip_install(str(target), ["--upgrade", "pip", "wheel"], prog.log)
+                pip_install(str(target), ["--upgrade", "pip", "wheel"],
+                            prog.log, say)
                 args = ["torch", "torchaudio"]
                 idx = torch_index(cfg)
                 if idx:
                     args += ["--index-url", idx]
-                pip_install(str(target), args, prog.log)
+                pip_install(str(target), args, prog.log, say)
                 prog.detail("deps", "Installing ComfyUI requirements…")
                 pip_install(str(target),
                             ["-r", str(comfy_dir / "requirements.txt")],
-                            prog.log)
+                            prog.log, say)
             cfg["python"] = str(target)
             node_reqs = Path(cfg["comfy_dir"]) / "custom_nodes" / NODE_DIR_NAME \
                 / "requirements.txt"
             if node_reqs.exists():
                 prog.detail("deps", "Installing the Qwen-TTS requirements…")
-                pip_install(str(target), ["-r", str(node_reqs)], prog.log)
+                pip_install(str(target), ["-r", str(node_reqs)], prog.log,
+                            lambda t, pct: prog.detail("deps", t, pct))
             else:
                 prog.log("No requirements.txt in the node folder — skipping.")
             prog.finish("deps", f"Installed into {Path(cfg['python']).name}")
@@ -831,10 +988,17 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
             prog.finish("models", "Everything is already downloaded")
         else:
             prog.log(f"{len(todo)} model folder(s) to fetch")
-            for m in todo:
+            for i, m in enumerate(todo):
                 prog.detail("models", f"Downloading {m['repo']}…")
-                download_repo(cfg, m["repo"], models_dir,
-                              on_detail=lambda d, _p: prog.detail("models", d))
+                # download_repo has worked the percentage out all along; it
+                # used to be handed to a lambda that dropped it on the floor.
+                # Spread each folder across its share of the whole step, so
+                # the bar crosses the run once instead of restarting per repo.
+                span, base = 100.0 / len(todo), 100.0 * i / len(todo)
+                download_repo(
+                    cfg, m["repo"], models_dir,
+                    on_detail=lambda d, pct, _b=base, _s=span:
+                        prog.detail("models", d, _b + (pct or 0) * _s / 100.0))
             prog.finish("models", "Voices and models ready")
 
         # 6. launch --------------------------------------------------------- #
