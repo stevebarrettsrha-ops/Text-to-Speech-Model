@@ -61,9 +61,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
       - run: python -m pip install -r requirements.txt
-      # No lockfile is committed, so this is `install` rather than `ci`.
-      - run: npm install --no-audit --no-fund
+      # `ci` rather than `install`: the lockfile decides the version, so a
+      # Playwright release cannot change what CI ran without a commit.
+      - run: npm ci --no-audit --no-fund
       - run: npx playwright install --with-deps chromium
       # The stand-ins under tests/ answer for ComfyUI and HuggingFace, so this
       # needs no GPU, no model downloads and no network.
