@@ -280,7 +280,7 @@ try {
      'and proves audio came back',
      (pass.meta.steps || []).find(x => x.id === 'audio')?.detail);
 
-  await app.comfyApi('/mock/hide/moss', { method: 'POST' });
+  await app.comfyApi('/mock/hide/moss', { method: 'POST' }, 'moss');
   const broken = await st('moss');
   const nodeStep = (broken.meta.steps || []).find(x => x.id === 'nodes');
   is(broken.state === 'error' && nodeStep && nodeStep.state === 'fail',
@@ -295,7 +295,7 @@ try {
   // caches ComfyUI's schema for two minutes, so the run that proves recovery
   // is also the thing that clears the stale "they are gone" answer for
   // everything after it.
-  await app.comfyApi('/mock/hide/none', { method: 'POST' });
+  await app.comfyApi('/mock/hide/none', { method: 'POST' }, 'moss');
   const again = await st('moss');
   is(again.state === 'done',
      'and passes again once the nodes are back, without waiting out the cache',
@@ -372,8 +372,14 @@ try {
   }
   const mossTake = (await takes()).find(t => t.engine === 'moss');
   is(!!mossTake, 'MOSS produces a take', mossTake && mossTake.title);
-  const mossLog = await app.comfyApi('/mock/log');
+  // MOSS's own ComfyUI, on its own port — the Qwen one should never have seen
+  // a MOSS graph, and that is half of what this proves.
+  const mossLog = await app.comfyApi('/mock/log', undefined, 'moss');
   const mossQueued = (mossLog.log || []).filter(l => l.includes('MossTTS'));
+  const qwenSawMoss = ((await app.comfyApi('/mock/log')).log || [])
+    .filter(l => l.includes('MossTTS'));
+  is(qwenSawMoss.length === 0,
+     "and Qwen's ComfyUI never saw a MOSS graph", String(qwenSawMoss.length));
   is(mossQueued.some(l => l.includes('MossTTSModelLoader')
                        && l.includes('MossTTSGenerate') && l.includes('|local')),
      'the MOSS graph is loader + generator, pointed at a local folder',
@@ -391,8 +397,11 @@ try {
   const deps = (await page.$$('#dep-list .fitem')).length;
   is(deps >= 6, 'the dependency list renders', `${deps} rows`);
   const depIds = (await app.api('/api/deps')).items.map(i => i.id);
-  is(depIds.includes('node') && depIds.includes('node_moss'),
-     'each engine has its own node row', depIds.join(', '));
+  // Nothing below ComfyUI is shared any more, so nothing below ComfyUI gets
+  // one row for both engines.
+  const perEngine = ['comfyui', 'node', 'torch', 'node_reqs', 'models', 'engine'];
+  is(perEngine.every(b => depIds.includes(`${b}_qwen`) && depIds.includes(`${b}_moss`)),
+     'every engine has its own row for everything', depIds.join(', '));
 
   // torch 2.14.0+cpu landed on a machine with an RTX 4060 in it, because the
   // only test for a GPU was shutil.which("nvidia-smi"). The panel now says
