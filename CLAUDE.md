@@ -163,8 +163,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 43 unit tests, standard library only
-npm test                 # 52 checks driving the real page in headless Chromium
+npm run test:units       # 72 unit tests, standard library only
+npm test                 # 57 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script
