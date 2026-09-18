@@ -593,11 +593,13 @@ def delete_model(cfg: dict, repo: str) -> None:
 REQUIRED_GROUPS = ("core", "preset", "moss_core")
 
 
-def curated(cfg: dict) -> list[dict]:
-    """Every folder both engines know about, with what it is for and whether
-    this setup has asked for it."""
+def curated(cfg: dict, vram_mb: int = 0) -> list[dict]:
+    """Every folder both engines know about, with what it is for, whether this
+    setup has asked for it, and whether the card can actually run it."""
     models_dir = Path(cfg["models_dir"]) if cfg.get("models_dir") else None
     wanted = {m["repo"] for m in bootstrap.wanted_models(cfg)}
+    if not vram_mb:
+        vram_mb = bootstrap.nvidia_gpu().get("vram_mb") or 0
     out = []
     for eid, eng in ENGINES.items():
         for m in eng["models"]:
@@ -605,6 +607,11 @@ def curated(cfg: dict) -> list[dict]:
                         "role": "required" if m["group"] in REQUIRED_GROUPS
                                 else "wanted" if m["repo"] in wanted
                                 else "optional",
+                        # None where the card is unknown: an unknown card is
+                        # not a small one, and hiding a model because
+                        # nvidia-smi was missing is rule 5b in a new coat.
+                        "fits": bootstrap.fits_vram(m.get("vram_gb") or 0,
+                                                    vram_mb),
                         "installed": bool(models_dir)
                         and bootstrap.model_installed(models_dir, m["repo"], eid)})
     return out

@@ -117,9 +117,32 @@ The 8B is a tick rather than a default, and the reason is this node rather than
 the model: it loads bf16 weights through `AutoModel.from_pretrained`, so 8B
 really does want ~18 GB here. OpenMOSS's own llama.cpp path fits the 8B on an
 8 GB card with Q4_K_M weights, staged loading and a quantized KV cache
-(`configs/llama_cpp/trt-8gb.yaml`), but the ComfyUI node implements none of it
-— no GGUF, no ONNX, no low-memory mode. If you want the 8B on 8 GB today, that
-is OpenMOSS's CLI, outside ComfyUI.
+(`configs/llama_cpp/trt-8gb.yaml`) — but the ComfyUI node implements none of
+it, and that path is not a download. `GET /api/moss/8b` lists what it would
+take, and two of the five cannot be fetched at any speed:
+
+| Prerequisite | Can it be downloaded? |
+|---|---|
+| llama.cpp compiled from source, plus the C bridge | **No** — a build, not a package |
+| `pip install -e ".[llama-cpp-onnx]"` from OpenMOSS/MOSS-TTS | Yes |
+| `OpenMOSS-Team/MOSS-TTS-GGUF` (Q4_K_M + 33 embeddings + 33 LM heads) | Yes |
+| `OpenMOSS-Team/MOSS-Audio-Tokenizer-ONNX` | Yes |
+| TensorRT engines | **No** — OpenMOSS ship none; they are built against your GPU |
+
+Add `?check=1` and the two HuggingFace repos are looked up rather than taken on
+trust. Nothing in first launch assumes any of this is present.
+
+### Will it run on this card?
+
+Every model carries a VRAM figure, and the app reads what the card actually
+has — `nvidia-smi --query-gpu=memory.total`, or ComfyUI's `/system_stats` when
+nvidia-smi is not on PATH. A model larger than the card is shown but greyed in
+the picker, and the Models page asks before downloading it. On an 8 GB card
+everything fetched by default runs: Qwen3-TTS in full, MOSS speech, MOSS
+cloning and MOSS voice design. Only the MOSS 8B is out of reach.
+
+Where the card cannot be read at all, nothing is hidden — an unknown card is
+not assumed to be a small one.
 
 The repo names come from the nodes' own source — `HF_MODEL_MAP` for Qwen,
 `utils/constants.py` for MOSS — not from either README, which list fewer.
@@ -256,9 +279,9 @@ run without touching the first one's takes.
 
 ```bash
 node tests/check.mjs     # everything compiles and the inline script parses
-npm run test:units       # 102 unit tests, standard library only
+npm run test:units       # 114 unit tests, standard library only
 npm install && npx playwright install chromium
-npm test                 # 68 checks driving the real page in headless Chromium
+npm test                 # 75 checks driving the real page in headless Chromium
 ```
 
 None of it needs a GPU, a model download or the network: `tests/mock_comfy.py`

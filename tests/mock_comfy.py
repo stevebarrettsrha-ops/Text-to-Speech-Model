@@ -192,11 +192,23 @@ def make_wav(path: Path, seconds: float, freq: float, rate=24000):
         w.writeframes(data)
 
 
+# 8 GB, in bytes, the way real ComfyUI reports it — so the VRAM guard has a
+# card to judge against without one being present. /mock/mode can change it.
+VRAM = {"total": 8588886016}
+
+
 @app.get("/system_stats")
 def stats():
     return jsonify({"system": {"os": "posix", "comfyui_version": "mock"},
-                    "devices": [{"name": "mock", "type": "cpu",
-                                 "vram_total": 0, "vram_free": 0}]})
+                    "devices": [{"name": "mock", "type": "cuda",
+                                 "vram_total": VRAM["total"],
+                                 "vram_free": VRAM["total"] // 2}]})
+
+
+@app.post("/mock/vram/<int:mb>")
+def mock_vram(mb):
+    VRAM["total"] = mb * 1024 * 1024
+    return jsonify({"vram_total": VRAM["total"]})
 
 
 @app.get("/object_info")

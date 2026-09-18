@@ -191,6 +191,27 @@
    `engine`, and `engine_nodes` reports both so the Engine panel can show a row
    each.
 
+27. **The card's memory is read, and nothing is offered that cannot be held.**
+   Every model entry carries a `vram_gb`, `nvidia_gpu()` reports `vram_mb`
+   (`--query-gpu=name,memory.total`), and `ComfyClient.vram_mb()` is the second
+   opinion for a portable ComfyUI that carries its own CUDA where nvidia-smi is
+   not on PATH — rule 5b's gap again. `fits_vram` returns **None** when the
+   card is unknown, and None is never treated as "too small": hiding models
+   because nvidia-smi was missing would be rule 5b in a new coat. The model
+   picker shows what will not fit and disables it, the Models page needs a
+   confirm before downloading it, and everything a first run fetches by default
+   is asserted to fit 8 GB.
+28. **The quantized 8B is checked, never assumed.** OpenMOSS do fit the 8B on
+   an 8 GB card, but through their own llama.cpp pipeline — Q4_K_M weights,
+   staged loading, numpy LM heads — not through this ComfyUI node. Two of the
+   five prerequisites cannot be downloaded at all: llama.cpp is compiled from
+   source, and the TensorRT engines are built against the card in front of you
+   ("we do **not** provide pre-built TensorRT engines"). So `GGUF_STEPS`
+   describes and `/api/moss/8b` reports; neither installs, and
+   `gguf_available()` looks the two HuggingFace repos up rather than taking
+   them on trust. A first launch that promised an 8B it could not deliver
+   would fail in the middle of someone's first take instead of here.
+
 ## Why line-by-line, not DialogueInferenceNode
 
 `DialogueInferenceNode` takes a `RoleBankNode`, which takes prompts from
@@ -204,8 +225,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 102 unit tests, standard library only
-npm test                 # 68 checks driving the real page in headless Chromium
+npm run test:units       # 114 unit tests, standard library only
+npm test                 # 75 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script

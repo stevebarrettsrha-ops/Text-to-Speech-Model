@@ -94,17 +94,23 @@ def comfy_port(url: str) -> int:
 # folder from the Models page and it will be found.
 MODEL_REPOS = [
     {"repo": "Qwen/Qwen3-TTS-Tokenizer-12Hz", "group": "core", "params": "0.2B",
+     "vram_gb": 1,
      "note": "Speech tokenizer. Nothing generates without it."},
     {"repo": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "group": "preset",
-     "params": "0.9B", "note": "Preset speakers, fast. The default voice source."},
+     "params": "0.9B", "vram_gb": 3,
+     "note": "Preset speakers, fast. The default voice source."},
     {"repo": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "group": "preset_hq",
-     "params": "2B", "note": "Preset speakers at higher quality."},
+     "params": "2B", "vram_gb": 5,
+     "note": "Preset speakers at higher quality."},
     {"repo": "Qwen/Qwen3-TTS-12Hz-0.6B-Base", "group": "clone", "params": "0.9B",
+     "vram_gb": 3,
      "note": "Zero-shot voice cloning from a reference clip, fast."},
     {"repo": "Qwen/Qwen3-TTS-12Hz-1.7B-Base", "group": "clone_hq", "params": "2B",
+     "vram_gb": 5,
      "note": "Voice cloning at higher quality."},
     {"repo": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign", "group": "design",
-     "params": "2B", "note": "Builds a voice from a written description."},
+     "params": "2B", "vram_gb": 5,
+     "note": "Builds a voice from a written description."},
 ]
 
 # group -> the config flag that asks for it. core and preset are always needed.
@@ -132,15 +138,16 @@ GROUP_FLAG = {"core": None, "preset": None, "clone": "want_clone",
 # — so through Script Builder the 8B stays a tick rather than a default.
 MOSS_MODEL_REPOS = [
     {"repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer", "group": "moss_core",
-     "params": "codec",
+     "params": "codec", "vram_gb": 1,
      "note": "Shared audio codec. Every MOSS model needs it."},
     {"repo": "OpenMOSS-Team/MOSS-TTS-Local-Transformer", "group": "moss_core",
-     "params": "1.7B",
+     "params": "1.7B", "vram_gb": 5,
      "note": "Speech and zero-shot cloning. ~5 GB of VRAM, and the fast one."},
     {"repo": "OpenMOSS-Team/MOSS-VoiceGenerator", "group": "moss_design",
-     "params": "1.7B",
+     "params": "1.7B", "vram_gb": 5,
      "note": "Builds a voice from a description. ~5 GB of VRAM."},
     {"repo": "OpenMOSS-Team/MOSS-TTS", "group": "moss_hq", "params": "8B",
+     "vram_gb": 18,
      "note": "Delay 8B — better, far slower, and ~18 GB of VRAM through "
              "this node."},
 ]
@@ -1168,25 +1175,47 @@ def nvidia_gpu(refresh: bool = False) -> dict:
     """
     if _GPU and not refresh:
         return _GPU
-    name, driver = "", False
+    name, driver, vram = "", False, 0
     for smi in _smi_candidates():
         try:
-            out = _run([smi, "--query-gpu=name", "--format=csv,noheader"],
-                       timeout=30)
+            out = _run([smi, "--query-gpu=name,memory.total",
+                        "--format=csv,noheader,nounits"], timeout=30)
         except Exception:  # noqa: BLE001
             continue
         if out.returncode != 0:
             continue
         first = next((l.strip() for l in (out.stdout or "").splitlines()
                       if l.strip()), "")
-        if first:
-            name, driver = first, True
-            break
+        if not first:
+            continue
+        # "NVIDIA GeForce RTX 4060, 8188" — the card with the most memory on a
+        # machine with several, because that is the one a model will land on.
+        parts = [p.strip() for p in first.split(",")]
+        name, driver = parts[0], True
+        if len(parts) > 1 and parts[1].isdigit():
+            vram = int(parts[1])
+        break
     if not name:
         name = next((n for n in _adapter_names() if "nvidia" in n.lower()), "")
     _GPU.clear()
-    _GPU.update({"name": name, "driver": driver})
+    _GPU.update({"name": name, "driver": driver, "vram_mb": vram})
     return _GPU
+
+
+def fits_vram(need_gb: float, vram_mb: int) -> bool | None:
+    """Will a model wanting `need_gb` run on a card with `vram_mb`?
+
+    None when we do not know the card — an unknown card is not a small one,
+    and refusing to offer a model because nvidia-smi was missing would be the
+    same mistake as rule 5b in a new coat.
+
+    The margin is deliberate: `need_gb` is the weights plus working memory the
+    upstream table quotes, and a desktop already spends a few hundred MB of
+    the card on its own windows.
+    """
+    if not vram_mb:
+        return None
+    return vram_mb / 1024.0 >= need_gb
 
 
 CUDA_INDEX = "https://download.pytorch.org/whl/cu128"
@@ -1303,6 +1332,79 @@ def node_import_error(python: str, comfy_dir: Path, engine: str = "qwen") -> str
         if line.startswith("FAILED "):
             return line[len("FAILED "):]
     return text[-400:] or "The import failed without saying why."
+
+
+# --------------------------------------------------------------------------- #
+# MOSS 8B on a small card — what it would take, checked rather than assumed
+# --------------------------------------------------------------------------- #
+#
+# The 8B will not load through the ComfyUI node on an 8 GB card: the node calls
+# AutoModel.from_pretrained with bf16 weights and nothing else. OpenMOSS's own
+# llama.cpp pipeline does fit it — configs/llama_cpp/trt-8gb.yaml measures a
+# 5.6 GB peak — but that is a different stack, and setup must not pretend any
+# part of it is already here.
+#
+# Every line below is from OpenMOSS's own docs, not from guesswork:
+#   moss_tts_delay/llama_cpp/README.md  "Prerequisites"
+#   configs/llama_cpp/trt-8gb.yaml      the 8 GB profile
+#   README.md                           "we do NOT provide pre-built TensorRT
+#                                        engines"
+#
+# Two of these cannot be downloaded at all — the TensorRT engines are built on
+# the machine that will run them, and llama.cpp is compiled from source — so a
+# first run can never simply fetch its way to a working 8B. GGUF_STEPS is what
+# the Engine panel reports; it deliberately describes rather than installs.
+GGUF_REPO = "OpenMOSS-Team/MOSS-TTS-GGUF"
+GGUF_TOKENIZER_REPO = "OpenMOSS-Team/MOSS-Audio-Tokenizer-ONNX"
+
+GGUF_STEPS = [
+    {"id": "toolchain", "label": "llama.cpp, compiled from source",
+     "detail": "With shared library support, then `bash build_bridge.sh "
+               "/path/to/llama.cpp` for the C bridge. Not a pip install, and "
+               "not something Script Builder can do for you.",
+     "obtainable": False},
+    {"id": "package", "label": "The MOSS-TTS package, torch-free extras",
+     "detail": "git clone OpenMOSS/MOSS-TTS, then "
+               "pip install -e \".[llama-cpp-onnx]\".",
+     "obtainable": True},
+    {"id": "weights", "label": f"{GGUF_REPO}",
+     "detail": "Q4_K_M backbone .gguf, 33 embedding .npy, 33 lm_head .npy and "
+               "the tokenizer. Checked before it is offered — nothing here "
+               "assumes it exists.",
+     "obtainable": True},
+    {"id": "codec", "label": f"{GGUF_TOKENIZER_REPO}",
+     "detail": "Encoder and decoder ONNX for the audio tokenizer.",
+     "obtainable": True},
+    {"id": "engines", "label": "TensorRT engines, built on this machine",
+     "detail": "OpenMOSS does not ship these: they are tied to your GPU and "
+               "TensorRT version (moss_audio_tokenizer/trt/build_engine.sh). "
+               "The ONNX backend works without them, but the 5.6 GB figure in "
+               "trt-8gb.yaml is measured with them.",
+     "obtainable": False},
+]
+
+
+def gguf_available(cfg: dict) -> dict:
+    """Does the quantized 8B actually exist where we would fetch it from?
+
+    Asked, never assumed. A first launch that took these repos on trust would
+    promise an 8B it cannot deliver, and the failure would land in the middle
+    of someone's first take rather than here.
+    """
+    out = {"checked": True, "repos": {}}
+    for repo in (GGUF_REPO, GGUF_TOKENIZER_REPO):
+        try:
+            files = hf_tree(cfg, repo)
+            names = [f["path"] for f in files]
+            out["repos"][repo] = {
+                "found": True, "files": len(names),
+                "gguf": [n for n in names if n.endswith(".gguf")],
+                "onnx": [n for n in names if n.endswith(".onnx")],
+            }
+        except Exception as exc:  # noqa: BLE001
+            out["repos"][repo] = {"found": False, "why": str(exc)[:200]}
+    out["ready"] = all(r.get("found") for r in out["repos"].values())
+    return out
 
 
 # --------------------------------------------------------------------------- #

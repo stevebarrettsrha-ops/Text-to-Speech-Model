@@ -623,11 +623,12 @@ class GpuDetection(unittest.TestCase):
             self.assertTrue(bootstrap._smi_candidates())
 
     def test_a_card_that_answers_is_a_card_with_a_driver(self):
-        done = subprocess.CompletedProcess([], 0, "NVIDIA GeForce RTX 4060\n", "")
+        done = subprocess.CompletedProcess([], 0,
+                                           "NVIDIA GeForce RTX 4060, 8188\n", "")
         with mock.patch.object(bootstrap, "_run", return_value=done):
             gpu = bootstrap.nvidia_gpu(refresh=True)
         self.assertEqual(gpu, {"name": "NVIDIA GeForce RTX 4060",
-                               "driver": True})
+                               "driver": True, "vram_mb": 8188})
 
     def test_a_card_with_no_driver_is_still_a_card(self):
         with mock.patch.object(bootstrap, "_run",
@@ -1234,6 +1235,130 @@ class BothEnginesOnDisk(unittest.TestCase):
         self.assertEqual(moss["role"], "required")
         self.assertTrue(moss["installed"])
         self.assertEqual(moss["engine_label"], "MOSS-TTS")
+
+
+class VramGuard(unittest.TestCase):
+    """A model that cannot be held by the card is worth saying so about before
+    the download, not after ComfyUI runs out of memory mid-take."""
+
+    def test_the_card_reports_its_memory(self):
+        done = subprocess.CompletedProcess(
+            [], 0, "NVIDIA GeForce RTX 4060, 8188\n", "")
+        with mock.patch.object(bootstrap, "_run", return_value=done):
+            gpu = bootstrap.nvidia_gpu(refresh=True)
+        self.assertEqual(gpu["name"], "NVIDIA GeForce RTX 4060")
+        self.assertEqual(gpu["vram_mb"], 8188)
+        bootstrap._GPU.clear()
+
+    def test_a_card_that_answers_without_a_number_is_still_a_card(self):
+        done = subprocess.CompletedProcess([], 0, "NVIDIA GeForce RTX 4060\n", "")
+        with mock.patch.object(bootstrap, "_run", return_value=done):
+            gpu = bootstrap.nvidia_gpu(refresh=True)
+        self.assertEqual(gpu["name"], "NVIDIA GeForce RTX 4060")
+        self.assertEqual(gpu["vram_mb"], 0)
+        bootstrap._GPU.clear()
+
+    def test_an_8gb_card_holds_the_1_7b_models_and_not_the_8b(self):
+        eight = 8188
+        for repo, want in (("OpenMOSS-Team/MOSS-TTS-Local-Transformer", True),
+                           ("OpenMOSS-Team/MOSS-VoiceGenerator", True),
+                           ("OpenMOSS-Team/MOSS-TTS", False)):
+            entry = next(m for m in bootstrap.MOSS_MODEL_REPOS
+                         if m["repo"] == repo)
+            with self.subTest(repo=repo):
+                self.assertIs(bootstrap.fits_vram(entry["vram_gb"], eight), want)
+
+    def test_an_unknown_card_is_never_treated_as_a_small_one(self):
+        # nvidia-smi missing is rule 5b's failure, and answering "will not fit"
+        # there would hide every model from someone who has the memory.
+        self.assertIsNone(bootstrap.fits_vram(18, 0))
+        rows = manager.curated({"models_dir": ""}, vram_mb=0)
+        self.assertTrue(all(r["fits"] is None for r in rows))
+
+    def test_the_models_page_marks_what_will_not_load(self):
+        rows = {r["repo"]: r for r in manager.curated({"models_dir": ""},
+                                                      vram_mb=8188)}
+        self.assertFalse(rows["OpenMOSS-Team/MOSS-TTS"]["fits"])
+        self.assertTrue(rows["OpenMOSS-Team/MOSS-VoiceGenerator"]["fits"])
+        self.assertTrue(rows["Qwen/Qwen3-TTS-12Hz-0.6B-Base"]["fits"])
+
+    def test_every_model_carries_a_figure_to_judge_it_by(self):
+        for eng in bootstrap.ENGINES.values():
+            for m in eng["models"]:
+                with self.subTest(repo=m["repo"]):
+                    self.assertIsInstance(m.get("vram_gb"), int)
+                    self.assertGreater(m["vram_gb"], 0)
+
+    def test_comfyui_answers_for_the_card_when_nvidia_smi_cannot(self):
+        # A portable ComfyUI carries its own CUDA and knows the card on a
+        # machine where nvidia-smi is not on PATH.
+        c = client_for({})
+        payload = {"devices": [{"name": "cuda:0", "vram_total": 8588886016}]}
+
+        class Reply:
+            status_code = 200
+
+            @staticmethod
+            def raise_for_status():
+                pass
+
+            @staticmethod
+            def json():
+                return payload
+
+        with mock.patch.object(comfy.requests, "get", return_value=Reply):
+            self.assertEqual(c.vram_mb(), 8191)
+
+    def test_an_engine_that_will_not_answer_reports_no_memory(self):
+        c = client_for({})
+        with mock.patch.object(comfy.requests, "get",
+                               side_effect=comfy.requests.ConnectionError()):
+            self.assertEqual(c.vram_mb(), 0)
+
+
+
+class Moss8bPrerequisites(unittest.TestCase):
+    """The quantized 8B is never assumed to be sitting on HuggingFace waiting,
+    and two of its prerequisites cannot be downloaded at all."""
+
+    def test_two_steps_are_not_downloadable_and_say_so(self):
+        steps = {s["id"]: s for s in bootstrap.GGUF_STEPS}
+        # llama.cpp is compiled from source; the TensorRT engines are built
+        # against the card in front of you. A first run that promised to fetch
+        # its way to a working 8B would be lying.
+        self.assertFalse(steps["toolchain"]["obtainable"])
+        self.assertFalse(steps["engines"]["obtainable"])
+        self.assertTrue(steps["weights"]["obtainable"])
+
+    def test_the_repos_are_looked_up_not_taken_on_trust(self):
+        seen = []
+
+        def tree(_cfg, repo, *a, **kw):
+            seen.append(repo)
+            return [{"path": "MOSS_TTS_Q4_K_M.gguf", "size": 1}]
+
+        with mock.patch.object(bootstrap, "hf_tree", tree):
+            out = bootstrap.gguf_available({})
+        self.assertEqual(sorted(seen), sorted([bootstrap.GGUF_REPO,
+                                               bootstrap.GGUF_TOKENIZER_REPO]))
+        self.assertTrue(out["ready"])
+
+    def test_a_repo_that_is_not_there_is_reported_not_guessed(self):
+        with mock.patch.object(bootstrap, "hf_tree",
+                               side_effect=RuntimeError("404 not found")):
+            out = bootstrap.gguf_available({})
+        self.assertFalse(out["ready"])
+        for repo in out["repos"].values():
+            self.assertFalse(repo["found"])
+            self.assertIn("404", repo["why"])
+
+    def test_the_8b_is_not_in_the_default_download_set(self):
+        # Whatever the llama.cpp path can do, first launch fetches nothing it
+        # cannot then load through the engine it actually ships with.
+        repos = [m["repo"] for m in
+                 bootstrap.wanted_models(dict(bootstrap.DEFAULT_CONFIG))]
+        self.assertNotIn("OpenMOSS-Team/MOSS-TTS", repos)
+        self.assertNotIn(bootstrap.GGUF_REPO, repos)
 
 
 if __name__ == "__main__":
