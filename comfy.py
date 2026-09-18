@@ -20,6 +20,7 @@ the pause between lines, per-speaker voices and per-line retries work.
 from __future__ import annotations
 
 import json
+import random
 import threading
 import time
 import uuid
@@ -198,6 +199,11 @@ class ComfyClient:
         unload = bool(opts.get("unload"))
 
         common = {
+            # Without this the schema default of 0 is filled in for every line,
+            # so a take is byte-identical to the last one and retrying a line
+            # gives back exactly what it gave before.
+            "seed": {"names": ["seed", "noise_seed"],
+                     "value": random.randint(0, 2 ** 31 - 1)},
             "attention": {"names": ["attention"], "value": attention},
             "unload": {"names": ["unload_model_after_generate", "unload_model"],
                        "value": unload},
@@ -245,6 +251,16 @@ class ComfyClient:
                              "value": instruct or "A clear, natural voice",
                              "required": True},
             })
+            # VoiceDesign only ships as 1.7B: the node raises outright on 0.6B,
+            # and 1.7B-VoiceDesign is the only folder setup fetches for it. The
+            # model picker offers 0.6B because cloning has one, so a designed
+            # voice would fail on the picker's own first entry. Which value
+            # means 1.7B is read off the node, never typed in here.
+            big = next((c for c in self._enum(DESIGN, "model_choice")
+                        if "1.7" in c), "")
+            if big:
+                wanted["model"] = {"names": ["model_choice", "model"],
+                                   "value": big}
             g["2"] = self._node(DESIGN, wanted)
         else:
             if not self.has(CUSTOM):

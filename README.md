@@ -16,7 +16,10 @@ Qwen3-TTS running through ComfyUI.
 **Windows** — double-click `run.bat`
 **macOS / Linux** — `./run.sh`
 
-The browser opens at <http://127.0.0.1:7799>.
+Either one finds a Python 3.10+, offers to install one if there is none, puts
+Script Builder's two packages into a `.venv` beside the script — never into the
+Python it found — and starts the server. The browser opens at
+<http://127.0.0.1:7799>.
 
 On the first run a setup panel appears with three routes:
 
@@ -40,7 +43,7 @@ Nothing goes into your system Python.
 
 ### Requirements
 
-- Python 3.10 or newer
+- Python 3.10 or newer (on Debian and Ubuntu, `python3-venv` too)
 - Git
 - An NVIDIA GPU with 8 GB or more is comfortable. Less works with **Free GPU
   memory after each run** switched on. CPU works but is slow.
@@ -108,7 +111,8 @@ Each speaker picks one in the Voices card:
   one-line sample.
 - **Clone** — upload a clean 5–15 second clip and type what is said in it.
   Matching the reference text properly makes a large difference.
-- **Design** — describe a voice in words. Needs the VoiceDesign model.
+- **Design** — describe a voice in words. Needs the VoiceDesign model, which
+  only exists as 1.7B; a designed line uses it whatever the model picker says.
 
 ### More options
 
@@ -170,12 +174,14 @@ is slow. Later lines are much quicker unless memory freeing is on.
 ## Layout
 
 ```
-server.py      Flask API — speech jobs, takes, setup, dependencies, HuggingFace
-bootstrap.py   Python/ComfyUI/node discovery, installs, model snapshots, process
-manager.py     Dependency checks and installers, HuggingFace browsing
-comfy.py       Builds Qwen-TTS graphs from ComfyUI's live schema
-web/index.html The interface — one file, no build step
-data/          config.json, takes.json, takes/
+run.sh, run.bat  Launchers — find Python, build .venv, start server.py
+requirements.txt Flask and requests. That is the whole list.
+server.py        Flask API — speech jobs, takes, setup, dependencies, HuggingFace
+bootstrap.py     Python/ComfyUI/node discovery, installs, model snapshots, process
+manager.py       Dependency checks and installers, HuggingFace browsing
+comfy.py         Builds Qwen-TTS graphs from ComfyUI's live schema
+web/index.html   The interface — one file, no build step
+data/            config.json, takes.json, takes/   (created on first run)
 ```
 
 Port: set `SCRIPT_BUILDER_PORT`. Set `SCRIPT_BUILDER_NO_BROWSER=1` to stop it

@@ -4,6 +4,9 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Script Builder</title>
+<!-- Inline, because the server has no static route: without it every page load
+     asks for /favicon.ico and logs a 404. Same mark as YuE Studio. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%237c4dff'/%3E%3Cstop offset='1' stop-color='%23ff2d7a'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='8' fill='%230a0a0c'/%3E%3Cg fill='url(%23g)'%3E%3Crect x='7' y='13' width='2.6' height='6' rx='1.3'/%3E%3Crect x='12' y='8' width='2.6' height='16' rx='1.3'/%3E%3Crect x='17' y='11' width='2.6' height='10' rx='1.3'/%3E%3Crect x='22' y='14' width='2.6' height='4' rx='1.3'/%3E%3C/g%3E%3C/svg%3E" />
 <style>
   :root{
     --bg:#0a0a0c; --panel:#121215; --panel-2:#17171b; --raised:#1b1b20;
@@ -307,7 +310,11 @@
   .step.running .mark{border-color:var(--accent);color:#cdbcff}
   .step.done .mark{background:var(--ok);border-color:var(--ok);color:#06210f}
   .step.error .mark{background:var(--err);border-color:var(--err);color:#2a0606}
+  .step .grow{flex:1;min-width:0}
   .step .lbl{font-size:13.5px;font-weight:500}
+  .step .pctnum{color:var(--accent);font-variant-numeric:tabular-nums;
+                font-weight:600;margin-left:6px}
+  .step .bar{margin-top:8px}
   .step .dt{font-size:12px;color:var(--dim);margin-top:2px;word-break:break-word}
   .step.error .dt{color:#ff9a9a}
   .pick{display:flex;flex-direction:column;gap:8px;margin:14px 0}
@@ -335,14 +342,22 @@
     .playerbar{grid-column:1/3;grid-row:3}
   }
   @media (max-width:760px){
-    .app{grid-template-columns:1fr;grid-template-rows:auto 1fr auto var(--player)}
+    /* body.solo is set on Models and Engine, and `body.solo .app` out-weighs a
+       bare `.app` here — a media query adds no specificity — so those two pages
+       kept the desktop rail column and ran off the side of the screen. */
+    .app,body.solo .app{grid-template-columns:1fr;
+         grid-template-rows:auto 1fr auto var(--player)}
+    /* A grid item is min-width:auto by default, so it refuses to shrink below
+       its content and the overflow-x below never engages: the rail widened the
+       whole page instead of scrolling its own chips. */
+    .app>*{min-width:0}
     .rail{flex-direction:row;overflow-x:auto;grid-row:1;grid-column:1;padding:8px;
-          border-right:0;border-bottom:1px solid var(--line-soft)}
+          border-right:0;border-bottom:1px solid var(--line-soft);min-width:0}
     .rail .spacer,.who,.brand,.statuspill{display:none}
     .nav{width:auto;white-space:nowrap}
     .main{grid-row:2;grid-column:1}
     .work{grid-row:3;grid-column:1;max-height:36vh}
-    .playerbar{grid-row:4;grid-column:1;gap:8px;padding:0 10px}
+    .playerbar,body.solo .playerbar{grid-row:4;grid-column:1;gap:8px;padding:0 10px}
     .pright input[type=range],.transport .iconbtn{display:none}
     .page,.chead,.createbar{padding-left:14px;padding-right:14px}
     .np{width:auto;flex:1}
@@ -562,6 +577,7 @@
       <div class="panel">
         <h2>Activity</h2>
         <p class="sub" id="task-title">Nothing running.</p>
+        <div class="bar" id="task-bar" hidden><i style="width:0%"></i></div>
         <div class="log" id="task-log"></div>
         <div class="rowbtn"><button class="btn" id="btnCancelTask" hidden>Stop</button></div>
       </div>
@@ -684,7 +700,7 @@ var S = {
   },
   voices: { speakers: [], models: [], attentions: [], capabilities: {} },
   status: null, job: null, jobs: [], take: null, takes: [], libFilter: "",
-  playing: false, stopped: false, playIndex: -1, repeat: false,
+  playing: false, stopped: false, playIndex: -1, repeat: false, playToken: 0,
   setupCursor: 0, taskId: null, taskCursor: 0, setupSeen: false
 };
 function $(id) { return document.getElementById(id); }
@@ -1134,8 +1150,12 @@ function highlight(index) {
 }
 
 /* ========================= playback ========================= */
-async function playTake(take, quiet) {
+async function playTake(take, quiet, startAt) {
   if (!take) return;
+  // Every call claims the player. An earlier run that is still unwinding —
+  // stepLine starts the next one 120ms after telling this one to stop — must
+  // not run the cleanup at the bottom over the top of its replacement.
+  var token = ++S.playToken;
   S.take = take;
   S.stopped = false;
   S.playing = true;
@@ -1146,9 +1166,10 @@ async function playTake(take, quiet) {
   paintArt($("npArt").querySelector("canvas"), take.id + (take.style || ""));
   $("playIcon").innerHTML = '<path d="M7 5h4v14H7zM13 5h4v14h-4z"/>';
   var pause = (take.pause || 0) * 1000;
+  var from = Math.max(0, Math.min(take.lines.length - 1, startAt || 0));
   do {
-    for (var i = 0; i < take.lines.length; i++) {
-      if (S.stopped) break;
+    for (var i = from; i < take.lines.length; i++) {
+      if (S.stopped || token !== S.playToken) break;
       S.playIndex = i;
       $("lineFlag").textContent = "line " + (i + 1) + " of " + take.lines.length;
       if (!quiet) highlight(take.lines[i].index);
@@ -1161,7 +1182,9 @@ async function playTake(take, quiet) {
       }
       if (i < take.lines.length - 1 && pause && !S.stopped) await wait(pause);
     }
-  } while (S.repeat && !S.stopped);
+    from = 0;   // a repeat pass starts from the top, not from where we came in
+  } while (S.repeat && !S.stopped && token === S.playToken);
+  if (token !== S.playToken) return;   // a newer playback owns the player now
   highlight(-1);
   S.playing = false;
   S.playIndex = -1;
@@ -1208,11 +1231,13 @@ function stepLine(d) {
   S.stopped = true;
   var next = Math.max(0, Math.min(S.take.lines.length - 1, S.playIndex + d));
   var take = S.take;
+  // Start the take again at another line — never a copy with the earlier lines
+  // sliced off it. That copy became S.take, so "line 2 of 3" renumbered itself
+  // to "line 1 of 2", and the lines it dropped were the ones ⏮ needed to go
+  // back to: one press of ⏭ and the other button could never leave that spot.
   setTimeout(function () {
     S.stopped = false;
-    S.playIndex = next - 1;
-    var rest = Object.assign({}, take, { lines: take.lines.slice(next) });
-    playTake(rest, false);
+    playTake(take, false, next);
   }, 120);
 }
 
@@ -1458,6 +1483,11 @@ async function pollTasks() {
       var t = await api("/api/tasks?id=" + S.taskId + "&since=" + S.taskCursor);
       S.taskCursor = t.cursor;
       $("task-title").textContent = t.title + " — " + (t.detail || t.state);
+      // The Engine panel runs the same pip installs the setup panel does, so
+      // it gets the same bar rather than a title that sits still for minutes.
+      var tb = $("task-bar");
+      tb.hidden = !(t.state === "running" && t.pct > 0);
+      tb.querySelector("i").style.width = Math.round(t.pct) + "%";
       if (t.lines.length) {
         var log = $("task-log");
         var bottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
@@ -1648,14 +1678,22 @@ async function pollSetup() {
   }
   var list = $("step-list");
   list.innerHTML = "";
-  Object.keys(st.steps).forEach(function (k) {
-    var s = st.steps[k];
+  // An array, in the order the steps run — a plain object would come back
+  // with its keys sorted, which is not the order anything happens in.
+  (st.steps || []).forEach(function (s) {
     var d = document.createElement("div");
     d.className = "step " + s.state;
+    // A bar only while there is a number to put in it. Drawn at 0% for a step
+    // that cannot measure itself, it reads as stuck rather than as working.
+    var bar = (s.state === "running" && typeof s.pct === "number")
+      ? '<div class="bar"><i style="width:' + s.pct.toFixed(1) + '%"></i></div>'
+      : "";
     d.innerHTML = '<span class="mark">' +
       (s.state === "done" ? "✓" : s.state === "error" ? "!" : "") +
-      '</span><div><div class="lbl">' + esc(s.label) + '</div><div class="dt">' +
-      esc(s.detail || "") + "</div></div>";
+      '</span><div class="grow"><div class="lbl">' + esc(s.label) +
+      (typeof s.pct === "number" && s.state === "running"
+        ? ' <span class="pctnum">' + Math.round(s.pct) + '%</span>' : "") +
+      '</div><div class="dt">' + esc(s.detail || "") + "</div>" + bar + "</div>";
     list.appendChild(d);
   });
   if (st.done) {
@@ -1680,7 +1718,8 @@ async function refreshStatus() {
   pill.querySelector("span").textContent = st.ready ? "Engine ready"
     : !st.comfy_online ? "Engine offline"
     : !st.nodes_ready ? "Nodes not loaded"
-    : st.missing_models.length ? "Models missing" : "Engine loading";
+    : st.missing_models.length ? "Models missing"
+    : st.models_known === false ? "No models folder" : "Engine loading";
   $("modelsTag").hidden = !(st.missing_models && st.missing_models.length);
   $("engineTag").hidden = !!(st.comfy_online && st.nodes_ready);
   $("runLabel").textContent = st.ready ? "Read the script" : "Set up the engine";

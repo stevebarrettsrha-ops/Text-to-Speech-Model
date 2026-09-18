@@ -22,8 +22,9 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 
 import bootstrap
 import manager
-from bootstrap import (APP_DIR, ComfyProcess, Progress, comfy_online,
-                       detect_comfy_dirs, load_config, save_config)
+from bootstrap import (APP_DIR, ComfyProcess, Progress, clean_url,
+                       comfy_online, comfy_port, detect_comfy_dirs,
+                       load_config, save_config)
 from comfy import ComfyClient, ComfyError
 
 DATA_DIR = APP_DIR / "data"
@@ -86,13 +87,21 @@ def stitch_wavs(paths: list[Path], dest: Path, pause: float) -> bool:
             params = first.getparams()
         with wave.open(str(dest), "wb") as out:
             out.setparams(params)
-            gap = b"\x00" * int(params.framerate * max(pause, 0)
-                                * params.sampwidth * params.nchannels)
+            # Whole frames only. Rounding the byte count instead lets a pause
+            # like 0.75s at 22050 Hz stereo end on half a frame, and every
+            # sample after it lands in the wrong channel.
+            frame = params.sampwidth * params.nchannels
+            gap = b"\x00" * (int(params.framerate * max(pause, 0)) * frame)
             for i, p in enumerate(paths):
                 with wave.open(str(p), "rb") as w:
                     if (w.getnchannels(), w.getsampwidth(), w.getframerate()) != \
                             (params.nchannels, params.sampwidth, params.framerate):
-                        return False
+                        # Raised, not returned: by the time a mismatch shows up
+                        # the earlier clips are already written, and returning
+                        # from inside the `with` left that half-built file on
+                        # disk next to the zip the caller then made — a wav
+                        # that looks like the take and holds one line of it.
+                        raise ValueError("clip formats differ")
                     out.writeframes(w.readframes(w.getnframes()))
                 if i < len(paths) - 1 and gap:
                     out.writeframes(gap)
@@ -157,7 +166,12 @@ def run_job(job_id: str, payload: dict) -> None:
 
         for i, line in enumerate(lines):
             key = str(line.get("speaker", 1))
-            voice = speakers.get(key) or speakers.get(int(key), {}) or {}
+            # JSON object keys are strings, but a take loaded back can carry
+            # integer ones. A key that is neither is a speaker we do not have,
+            # not a reason to fail the whole job.
+            voice = speakers.get(key) or {}
+            if not voice and key.isdigit():
+                voice = speakers.get(int(key)) or {}
             set_state(stage=f"Line {i + 1} of {len(lines)} · "
                             f"{voice.get('name') or 'Speaker ' + key}",
                       pct=round(i / max(len(lines), 1) * 100, 1),
@@ -211,13 +225,18 @@ def run_job(job_id: str, payload: dict) -> None:
                 pass
         add_take(take)
         set_state(status="done", pct=100, stage="Ready", take=take)
+    # A job that does not finish records no take, so the clips it did fetch are
+    # unreachable: nothing in the library lists them and no Delete can remove
+    # them. Left behind, every failed run — and out of memory on line four is
+    # the failure this app documents — costs another few megabytes for good.
     except ComfyError as exc:
+        shutil.rmtree(folder, ignore_errors=True)
         if str(exc) == "Cancelled":
-            shutil.rmtree(folder, ignore_errors=True)
             set_state(status="cancelled", stage="Cancelled")
         else:
             set_state(status="error", error=str(exc), stage="Failed")
     except Exception as exc:  # noqa: BLE001
+        shutil.rmtree(folder, ignore_errors=True)
         set_state(status="error", error=f"{type(exc).__name__}: {exc}",
                   stage="Failed")
 
@@ -242,12 +261,18 @@ def web_asset(name: str):
 def api_status():
     online = comfy_online(cfg["comfy_url"])
     models_dir = Path(cfg["models_dir"]) if cfg.get("models_dir") else None
-    missing = []
-    if models_dir and models_dir.is_dir():
-        missing = [m["repo"] for m in bootstrap.missing_models(models_dir, cfg)]
+    # Whether the voices could be checked at all, which is not the same as
+    # finding none missing. With no models folder set there is nowhere to look,
+    # and an empty "missing" list used to read as "all present" — so a machine
+    # with ComfyUI up, the nodes loaded and not one voice on disk reported the
+    # engine ready and let someone press Read.
+    models_known = bool(models_dir and models_dir.is_dir())
+    missing = [m["repo"] for m in bootstrap.missing_models(models_dir, cfg)] \
+        if models_known else []
     payload = {
         "comfy_online": online,
         "setup_complete": bool(cfg.get("setup_complete")),
+        "models_known": models_known,
         "missing_models": missing,
         "detected": detect_comfy_dirs(),
         "config": {k: cfg.get(k) for k in
@@ -264,7 +289,7 @@ def api_status():
         except Exception as exc:  # noqa: BLE001
             payload["schema_error"] = str(exc)
     payload["ready"] = bool(online and payload["nodes_ready"]
-                            and not [m for m in missing])
+                            and models_known and not missing)
     return jsonify(payload)
 
 
@@ -294,7 +319,8 @@ def api_setup_start():
                 "want_voicedesign"):
         if key in body:
             cfg[key] = body[key]
-    client.url = cfg["comfy_url"].rstrip("/")
+    cfg["comfy_url"] = clean_url(cfg.get("comfy_url")) or client.url
+    client.url = cfg["comfy_url"]
     save_config(cfg)
     progress.__init__()
     threading.Thread(target=bootstrap.run_setup,
@@ -317,8 +343,11 @@ def api_comfy_start():
     py = bootstrap.comfy_python(cfg)
     if not cfg.get("comfy_dir") or not py:
         return jsonify({"error": "Run setup first."}), 400
-    port = int(cfg["comfy_url"].rsplit(":", 1)[-1])
-    comfy_proc.start(py, Path(cfg["comfy_dir"]), port, progress)
+    try:
+        comfy_proc.start(py, Path(cfg["comfy_dir"]),
+                         comfy_port(cfg["comfy_url"]), progress)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 400
     return jsonify({"ok": True})
 
 
@@ -329,7 +358,8 @@ def api_config():
                 "torch_index", "want_clone", "want_17b", "want_voicedesign"):
         if key in body:
             cfg[key] = body[key]
-    client.url = cfg["comfy_url"].rstrip("/")
+    cfg["comfy_url"] = clean_url(cfg.get("comfy_url")) or client.url
+    client.url = cfg["comfy_url"]
     save_config(cfg)
     return jsonify({"ok": True})
 
@@ -551,15 +581,40 @@ def api_take_delete(take_id: str):
 
 
 # --------------------------------------------------------------------------- #
+def sweep_orphan_takes() -> int:
+    """Drop clip folders that takes.json does not list.
+
+    takes.json is the record of what exists. A folder missing from it is one a
+    run never finished — killed part way through, or left by a version that did
+    not clean up after a failure — and nothing in the app can reach it again.
+    """
+    known = {t["id"] for t in read_takes()}
+    gone = 0
+    for folder in TAKES_DIR.iterdir() if TAKES_DIR.is_dir() else []:
+        if folder.is_dir() and folder.name not in known:
+            shutil.rmtree(folder, ignore_errors=True)
+            gone += 1
+    return gone
+
+
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     TAKES_DIR.mkdir(parents=True, exist_ok=True)
+    swept = sweep_orphan_takes()
+    if swept:
+        progress.log(f"Cleared {swept} unfinished take folder(s).")
     if cfg.get("setup_complete") and cfg.get("auto_start_comfy", True) \
             and cfg.get("comfy_dir") and bootstrap.comfy_python(cfg) \
             and not comfy_online(cfg["comfy_url"]):
         progress.log("Restarting ComfyUI from the last setup…")
-        comfy_proc.start(bootstrap.comfy_python(cfg), Path(cfg["comfy_dir"]),
-                         int(cfg["comfy_url"].rsplit(":", 1)[-1]), progress)
+        # An engine that cannot be started is an engine the Engine panel
+        # reports as offline, never a reason the whole app fails to boot.
+        try:
+            comfy_proc.start(bootstrap.comfy_python(cfg),
+                             Path(cfg["comfy_dir"]),
+                             comfy_port(cfg["comfy_url"]), progress)
+        except RuntimeError as exc:
+            progress.log(f"Could not restart ComfyUI: {exc}")
     url = f"http://127.0.0.1:{PORT}"
     print(f"\n  Script Builder  →  {url}\n")
     if os.environ.get("SCRIPT_BUILDER_NO_BROWSER") != "1":

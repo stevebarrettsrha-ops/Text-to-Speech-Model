@@ -20,12 +20,14 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 
@@ -38,6 +40,42 @@ NODE_REPO = "https://github.com/flybirdxx/ComfyUI-Qwen-TTS.git"
 NODE_DIR_NAME = "ComfyUI-Qwen-TTS"
 
 HF_BASE = "https://huggingface.co"
+DEFAULT_COMFY_URL = "http://127.0.0.1:8188"
+
+
+def clean_url(url) -> str:
+    """A base URL fit to build requests on, or "" if it cannot be made into one.
+
+    No stray whitespace and no trailing slash — appending /system_stats to
+    "http://host:8188/" asks for //system_stats, which is a 404, not a health
+    check. A bare "localhost:8188", which is what people type, gains the scheme
+    it is missing; anything with no host at all comes back empty so the caller
+    can keep whatever address was already working.
+    """
+    text = url.strip().rstrip("/") if isinstance(url, str) else ""
+    if not text:
+        return ""
+    if "://" not in text:
+        text = "http://" + text
+    parts = urlsplit(text)
+    if (parts.scheme not in ("http", "https") or not parts.hostname
+            or any(ch.isspace() for ch in parts.netloc)):
+        return ""
+    return text
+
+
+def comfy_port(url: str) -> int:
+    """The port to start ComfyUI on, read out of its URL.
+
+    This used to be int(url.rsplit(":")[-1]), which blew up on a trailing slash
+    or a port-less address — typed once into Settings, that config stopped the
+    server from booting at all.
+    """
+    try:
+        port = urlsplit(clean_url(url) or DEFAULT_COMFY_URL).port
+    except ValueError:
+        port = None
+    return port or 8188
 
 # The Qwen3-TTS collection on HuggingFace. The custom node looks for these
 # under ComfyUI/models/qwen-tts/Qwen/<folder>.
@@ -69,7 +107,7 @@ GROUP_FLAG = {"core": None, "preset": None, "clone": "want_clone",
               "design": "want_voicedesign"}
 
 DEFAULT_CONFIG = {
-    "comfy_url": "http://127.0.0.1:8188",
+    "comfy_url": DEFAULT_COMFY_URL,
     "comfy_dir": "",
     "models_dir": "",        # ComfyUI/models
     "python": "",            # interpreter that runs ComfyUI
@@ -99,6 +137,9 @@ def load_config() -> dict:
             cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
         except Exception:
             pass
+    # Heal a URL saved before it was normalised — a trailing slash in here used
+    # to keep the whole app from starting.
+    cfg["comfy_url"] = clean_url(cfg.get("comfy_url")) or DEFAULT_COMFY_URL
     return cfg
 
 
@@ -127,7 +168,11 @@ class Progress:
         self.done = False
         self.error: str | None = None
         self.step = ""
-        self.steps = {k: {"label": v, "state": "pending", "detail": ""}
+        # pct is None while a step has no measurable progress — a bar drawn at
+        # 0% for the whole of a fifteen-minute step reads as "stuck", so the
+        # page shows none until there is a number to put in it.
+        self.steps = {k: {"label": v, "state": "pending", "detail": "",
+                          "pct": None}
                       for k, v in self.STEPS}
 
     def log(self, msg: str) -> None:
@@ -142,14 +187,18 @@ class Progress:
             self.step = key
             self.steps[key]["state"] = "running"
             self.steps[key]["detail"] = detail
+            self.steps[key]["pct"] = None
 
-    def detail(self, key: str, detail: str) -> None:
+    def detail(self, key: str, detail: str, pct: float | None = None) -> None:
         with self._lock:
             self.steps[key]["detail"] = detail
+            if pct is not None:
+                self.steps[key]["pct"] = max(0.0, min(100.0, float(pct)))
 
     def finish(self, key: str, detail: str = "") -> None:
         with self._lock:
             self.steps[key]["state"] = "done"
+            self.steps[key]["pct"] = None
             if detail:
                 self.steps[key]["detail"] = detail
 
@@ -162,7 +211,13 @@ class Progress:
         with self._lock:
             return {"running": self.running, "done": self.done,
                     "error": self.error, "step": self.step,
-                    "steps": json.loads(json.dumps(self.steps)),
+                    # A list, in the order the steps actually happen. This used
+                    # to be the dict itself, and Flask sorts the keys of every
+                    # dict it sends — which listed Check Python last, after the
+                    # step that starts the engine, on the one screen where
+                    # order is the whole point.
+                    "steps": [{"key": key, **self.steps[key]}
+                              for key, _ in self.STEPS],
                     "cursor": len(self.lines), "lines": self.lines[since:]}
 
 
@@ -223,17 +278,71 @@ def venv_python(comfy_dir: Path) -> Path:
                    else "bin/python")
 
 
+def _interpreters(comfy_dir: Path) -> list[Path]:
+    """Where a ComfyUI install keeps the interpreter it runs on, best first.
+
+    Portable python_embeded leads, as the install instructions say. After it
+    come the environments an install someone else set up keeps beside or inside
+    its own folder — an existing ComfyUI already has torch in one of these, and
+    the node's requirements have to land in the same place or ComfyUI will not
+    import them. Our own comfy-venv is last, because it only exists when we
+    built it.
+    """
+    win = platform.system() == "Windows"
+    exe = "Scripts/python.exe" if win else "bin/python"
+    cands: list[Path] = []
+    if win:
+        cands += [comfy_dir.parent / "python_embeded" / "python.exe",
+                  comfy_dir / "python_embeded" / "python.exe"]
+    cands += [comfy_dir / "venv" / exe,
+              comfy_dir / ".venv" / exe,
+              comfy_dir.parent / "venv" / exe,
+              comfy_dir.parent / ".venv" / exe]
+    if win:
+        cands += [comfy_dir.parent / "python_standalone" / "python.exe"]
+    else:
+        cands += [comfy_dir.parent / "python_standalone" / "bin" / "python"]
+    cands += [venv_python(comfy_dir)]
+    return cands
+
+
+def existing_python(comfy_dir: Path) -> str:
+    """The interpreter an existing ComfyUI already runs on, if we can find it.
+
+    Tested by running it, never by its path alone — the same rule as
+    find_python(). An install whose environment has torch wins outright; a
+    working interpreter without torch is the fallback, because it is still that
+    install's own environment and ours has no business replacing it.
+    """
+    fallback = ""
+    for cand in _interpreters(comfy_dir):
+        try:
+            if not cand.exists():
+                continue
+            out = _run([str(cand), "-c", "import importlib.util as u;"
+                                         "print(bool(u.find_spec('torch')))"],
+                       timeout=60)
+        except Exception:
+            continue
+        if out.returncode != 0:
+            continue
+        if out.stdout.strip().splitlines()[-1:] == ["True"]:
+            return str(cand)
+        fallback = fallback or str(cand)
+    return fallback
+
+
 def comfy_python(cfg: dict) -> str:
-    """Whichever interpreter ComfyUI runs on: portable first, then our venv,
-    then whatever was recorded during setup."""
+    """Whichever interpreter ComfyUI runs on: portable first, then the
+    environment the install already has, then whatever setup recorded."""
     comfy_dir = Path(cfg["comfy_dir"]) if cfg.get("comfy_dir") else None
     if comfy_dir:
         p = portable_python(comfy_dir)
         if p:
             return str(p)
-        v = venv_python(comfy_dir)
-        if v.exists():
-            return str(v)
+        found = existing_python(comfy_dir)
+        if found:
+            return found
     return cfg.get("python") or ""
 
 
@@ -278,6 +387,12 @@ def qwen_model_dir(models_dir: Path, repo: str) -> Path:
 def model_installed(models_dir: Path, repo: str) -> bool:
     d = qwen_model_dir(models_dir, repo)
     if not d.is_dir():
+        return False
+    # A .part is a download that stopped part way through. The config.json
+    # beside it arrived first and is perfectly good, which is exactly why this
+    # has to be checked: without it a folder whose weights are still half here
+    # reports as installed, and the engine reports ready.
+    if any(d.rglob("*.part")):
         return False
     weights = [f for f in d.rglob("*")
                if f.suffix in (".safetensors", ".bin", ".pt", ".pth")]
@@ -366,10 +481,26 @@ def wanted_files(files: list[dict]) -> list[dict]:
     return out
 
 
+def human_size(n: float) -> str:
+    """Bytes at a scale that reads. Fixing this at GB showed every repo under
+    ten megabytes as "0.00 of 0.00 GB"."""
+    if n >= 1e9:
+        return f"{n / 1e9:.2f} GB"
+    if n >= 1e6:
+        return f"{n / 1e6:.0f} MB"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f} kB"
+    return f"{int(n)} B"
+
+
 def download_file(cfg: dict, repo: str, path: str, dest: Path,
                   on_progress=None, should_cancel=None,
-                  revision: str = "main") -> None:
-    """Resumable single-file download: .part file, Range resume, atomic move."""
+                  revision: str = "main", expected: int = 0) -> None:
+    """Resumable single-file download: .part file, Range resume, atomic move.
+
+    `expected` is the size the repo listing gave, when there is one. Nothing is
+    moved into place until what arrived accounts for it.
+    """
     url = f"{hf_endpoint(cfg)}/{repo}/resolve/{revision}/{path}"
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".part")
@@ -387,10 +518,15 @@ def download_file(cfg: dict, repo: str, path: str, dest: Path,
             raise RuntimeError("HuggingFace refused the download. Add a token "
                                "with access to this repo.")
         r.raise_for_status()
-        total = int(r.headers.get("Content-Length", 0)) + have
-        mode = "ab" if (have and r.status_code == 206) else "wb"
-        if mode == "wb":
+        # A 206 means the server honoured the Range header and Content-Length
+        # covers only what is left; a 200 means it ignored it and is sending
+        # the whole file again, so what is already on disk does not count —
+        # towards the total either, or the progress readout runs past 100%.
+        resuming = bool(have) and r.status_code == 206
+        mode = "ab" if resuming else "wb"
+        if not resuming:
             have = 0
+        total = int(r.headers.get("Content-Length", 0)) + have
         got, last = have, 0.0
         with open(part, mode) as fh:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -404,6 +540,18 @@ def download_file(cfg: dict, repo: str, path: str, dest: Path,
                 if on_progress and now - last > 0.6:
                     last = now
                     on_progress(got, total)
+    # A connection that drops mid-file ends that loop exactly like a clean
+    # finish does. Renaming a short file into place makes it look complete for
+    # good: the .part it would have resumed from is gone, and the folder counts
+    # as installed while the weights in it are truncated. Keep the .part and
+    # say so — the next attempt carries on from where this one stopped.
+    want = expected or total
+    landed = part.stat().st_size if part.exists() else 0
+    if want and landed < want:
+        raise RuntimeError(
+            f"{path} stopped at {landed / 1e6:.1f} MB of {want / 1e6:.1f} MB — "
+            "the connection dropped. Start the download again and it carries "
+            "on from here.")
     part.replace(dest)
     if on_progress:
         on_progress(dest.stat().st_size, dest.stat().st_size)
@@ -425,11 +573,13 @@ def download_repo(cfg: dict, repo: str, models_dir: Path,
         def prog(got, tot, _f=f, _i=i, _done=done_bytes):
             if on_detail:
                 overall = (_done + got) / total_bytes * 100
-                on_detail(f"{repo} · file {_i}/{len(files)} · "
-                          f"{(_done + got)/1e9:.2f} of {total_bytes/1e9:.2f} GB",
+                on_detail(f"{repo.split('/')[-1]} · file {_i}/{len(files)} · "
+                          f"{human_size(_done + got)} of "
+                          f"{human_size(total_bytes)} ({overall:.0f}%)",
                           overall)
 
-        download_file(cfg, repo, f["path"], dest, prog, should_cancel)
+        download_file(cfg, repo, f["path"], dest, prog, should_cancel,
+                      expected=f["size"])
         if should_cancel and should_cancel():
             return
         done_bytes += f["size"]
@@ -449,17 +599,29 @@ class ComfyProcess:
 
     def start(self, python: str, comfy_dir: Path, port: int,
               prog: Progress) -> None:
+        """Raises RuntimeError with a sentence a person can act on. A ComfyUI
+        folder that has moved, or an interpreter that is gone, is an engine
+        that cannot start — never a reason the whole app fails to boot."""
         if self.alive():
             return
+        if not (comfy_dir / "main.py").exists():
+            raise RuntimeError(
+                f"There is no ComfyUI at {comfy_dir} any more — the folder has "
+                "moved or been deleted. Run setup again from Settings.")
         cmd = [python, "main.py", "--listen", "127.0.0.1", "--port", str(port),
                "--disable-auto-launch"]
         prog.log("Launching ComfyUI: " + " ".join(cmd))
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) \
             if platform.system() == "Windows" else 0
-        self.proc = subprocess.Popen(cmd, cwd=str(comfy_dir),
-                                     stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, text=True,
-                                     bufsize=1, creationflags=flags)
+        try:
+            self.proc = subprocess.Popen(cmd, cwd=str(comfy_dir),
+                                         stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, text=True,
+                                         bufsize=1, creationflags=flags)
+        except OSError as exc:
+            raise RuntimeError(
+                f"ComfyUI could not be started with {python} — {exc}. "
+                "Run setup again from Settings.") from exc
         threading.Thread(target=self._pump, args=(prog,), daemon=True).start()
 
     def _pump(self, prog: Progress) -> None:
@@ -510,18 +672,150 @@ def wait_for_comfy(url: str, timeout: int = 900) -> bool:
 # --------------------------------------------------------------------------- #
 # pip
 # --------------------------------------------------------------------------- #
-def pip_install(python: str, args: list[str], log) -> None:
-    cmd = [python, "-m", "pip", "install"] + args
+def stream_lines(stream):
+    """What a subprocess writes, with a carriage return counting as a break.
+
+    pip redraws its progress over itself with \r. Iterating the pipe by line
+    waits for a \n that only arrives when the download has already finished,
+    which is why a 2.7 GB PyTorch showed "Collecting torch" and then nothing.
+    """
+    buffer = ""
+    while True:
+        char = stream.read(1)
+        if not char:
+            break
+        if char in ("\r", "\n"):
+            if buffer.strip():
+                yield buffer.strip()
+            buffer = ""
+        else:
+            buffer += char
+    if buffer.strip():
+        yield buffer.strip()
+
+
+def pip_progress(line: str, state: dict):
+    """One line of pip output -> (something worth reading, percent) or None.
+
+    `--progress-bar raw` prints "Progress 123 of 456" as it goes, and that is
+    the only account of a multi-gigabyte download that survives being piped:
+    pip draws no bar at all unless it is talking to a terminal.
+    """
+    if line.startswith("Downloading "):
+        parts = line.split()
+        state["what"] = (parts[1].split("-")[0] if len(parts) > 1
+                         else "package")
+        state["since"] = time.time()
+        # Shown as well as recorded: where pip is too old for raw progress
+        # this line and the clock below are the whole account of a download.
+        size = re.search(r"\(([\d.]+\s*[kKMG]?B)\)", line)
+        return (f"Downloading {state['what']}"
+                + (f" — {size.group(1)}" if size else ""), None)
+    if line.startswith("Installing collected packages"):
+        # Nothing is printed again until this finishes, and for a 2.7 GB
+        # PyTorch that is minutes of writing thousands of files. Say which
+        # part is slow rather than leaving the last download's name up.
+        state["what"] = "Unpacking and installing — the slow part"
+        return ("Unpacking and installing — the slow part", None)
+    if line.startswith(("Building", "Preparing", "Getting requirements")):
+        state["what"] = line[:60]
+        return (line[:60], None)
+    if not line.startswith("Progress "):
+        return None
+    parts = line.split()
+    try:
+        got, total = int(parts[1]), int(parts[3])
+    except (IndexError, ValueError):
+        return None
+    what = state.get("what", "package")
+    elapsed = max(time.time() - state.get("since", time.time()), 0.001)
+    speed = got / elapsed
+    if total <= 0:
+        return (f"{what} — {got / 1e6:.0f} MB so far", None)
+    size = (f"{got / 1e9:.2f} of {total / 1e9:.2f} GB" if total >= 1e9
+            else f"{got / 1e6:.0f} of {total / 1e6:.0f} MB")
+    # Clamped here so every consumer gets a sane number: Progress.detail
+    # clamps its own, but a Task on the Engine page takes what it is given and
+    # would set a bar to a negative width.
+    pct = max(0.0, min(100.0, got * 100.0 / total))
+    head = f"{what} — {size} ({pct:.0f}%)"
+    # A rate measured over the first fraction of a second is nonsense — one
+    # chunk arriving at once reads as several hundred MB/s.
+    if elapsed < 1.5 or speed <= 0:
+        return (head, pct)
+    left = (total - got) / speed
+    return (f"{head} · {speed / 1e6:.1f} MB/s · "
+            f"{int(left // 60)}m {int(left % 60):02d}s left", pct)
+
+
+def pip_raw_progress(python: str) -> list[str]:
+    """`--progress-bar raw` if this pip offers it, asked rather than guessed.
+
+    A version number is the wrong test: pip 24.0 takes only on/off and exits
+    with "invalid choice: 'raw'" — passing it there does not merely lose the
+    percentage, it fails the install. pip's own help lists the choices, so
+    read them.
+    """
+    try:
+        out = _run([str(python), "-m", "pip", "install", "--help"], timeout=60)
+        block = re.search(r"--progress-bar[^\n]*\n(?:\s{6,}[^\n]*\n)*",
+                          out.stdout or "")
+        if block and re.search(r"\braw\b", block.group(0)):
+            return ["--progress-bar", "raw"]
+    except Exception:  # noqa: BLE001
+        pass
+    return []
+
+
+def pip_install(python: str, args: list[str], log, on_detail=None) -> None:
+    """Run pip, reporting progress through on_detail(text, pct).
+
+    pct is None when there is no number to show — pip says nothing measurable
+    while it resolves dependencies or unpacks a wheel.
+    """
+    cmd = [python, "-m", "pip", "install"] + args + pip_raw_progress(python)
     log("$ " + " ".join(cmd[:8]) + (" …" if len(cmd) > 8 else ""))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+                            stderr=subprocess.STDOUT, text=True, bufsize=0)
     assert proc.stdout
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line.startswith(("Collecting", "Downloading", "Installing",
-                            "Successfully", "ERROR", "Building",
-                            "WARNING: ")):
-            log(line[:200])
+
+    state: dict = {}
+    last = [0.0]
+    last_pct = [-1.0]
+    started = time.time()
+    stop = threading.Event()
+
+    def tick() -> None:
+        # Unpacking a 2.7 GB wheel prints nothing for minutes. Keep a clock
+        # running so the panel never looks like it has died.
+        while not stop.wait(5):
+            if not on_detail or time.time() - last[0] < 5:
+                continue
+            waited = int(time.time() - started)
+            on_detail(f"{state.get('what') or 'Working'} — "
+                      f"{waited // 60}m {waited % 60:02d}s so far", None)
+
+    if on_detail:
+        threading.Thread(target=tick, daemon=True).start()
+    try:
+        for line in stream_lines(proc.stdout):
+            shown = pip_progress(line, state)
+            # Throttled by time, except when the percentage actually moved: a
+            # fast mirror can deliver a whole wheel in three bursts, and time
+            # alone would swallow every one of them and leave the bar at zero.
+            moved = (shown and shown[1] is not None
+                     and abs(shown[1] - last_pct[0]) >= 1.0)
+            if shown and on_detail and (moved or time.time() - last[0] > 0.4):
+                last[0] = time.time()
+                if shown[1] is not None:
+                    last_pct[0] = shown[1]
+                on_detail(shown[0], shown[1])
+            elif line.startswith(("Collecting", "Downloading", "Installing",
+                                  "Successfully", "ERROR", "Building",
+                                  "WARNING: ")):
+                log(line[:200])
+    finally:
+        stop.set()
     if proc.wait() != 0:
         raise RuntimeError("pip install failed — see the log.")
 
@@ -634,36 +928,55 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
         if mode == "external":
             prog.finish("deps", "Handled by your own ComfyUI install")
         else:
-            target = portable_python(Path(cfg["comfy_dir"]))
+            comfy_dir = Path(cfg["comfy_dir"])
+            target = portable_python(comfy_dir)
             if target:
                 prog.log(f"Portable ComfyUI detected — installing into {target}")
+            elif not cfg.get("managed"):
+                # Someone else's install already runs on its own environment,
+                # with torch in it. Building a second one beside it would cost
+                # gigabytes and put the node's requirements where ComfyUI never
+                # looks, so the nodes would still fail to import.
+                found = existing_python(comfy_dir)
+                if not found:
+                    raise RuntimeError(
+                        f"Could not find the Python environment that the "
+                        f"ComfyUI at {comfy_dir} runs on, so the Qwen-TTS "
+                        "requirements have nowhere to go. Start that ComfyUI "
+                        "yourself and pick 'Connect to a ComfyUI I start "
+                        "myself', or let Script Builder install its own.")
+                target = Path(found)
+                prog.log(f"That install runs on {target} — using it as it is")
             else:
-                vpy = venv_python(Path(cfg["comfy_dir"]))
+                vpy = venv_python(comfy_dir)
                 if not vpy.exists():
                     prog.detail("deps", "Creating the Python environment…")
                     res = _run([py, "-m", "venv",
-                                str(Path(cfg["comfy_dir"]).parent / "comfy-venv")])
+                                str(comfy_dir.parent / "comfy-venv")])
                     if res.returncode != 0:
                         raise RuntimeError("venv creation failed: " +
                                            (res.stderr or res.stdout)[-600:])
                 target = vpy
+                say = lambda t, pct: prog.detail("deps", t, pct)  # noqa: E731
                 prog.detail("deps", "Installing PyTorch — the long one…")
-                pip_install(str(target), ["--upgrade", "pip", "wheel"], prog.log)
+                pip_install(str(target), ["--upgrade", "pip", "wheel"],
+                            prog.log, say)
                 args = ["torch", "torchaudio"]
                 idx = torch_index(cfg)
                 if idx:
                     args += ["--index-url", idx]
-                pip_install(str(target), args, prog.log)
+                pip_install(str(target), args, prog.log, say)
                 prog.detail("deps", "Installing ComfyUI requirements…")
                 pip_install(str(target),
-                            ["-r", str(Path(cfg["comfy_dir"]) / "requirements.txt")],
-                            prog.log)
+                            ["-r", str(comfy_dir / "requirements.txt")],
+                            prog.log, say)
             cfg["python"] = str(target)
             node_reqs = Path(cfg["comfy_dir"]) / "custom_nodes" / NODE_DIR_NAME \
                 / "requirements.txt"
             if node_reqs.exists():
                 prog.detail("deps", "Installing the Qwen-TTS requirements…")
-                pip_install(str(target), ["-r", str(node_reqs)], prog.log)
+                pip_install(str(target), ["-r", str(node_reqs)], prog.log,
+                            lambda t, pct: prog.detail("deps", t, pct))
             else:
                 prog.log("No requirements.txt in the node folder — skipping.")
             prog.finish("deps", f"Installed into {Path(cfg['python']).name}")
@@ -675,10 +988,17 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
             prog.finish("models", "Everything is already downloaded")
         else:
             prog.log(f"{len(todo)} model folder(s) to fetch")
-            for m in todo:
+            for i, m in enumerate(todo):
                 prog.detail("models", f"Downloading {m['repo']}…")
-                download_repo(cfg, m["repo"], models_dir,
-                              on_detail=lambda d, _p: prog.detail("models", d))
+                # download_repo has worked the percentage out all along; it
+                # used to be handed to a lambda that dropped it on the floor.
+                # Spread each folder across its share of the whole step, so
+                # the bar crosses the run once instead of restarting per repo.
+                span, base = 100.0 / len(todo), 100.0 * i / len(todo)
+                download_repo(
+                    cfg, m["repo"], models_dir,
+                    on_detail=lambda d, pct, _b=base, _s=span:
+                        prog.detail("models", d, _b + (pct or 0) * _s / 100.0))
             prog.finish("models", "Voices and models ready")
 
         # 6. launch --------------------------------------------------------- #
@@ -690,8 +1010,8 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
         elif comfy_online(url):
             prog.log("ComfyUI is already running")
         else:
-            port = int(url.rsplit(":", 1)[-1])
-            comfy.start(cfg["python"], Path(cfg["comfy_dir"]), port, prog)
+            comfy.start(cfg["python"], Path(cfg["comfy_dir"]),
+                        comfy_port(url), prog)
             prog.detail("launch", "Waiting for ComfyUI — the first start is slow…")
             if not wait_for_comfy(url, timeout=900):
                 raise RuntimeError("ComfyUI did not start within 15 minutes.\n"
