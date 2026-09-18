@@ -157,7 +157,8 @@ export async function boot({ log = console.log } = {}) {
     hf_endpoint: `http://127.0.0.1:${hfPort}`,
     hf_repo: 'Qwen/Qwen3-TTS-12Hz-0.6B-Base',
     want_clone: true, want_17b: false, want_voicedesign: true,
-    setup_complete: true,
+    want_moss: true, want_moss_8b: false, want_moss_design: true,
+    engine: 'qwen', setup_complete: true,
   }, null, 2));
 
   start('app', ['server.py'], {
@@ -183,7 +184,12 @@ export async function boot({ log = console.log } = {}) {
   for (const repo of ['Qwen/Qwen3-TTS-Tokenizer-12Hz',
                       'Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice',
                       'Qwen/Qwen3-TTS-12Hz-0.6B-Base',
-                      'Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign']) {
+                      'Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign',
+                      // MOSS lands in a different folder shape, so seeding it
+                      // here is also what proves the second layout works.
+                      'OpenMOSS-Team/MOSS-Audio-Tokenizer',
+                      'OpenMOSS-Team/MOSS-TTS-Local-Transformer',
+                      'OpenMOSS-Team/MOSS-VoiceGenerator']) {
     await post('/api/hf/download', { repo });
     for (let i = 0; i < 40; i++) {
       const tasks = await api('/api/tasks');
@@ -225,8 +231,12 @@ export async function boot({ log = console.log } = {}) {
     temperature: 0.9,
   });
 
+  // Through node:http like everything else here — see the note on request().
+  const comfyApi = async p => JSON.parse(
+    (await request(`http://127.0.0.1:${comfyPort}${p}`)).text);
+
   return {
-    base, api, post, runTake, dataDir, modelsDir,
+    base, api, post, runTake, comfyApi, dataDir, modelsDir,
     comfy: `http://127.0.0.1:${comfyPort}`,
     hf: `http://127.0.0.1:${hfPort}`,
     stop: teardown,

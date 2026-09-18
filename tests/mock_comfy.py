@@ -3,8 +3,9 @@ Builder end to end: /system_stats, /object_info, /prompt, /history, /view,
 /upload/image, /interrupt.
 
 The /object_info payload is transcribed from flybirdxx/ComfyUI-Qwen-TTS
-nodes.py at main, so the graphs Script Builder builds are validated against the
-same input names, enums and defaults the real node declares.
+nodes.py and richservo/comfyui-moss-tts nodes/*.py at main, so the graphs
+Script Builder builds are validated against the same input names, enums and
+defaults the real nodes declare.
 """
 import math, os, struct, sys, threading, time, uuid, wave
 from pathlib import Path
@@ -41,10 +42,38 @@ GEN = {
 }
 
 
-def _node(required, optional=None, ret="AUDIO"):
+def _node(required, optional=None, ret="AUDIO", category="Qwen3-TTS"):
     return {"input": {"required": required, "optional": optional or {}},
             "output": [ret], "output_name": [ret.lower()],
-            "category": "Qwen3-TTS"}
+            "category": category}
+
+
+# MOSS-TTS, from richservo/comfyui-moss-tts. Its display names are what the
+# loader's model_variant enum really offers — Script Builder picks the entry it
+# wants out of this list by substring, because the repo id each one maps to
+# lives in the node's constants and never reaches /object_info.
+MOSS_VARIANTS = ["MOSS-TTS (Delay 8B)", "MOSS-TTS (Local 1.7B)",
+                 "MOSS-TTSD v1.0", "MOSS-VoiceGenerator", "MOSS-SoundEffect"]
+MOSS_LANG = ["auto", "zh", "en", "ja", "ko"]
+MOSS_SEED = ["INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}]
+MOSS_HANDLES = {
+    "head_handle": ["FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1}],
+    "tail_handle": ["FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1}],
+}
+
+
+def _moss_sampling(temperature, top_p, top_k, penalty):
+    return {
+        "temperature": ["FLOAT", {"default": temperature, "min": 0.0,
+                                  "max": 5.0, "step": 0.01}],
+        "top_p": ["FLOAT", {"default": top_p, "min": 0.0, "max": 1.0,
+                            "step": 0.01}],
+        "top_k": ["INT", {"default": top_k, "min": 1, "max": 200, "step": 1}],
+        "repetition_penalty": ["FLOAT", {"default": penalty, "min": 0.5,
+                                         "max": 2.0, "step": 0.01}],
+        "max_new_tokens": ["INT", {"default": 4096, "min": 1, "max": 8192,
+                                   "step": 1}],
+    }
 
 
 OBJECT_INFO = {
@@ -90,7 +119,66 @@ OBJECT_INFO = {
         "format": [["flac", "wav", "mp3", "opus"], {"default": "flac"}]}},
         "output": [], "output_name": [], "category": "audio",
         "output_node": True},
+
+    "MossTTSModelLoader": _node(
+        {"model_variant": [MOSS_VARIANTS, {"default": MOSS_VARIANTS[0]}],
+         "local_model_path": ["STRING", {"default": ""}],
+         "codec_local_path": ["STRING", {"default": ""}]},
+        {}, "MOSS_TTS_PIPE", "audio/MOSS-TTS"),
+    "MossTTSGenerate": _node(
+        dict({"moss_pipe": ["MOSS_TTS_PIPE"],
+              "language": [MOSS_LANG, {"default": "auto"}],
+              "text": ["STRING", {"default": "", "multiline": True}],
+              "seed": MOSS_SEED,
+              "enable_duration_control": ["BOOLEAN", {"default": False}],
+              "duration_tokens": ["INT", {"default": 325, "min": 1,
+                                          "max": 4096, "step": 1}]},
+             **_moss_sampling(1.7, 0.8, 25, 1.0), **MOSS_HANDLES),
+        {"reference_audio": ["AUDIO"]}, "AUDIO", "audio/MOSS-TTS"),
+    "MossTTSVoiceDesign": _node(
+        dict({"moss_pipe": ["MOSS_TTS_PIPE"],
+              "language": [MOSS_LANG, {"default": "auto"}],
+              "text": ["STRING", {"default": "", "multiline": True}],
+              "instruction": ["STRING", {"default": "", "multiline": True}],
+              "seed": MOSS_SEED},
+             **_moss_sampling(1.5, 0.6, 50, 1.1), **MOSS_HANDLES),
+        {}, "AUDIO", "audio/MOSS-TTS"),
+    "MossTTSSoundEffect": _node(
+        dict({"moss_pipe": ["MOSS_TTS_PIPE"],
+              "ambient_sound": ["STRING", {"default": "", "multiline": True}],
+              "duration_seconds": ["FLOAT", {"default": 5.0, "min": 0.5,
+                                             "max": 60.0, "step": 0.5}],
+              "seed": MOSS_SEED},
+             **_moss_sampling(1.5, 0.6, 50, 1.2), **MOSS_HANDLES),
+        {}, "AUDIO", "audio/MOSS-TTS"),
+    "MossTTSDialogue": _node(
+        dict({"moss_pipe": ["MOSS_TTS_PIPE"],
+              "language": [MOSS_LANG, {"default": "auto"}],
+              "dialogue_text": ["STRING", {"default": "", "multiline": True}],
+              "speaker_count": ["INT", {"default": 2, "min": 2, "max": 2,
+                                        "step": 1}],
+              "normalize_text": ["BOOLEAN", {"default": True}],
+              "seed": MOSS_SEED},
+             **_moss_sampling(1.1, 0.9, 50, 1.1), **MOSS_HANDLES),
+        {"s1_reference_audio": ["AUDIO"],
+         "s1_prompt_text": ["STRING", {"default": "", "multiline": False}],
+         "s2_reference_audio": ["AUDIO"],
+         "s2_prompt_text": ["STRING", {"default": "", "multiline": False}]},
+        "AUDIO", "audio/MOSS-TTS"),
 }
+
+# Which node sets /object_info admits to having, so a test can reproduce an
+# engine whose nodes ComfyUI never loaded.
+HIDDEN = set()
+PREFIXES = {"qwen": ("CustomVoice", "VoiceClone", "VoiceDesign"),
+            "moss": ("Moss",)}
+
+
+def visible_info() -> dict:
+    if not HIDDEN:
+        return OBJECT_INFO
+    drop = tuple(pre for eid in HIDDEN for pre in PREFIXES.get(eid, ()))
+    return {k: v for k, v in OBJECT_INFO.items() if not k.startswith(drop)}
 
 
 def make_wav(path: Path, seconds: float, freq: float, rate=24000):
@@ -116,12 +204,23 @@ def object_info():
     OBJECT_INFO["LoadAudio"]["input"]["required"]["audio"][0] = \
         sorted(p.name for p in IN.glob("*")) or [""]
     LOG.append("GET /object_info")
-    return jsonify(OBJECT_INFO)
+    return jsonify(visible_info())
 
 
 @app.get("/object_info/<cls>")
 def object_info_one(cls):
-    return jsonify({cls: OBJECT_INFO[cls]} if cls in OBJECT_INFO else {})
+    info = visible_info()
+    return jsonify({cls: info[cls]} if cls in info else {})
+
+
+@app.post("/mock/hide/<engine>")
+def mock_hide(engine):
+    """Pretend ComfyUI never loaded that engine's nodes — pass 'none' to
+    put them all back."""
+    HIDDEN.clear()
+    if engine != "none":
+        HIDDEN.add(engine)
+    return jsonify({"hidden": sorted(HIDDEN)})
 
 
 def validate(prompt: dict):
@@ -222,6 +321,11 @@ def prompt():
             bits += f"(model={ins['model_choice']},seed={ins.get('seed')})"
         if "speaker" in ins:
             bits += f"[{ins['speaker']}]"
+        if "model_variant" in ins:
+            # Logged so a test can prove which MOSS checkpoint was asked for,
+            # and whether it was pointed at a local folder or left to fetch.
+            local = "local" if ins.get("local_model_path") else "hub"
+            bits += f"[{ins['model_variant']}|{local}]"
         shape.append(bits)
     LOG.append(f"QUEUE {' -> '.join(shape)} fmt={save_fmt} text={text[:34]!r}")
     threading.Thread(target=run_prompt, args=(pid, graph, text, save_fmt),

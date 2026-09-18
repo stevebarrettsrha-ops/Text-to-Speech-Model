@@ -33,6 +33,20 @@ REPOS = {
                                              ("model.safetensors", 1_500_000)],
     "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign": [("config.json", 1_100),
                                              ("model.safetensors", 1_600_000)],
+    # MOSS-TTS. These land in models/moss-tts/<Org>--<Name>, flattened, which
+    # is the layout its loader builds from repo_id.replace("/", "--") — the one
+    # place the two engines must not be treated alike.
+    "OpenMOSS-Team/MOSS-Audio-Tokenizer": [("config.json", 800),
+                                           ("model.safetensors", 300_000)],
+    "OpenMOSS-Team/MOSS-TTS-Local-Transformer": [
+        ("config.json", 1_300),
+        ("model.safetensors", 1_700_000),
+        ("tokenizer.json", 18_000),
+    ],
+    "OpenMOSS-Team/MOSS-TTS": [("config.json", 1_400),
+                               ("model.safetensors", 2_400_000)],
+    "OpenMOSS-Team/MOSS-VoiceGenerator": [("config.json", 1_400),
+                                          ("model.safetensors", 2_200_000)],
 }
 
 MODE = {"cut_after": 0, "ignore_range": False, "gated": "", "slow": 0.0}

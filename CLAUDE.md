@@ -150,6 +150,47 @@
    including an engine that is set up and merely needs restarting — which that
    dialog cannot do. `blocker(status)` returns the label and where to go.
 
+19. **Two engines, and everything that differs between them lives in
+   `ENGINES`.** Node repo, node folder, the file that proves it is installed,
+   the models sub-folder, the folder layout and the model list are one table
+   entry each, so a third engine is a row rather than a hunt through four files.
+   `engine_of(repo)` answers which engine a model belongs to from the tables
+   themselves, and every model entry `wanted_models` returns carries its own
+   `engine` because the caller downloading it has to know which layout to use.
+20. **The two engines do not agree on where a model folder goes, and neither
+   layout is a preference.** Qwen nests `models/qwen-tts/<Org>/<Name>`, which
+   is where its node searches. MOSS flattens to `models/moss-tts/<Org>--<Name>`,
+   because its loader builds that path from `repo_id.replace("/", "--")`. Put a
+   MOSS folder in the Qwen shape and the node does not see it — it downloads a
+   second copy of a model already on disk. Same trap in reverse in
+   `local_models`: walking the nested shape over a flat folder lists nothing,
+   so a downloaded MOSS model reads as never downloaded.
+21. **MOSS is two nodes, and `local_model_path` is only ever a folder that is
+   really there.** `MossTTSModelLoader` holds the weights and hands a
+   `MOSS_TTS_PIPE` to `MossTTSGenerate` or `MossTTSVoiceDesign`. Its
+   `_resolve_local_dir` treats that path as a path only when it can stat it and
+   as a HuggingFace repo id otherwise — so passing a folder that has not been
+   downloaded becomes `snapshot_download("D:\...\MOSS-TTS")`, which is not a
+   repo id and fails. `moss_dirs()` leaves absent folders out, "" reaches the
+   node, and the node fetches the model itself.
+22. **MOSS has no preset speakers, and the page says so rather than showing an
+   empty list.** There is no speaker enum on any MOSS node. `/api/voices`
+   returns an empty list with `fallback` False — not the Qwen fallback names,
+   which cannot be used — and the Voices card's first button reads *Own voice*:
+   with neither a clip nor a description the base model speaks in a voice of
+   its own, which changes with the seed.
+23. **A designed voice loads MOSS-VoiceGenerator whatever the picker says.**
+   `MossTTSVoiceDesign` warns and misbehaves on any other checkpoint. Same
+   reasoning as Qwen's VoiceDesign forcing 1.7B — and, as there, which enum
+   entry means that model is read off the node by substring
+   (`MOSS_VARIANT_HINTS`), because the repo id each display name maps to lives
+   in the node's constants and never reaches `/object_info`.
+24. **Readiness is per engine.** With MOSS selected, a missing Qwen folder is
+   not what stands between the script and a take; reporting it as one sends
+   people to download a model they are not about to use. `/api/status` takes an
+   `engine`, and `engine_nodes` reports both so the Engine panel can show a row
+   each.
+
 ## Why line-by-line, not DialogueInferenceNode
 
 `DialogueInferenceNode` takes a `RoleBankNode`, which takes prompts from
@@ -163,8 +204,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 72 unit tests, standard library only
-npm test                 # 57 checks driving the real page in headless Chromium
+npm run test:units       # 98 unit tests, standard library only
+npm test                 # 68 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script
@@ -172,8 +213,10 @@ kills all interactivity silently, and nothing else catches it.
 
 Nothing in the suite needs a GPU, a model download or the network.
 `tests/mock_comfy.py` answers for ComfyUI — its `/object_info` is transcribed
-from the real node, and it runs ComfyUI's own graph validation, so a graph that
-passes here passes there. `tests/mock_hf.py` answers for HuggingFace, with
+from both real node packs, and it runs ComfyUI's own graph validation, so a
+graph that passes here passes there. `POST /mock/hide/<engine>` drops one
+engine's classes, which is how "ComfyUI never loaded those nodes" is reproduced
+without breaking an install. `tests/mock_hf.py` answers for HuggingFace, with
 `Range` support and switches to cut a transfer off mid-file or ignore a resume.
 
 `SCRIPT_BUILDER_DATA` moves `data/`, and the suite points it at a temporary
@@ -194,9 +237,19 @@ hand on purpose: the gate has to keep running with nothing installed.
 ## Version floor
 
 Node classes used: `CustomVoiceNode`, `VoiceCloneNode`, `VoiceDesignNode`,
-`LoadAudio`, `SaveAudioAdvanced` (falls back to `SaveAudio`). Qwen3-TTS needs
-`transformers==4.57.3` or `>=5.0` — the Engine panel checks this explicitly
-because it is the usual cause of IMPORT FAILED.
+`LoadAudio`, `SaveAudioAdvanced` (falls back to `SaveAudio`), and from
+MOSS `MossTTSModelLoader`, `MossTTSGenerate`, `MossTTSVoiceDesign`. Qwen3-TTS
+needs `transformers==4.57.3` or `>=5.0` — the Engine panel checks this
+explicitly because it is the usual cause of IMPORT FAILED. MOSS asks only for
+`>=4.40.0`, so the Qwen floor is the binding one when both are installed into
+the same interpreter, which they are.
+
+MOSS models: `OpenMOSS-Team/MOSS-Audio-Tokenizer` and
+`OpenMOSS-Team/MOSS-TTS-Local-Transformer` are required; `MOSS-TTS` (Delay 8B)
+and `MOSS-VoiceGenerator` are optional and want ~18 GB of VRAM each. The repo
+ids in `MOSS_MODEL_REPOS` are the ones in the node's own
+`utils/constants.py` `MODEL_VARIANTS` — keep them in step with that file, the
+same way `MODEL_REPOS` tracks the Qwen node's `HF_MODEL_MAP`.
 
 Models: `Qwen/Qwen3-TTS-12Hz-0.6B-Base` and `Qwen/Qwen3-TTS-Tokenizer-12Hz` are
 required; the 1.7B Base and 1.7B VoiceDesign folders are optional. They live in
