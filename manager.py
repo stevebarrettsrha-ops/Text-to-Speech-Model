@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path
 
 import bootstrap
-from bootstrap import (APP_DIR, MODEL_REPOS, NODE_DIR_NAME, NODE_REPO,
+from bootstrap import (APP_DIR, NODE_DIR_NAME, NODE_REPO,
                        QWEN_SUBDIR, comfy_python, have_git, portable_python,
                        qwen_model_dir, venv_python)
 

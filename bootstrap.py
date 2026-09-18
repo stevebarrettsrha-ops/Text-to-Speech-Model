@@ -775,9 +775,6 @@ def pip_install(python: str, args: list[str], log, on_detail=None) -> None:
     """
     cmd = [python, "-m", "pip", "install"] + args + pip_raw_progress(python)
     log("$ " + " ".join(cmd[:8]) + (" …" if len(cmd) > 8 else ""))
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, bufsize=0)
-    assert proc.stdout
 
     state: dict = {}
     last = [0.0]
@@ -795,28 +792,44 @@ def pip_install(python: str, args: list[str], log, on_detail=None) -> None:
             on_detail(f"{state.get('what') or 'Working'} — "
                       f"{waited // 60}m {waited % 60:02d}s so far", None)
 
-    if on_detail:
-        threading.Thread(target=tick, daemon=True).start()
-    try:
-        for line in stream_lines(proc.stdout):
-            shown = pip_progress(line, state)
-            # Throttled by time, except when the percentage actually moved: a
-            # fast mirror can deliver a whole wheel in three bursts, and time
-            # alone would swallow every one of them and leave the bar at zero.
-            moved = (shown and shown[1] is not None
-                     and abs(shown[1] - last_pct[0]) >= 1.0)
-            if shown and on_detail and (moved or time.time() - last[0] > 0.4):
-                last[0] = time.time()
-                if shown[1] is not None:
-                    last_pct[0] = shown[1]
-                on_detail(shown[0], shown[1])
-            elif line.startswith(("Collecting", "Downloading", "Installing",
-                                  "Successfully", "ERROR", "Building",
-                                  "WARNING: ")):
-                log(line[:200])
-    finally:
-        stop.set()
-    if proc.wait() != 0:
+    # The context manager closes the pipe and reaps the child even if reading
+    # its output raises, which a bare Popen left to garbage collection did not.
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True,
+                          bufsize=0) as proc:
+        assert proc.stdout
+        if on_detail:
+            threading.Thread(target=tick, daemon=True).start()
+        try:
+            for line in stream_lines(proc.stdout):
+                # The log gets its line whatever the panel does. These two
+                # used to be an if/elif, so whether "Downloading torch
+                # (2.7 GB)" or "Installing collected packages" reached the log
+                # depended on whether the throttle below happened to swallow
+                # the panel update — and that log is what people are told to
+                # read when an install fails.
+                if line.startswith(("Collecting", "Downloading", "Installing",
+                                    "Successfully", "ERROR", "Building",
+                                    "WARNING: ")):
+                    log(line[:200])
+                shown = pip_progress(line, state)
+                if not (shown and on_detail):
+                    continue
+                # Throttled by time, except when the percentage actually
+                # moved: a fast mirror can deliver a whole wheel in three
+                # bursts, and time alone would swallow every one of them and
+                # leave the bar at zero.
+                moved = (shown[1] is not None
+                         and abs(shown[1] - last_pct[0]) >= 1.0)
+                if moved or time.time() - last[0] > 0.4:
+                    last[0] = time.time()
+                    if shown[1] is not None:
+                        last_pct[0] = shown[1]
+                    on_detail(shown[0], shown[1])
+        finally:
+            stop.set()
+        code = proc.wait()
+    if code != 0:
         raise RuntimeError("pip install failed — see the log.")
 
 

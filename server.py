@@ -48,26 +48,49 @@ takes_lock = threading.Lock()
 # --------------------------------------------------------------------------- #
 # takes
 # --------------------------------------------------------------------------- #
+def _read_takes() -> list[dict]:
+    """Callers hold takes_lock."""
+    if not TAKES_PATH.exists():
+        return []
+    try:
+        return json.loads(TAKES_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _write_takes(items: list[dict]) -> None:
+    """Callers hold takes_lock. Written beside the file and moved into place:
+    takes.json is the whole library, and a half-written one is an empty one."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = TAKES_PATH.with_name(TAKES_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(items, indent=2), encoding="utf-8")
+    tmp.replace(TAKES_PATH)
+
+
 def read_takes() -> list[dict]:
     with takes_lock:
-        if not TAKES_PATH.exists():
-            return []
-        try:
-            return json.loads(TAKES_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return []
+        return _read_takes()
 
 
 def write_takes(items: list[dict]) -> None:
     with takes_lock:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        TAKES_PATH.write_text(json.dumps(items, indent=2), encoding="utf-8")
+        _write_takes(items)
 
 
+# Read, change, write — all inside one hold of the lock. Taking it twice with
+# a gap in the middle meant two jobs finishing together each wrote the list
+# they had read before the other's take was in it, and the loser vanished from
+# the library while its audio stayed on disk for the orphan sweep to delete.
 def add_take(take: dict) -> None:
-    items = read_takes()
-    items.insert(0, take)
-    write_takes(items[:200])
+    with takes_lock:
+        items = _read_takes()
+        items.insert(0, take)
+        _write_takes(items[:200])
+
+
+def remove_take(take_id: str) -> None:
+    with takes_lock:
+        _write_takes([t for t in _read_takes() if t["id"] != take_id])
 
 
 def take_title(lines: list[dict]) -> str:
@@ -493,6 +516,14 @@ def api_speak():
     payload["lines"] = lines
     job_id = uuid.uuid4().hex[:12]
     with jobs_lock:
+        # Every other buffer in this app is capped; this one was not. A
+        # finished job keeps the whole take, and /api/jobs walks the lot once
+        # a second while a run is going, so a long session paid for takes
+        # nothing has looked at in hours.
+        finished = sorted((j for j in jobs.values() if j["status"] != "running"),
+                          key=lambda j: j["created"])
+        for old_job in finished[:-25]:
+            jobs.pop(old_job["id"], None)
         jobs[job_id] = {"id": job_id, "status": "running", "pct": 0,
                         "stage": "Starting", "created": time.time(),
                         "total": len(lines),
@@ -574,8 +605,7 @@ def api_take_line(take_id: str, index: int):
 
 @app.delete("/api/take/<take_id>")
 def api_take_delete(take_id: str):
-    items = read_takes()
-    write_takes([t for t in items if t["id"] != take_id])
+    remove_take(take_id)
     shutil.rmtree(TAKES_DIR / take_id, ignore_errors=True)
     return jsonify({"ok": True})
 
