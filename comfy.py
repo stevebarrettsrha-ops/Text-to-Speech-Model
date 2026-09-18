@@ -112,6 +112,27 @@ class ComfyClient:
     def has(self, class_type: str) -> bool:
         return class_type in self.schema()
 
+    def vram_mb(self) -> int:
+        """What ComfyUI says the card has, as a second opinion to nvidia-smi.
+
+        A portable ComfyUI carries its own CUDA and will happily report the
+        card on a machine where nvidia-smi is not on PATH — the same gap rule
+        5b is about. Bytes here, megabytes out; 0 when nothing can be read.
+        """
+        try:
+            r = _reach(lambda: requests.get(f"{self.url}/system_stats",
+                                           timeout=10), self.url)
+            r.raise_for_status()
+            best = 0
+            for dev in (r.json().get("devices") or []):
+                total = dev.get("vram_total") or 0
+                if isinstance(total, (int, float)) and total > best:
+                    best = int(total)
+            # ComfyUI reports bytes; anything smaller is already megabytes.
+            return best // (1024 * 1024) if best > 1 << 20 else int(best)
+        except Exception:  # noqa: BLE001
+            return 0
+
     def node_inputs(self, class_type: str) -> dict:
         info = self.schema().get(class_type)
         if not info:

@@ -191,6 +191,52 @@
    `engine`, and `engine_nodes` reports both so the Engine panel can show a row
    each.
 
+27. **The card's memory is read, and nothing is offered that cannot be held.**
+   Every model entry carries a `vram_gb`, `nvidia_gpu()` reports `vram_mb`
+   (`--query-gpu=name,memory.total`), and `ComfyClient.vram_mb()` is the second
+   opinion for a portable ComfyUI that carries its own CUDA where nvidia-smi is
+   not on PATH — rule 5b's gap again. `fits_vram` returns **None** when the
+   card is unknown, and None is never treated as "too small": hiding models
+   because nvidia-smi was missing would be rule 5b in a new coat. The model
+   picker shows what will not fit and disables it, the Models page needs a
+   confirm before downloading it, and everything a first run fetches by default
+   is asserted to fit 8 GB.
+28. **The quantized 8B is checked, never assumed.** OpenMOSS do fit the 8B on
+   an 8 GB card, but through their own llama.cpp pipeline — Q4_K_M weights,
+   staged loading, numpy LM heads — not through this ComfyUI node. Two of the
+   five prerequisites cannot be downloaded at all: llama.cpp is compiled from
+   source, and the TensorRT engines are built against the card in front of you
+   ("we do **not** provide pre-built TensorRT engines"). So `GGUF_STEPS`
+   describes and `/api/moss/8b` reports; neither installs, and
+   `gguf_available()` looks the two HuggingFace repos up rather than taking
+   them on trust. A first launch that promised an 8B it could not deliver
+   would fail in the middle of someone's first take instead of here.
+
+29. **The dependency report cannot answer "does it work", so there is a
+   self-test.** Every row there can read ok while the first take still fails:
+   folders present but holding no weights, classes loaded from a version whose
+   inputs were renamed, a model larger than the card. `manager.selftest` runs
+   the whole path in order — engine answering, nodes loaded, folders whole,
+   graph builds, ComfyUI accepts it, audio comes back — and stops at the first
+   step that breaks, naming it. It **forces a fresh schema read**: the cache
+   lasts two minutes and the reason anyone presses Test is usually that
+   something just changed, so reading it once reported "nodes are loaded"
+   about a ComfyUI that had just been shown not to have them.
+29b. **Silence is a failure, and a byte count is not a test.** A clip of the
+   right length full of zeros decodes perfectly and plays nothing, which is
+   exactly what a model that loaded and generated nothing sounds like —
+   `_peak` catches it, and returns -1 rather than 0 for a width it cannot
+   measure so 24-bit audio is never called silent. The folder check looks for
+   weight **files**, not a size: the right floor for a tokenizer is not the
+   right floor for an 8B, and picking one number gets both wrong.
+29c. **The self-test reads ComfyUI's console over the run.** It is the only
+   way to see what the API never reports — a model reaching for HuggingFace
+   mid-generation because a processor could not find its codec locally, which
+   is live for MOSS: `codec_local_path` is only used for TTSD, so the Local
+   1.7B and VoiceGenerator resolve their audio tokenizer through
+   `AutoProcessor.from_pretrained` instead. Where someone else started
+   ComfyUI, that step reports skipped rather than passing on an empty tail.
+
 ## Why line-by-line, not DialogueInferenceNode
 
 `DialogueInferenceNode` takes a `RoleBankNode`, which takes prompts from
@@ -204,8 +250,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 98 unit tests, standard library only
-npm test                 # 68 checks driving the real page in headless Chromium
+npm run test:units       # 122 unit tests, standard library only
+npm test                 # 80 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script
@@ -244,12 +290,27 @@ explicitly because it is the usual cause of IMPORT FAILED. MOSS asks only for
 `>=4.40.0`, so the Qwen floor is the binding one when both are installed into
 the same interpreter, which they are.
 
-MOSS models: `OpenMOSS-Team/MOSS-Audio-Tokenizer` and
-`OpenMOSS-Team/MOSS-TTS-Local-Transformer` are required; `MOSS-TTS` (Delay 8B)
-and `MOSS-VoiceGenerator` are optional and want ~18 GB of VRAM each. The repo
-ids in `MOSS_MODEL_REPOS` are the ones in the node's own
+MOSS models: `OpenMOSS-Team/MOSS-Audio-Tokenizer`,
+`MOSS-TTS-Local-Transformer` (1.7B) and `MOSS-VoiceGenerator` (1.7B) are the
+default set and all three run on 8 GB; `MOSS-TTS` (8B) is the only optional
+one. The repo ids in `MOSS_MODEL_REPOS` are the ones in the node's own
 `utils/constants.py` `MODEL_VARIANTS` — keep them in step with that file, the
 same way `MODEL_REPOS` tracks the Qwen node's `HF_MODEL_MAP`.
+
+25. **Model sizes come from OpenMOSS's table, never from the ComfyUI node's
+   README.** That README lists MOSS-VoiceGenerator as "Delay 8B, ~18 GB",
+   conflating the architecture with the size — `MossTTSDelay` is the
+   architecture and OpenMOSS publishes VoiceGenerator at 1.7B. Believing it put
+   MOSS voice design behind a warning that it would not run on an 8 GB card
+   when it fits as easily as the base model does. Rule 3's reasoning again: the
+   upstream source is the truth, a downstream README is a copy that drifts.
+26. **The 8B is optional because of this node, not because of the model.**
+   `MossTTSModelLoader` loads bf16 weights through
+   `AutoModel.from_pretrained`, so 8B wants ~18 GB here. OpenMOSS's own
+   llama.cpp path fits it on 8 GB with Q4_K_M weights, staged loading and a
+   quantized KV cache; the ComfyUI node implements no part of that — no GGUF,
+   no ONNX, no `low_memory`. Say which of the two is the limit when explaining
+   it, or the next person removes the tick and runs out of VRAM.
 
 Models: `Qwen/Qwen3-TTS-12Hz-0.6B-Base` and `Qwen/Qwen3-TTS-Tokenizer-12Hz` are
 required; the 1.7B Base and 1.7B VoiceDesign folders are optional. They live in

@@ -164,6 +164,17 @@ def wait_for_prompt(prompt_id: str, job_id: str, timeout: int = 900) -> list[dic
                              "ComfyUI console.")
 
 
+def gpu_vram(live=None) -> int:
+    """The card's memory in MB, nvidia-smi first, ComfyUI second, 0 if unknown."""
+    mb = bootstrap.nvidia_gpu().get("vram_mb") or 0
+    if not mb and live is not None:
+        try:
+            mb = live.vram_mb()
+        except Exception:  # noqa: BLE001
+            mb = 0
+    return mb
+
+
 def moss_dirs() -> dict:
     """repo id -> the folder it is really in, for the folders that are there.
 
@@ -381,12 +392,19 @@ def api_voices():
             # is built, and sending it back and forth through the browser would
             # be one more place for the two to drift apart.
             here = moss_dirs()
-            models = [{"value": m["repo"],
-                       "label": f"{m['repo'].split('/')[-1]} · {m['params']}"
-                                + ("" if m["repo"] in here else " (not downloaded)")}
-                      for m in bootstrap.ENGINES["moss"]["models"]
-                      if m["group"] != "moss_core"
-                      or "Tokenizer" not in m["repo"]]
+            vram = gpu_vram(client)
+            models = []
+            for m in bootstrap.ENGINES["moss"]["models"]:
+                if m["group"] == "moss_core" and "Tokenizer" in m["repo"]:
+                    continue
+                fits = bootstrap.fits_vram(m.get("vram_gb") or 0, vram)
+                label = f"{m['repo'].split('/')[-1]} · {m['params']}"
+                if fits is False:
+                    label += f" — needs ~{m['vram_gb']} GB, will not fit"
+                elif m["repo"] not in here:
+                    label += " (not downloaded)"
+                models.append({"value": m["repo"], "label": label,
+                               "fits": fits, "vram_gb": m.get("vram_gb")})
             return jsonify({
                 "engine": "moss", "speakers": [], "fallback": False,
                 "models": models,
@@ -510,6 +528,71 @@ def api_comfy_restart():
                                           run).view()})
 
 
+@app.post("/api/selftest/<engine>")
+def api_selftest(engine: str):
+    """Prove an engine end to end on this machine, or name the step that stops.
+
+    Every row of the dependency report can read ok while the first take still
+    fails — folders present and truncated, classes loaded from a version whose
+    inputs were renamed, weights larger than the card. One line of speech,
+    generated here, is the only answer that settles it.
+    """
+    if engine not in bootstrap.ENGINES:
+        return jsonify({"error": f"There is no '{engine}' engine."}), 400
+    if not bootstrap.engine_enabled(cfg, engine):
+        return jsonify({"error": f"{bootstrap.ENGINES[engine]['label']} is "
+                                 "turned off in Settings."}), 400
+    if manager.TASKS.running("selftest"):
+        return jsonify({"error": "A self-test is already running."}), 409
+
+    # Only our own ComfyUI's console is ours to read; someone else's belongs
+    # to them, and the test says so rather than reporting an empty tail as a
+    # clean run.
+    tail = comfy_proc.tail if comfy_proc.alive() else None
+
+    def run(task: manager.Task) -> None:
+        manager.selftest(cfg, client, engine, task, tail)
+
+    label = bootstrap.ENGINES[engine]["label"]
+    return jsonify({"ok": True,
+                    "task": manager.spawn("selftest", f"Test {label}", run,
+                                          {"engine": engine}).view()})
+
+
+@app.get("/api/moss/8b")
+def api_moss_8b():
+    """What running the MOSS 8B on a small card would actually take.
+
+    Reports; installs nothing. Two of the five prerequisites cannot be
+    downloaded at all — llama.cpp is compiled from source and the TensorRT
+    engines are built against the card in front of you — so anything that
+    claimed first launch could fetch its way to a working 8B would be lying.
+    The two HuggingFace repos are looked up rather than taken on trust.
+    """
+    vram = gpu_vram(client if comfy_online(cfg["comfy_url"]) else None)
+    entry = next((m for m in bootstrap.ENGINES["moss"]["models"]
+                  if m["repo"] == "OpenMOSS-Team/MOSS-TTS"), {})
+    body = {
+        "gpu": bootstrap.nvidia_gpu(),
+        "vram_mb": vram,
+        "through_comfyui": {
+            "fits": bootstrap.fits_vram(entry.get("vram_gb") or 18, vram),
+            "why": "The ComfyUI node loads bf16 weights with "
+                   "AutoModel.from_pretrained — no GGUF, no ONNX, no "
+                   "low-memory mode — so the 8B wants about 18 GB here.",
+        },
+        "through_llama_cpp": {
+            "fits_claim": "OpenMOSS measure a 5.6 GB peak with "
+                          "configs/llama_cpp/trt-8gb.yaml: Q4_K_M weights, "
+                          "staged loading, numpy LM heads.",
+            "steps": bootstrap.GGUF_STEPS,
+        },
+    }
+    if request.args.get("check") == "1":
+        body["weights"] = bootstrap.gguf_available(cfg)
+    return jsonify(body)
+
+
 @app.post("/api/config")
 def api_config():
     body = request.get_json(silent=True) or {}
@@ -533,7 +616,11 @@ def api_deps():
     # The GPU answer is cached — it costs a PowerShell query on Windows and
     # cannot change without a reboot. Recheck asks again anyway, because
     # installing the driver is exactly what someone does between two presses.
-    gpu = bootstrap.nvidia_gpu(refresh=request.args.get("fresh") == "1")
+    gpu = dict(bootstrap.nvidia_gpu(refresh=request.args.get("fresh") == "1"))
+    if not gpu.get("vram_mb") and live:
+        # nvidia-smi missing but ComfyUI running: it carries its own CUDA and
+        # knows the card, which is exactly the gap rule 5b is about.
+        gpu["vram_mb"] = live.vram_mb()
     return jsonify({"items": manager.dependencies(cfg, live),
                     "torch_index": cfg.get("torch_index", ""),
                     "gpu": gpu,
@@ -583,7 +670,11 @@ def api_hf_settings():
                     "token_set": bool(token),
                     "token_hint": ("…" + token[-4:]) if len(token) > 4 else "",
                     "repo": cfg.get("hf_repo") or bootstrap.MODEL_REPOS[0]["repo"],
-                    "curated": manager.curated(cfg),
+                    "curated": manager.curated(cfg, gpu_vram(
+                        client if comfy_online(cfg["comfy_url"]) else None)),
+                    "vram_mb": gpu_vram(
+                        client if comfy_online(cfg["comfy_url"]) else None),
+                    "gpu_name": bootstrap.nvidia_gpu().get("name", ""),
                     "models_dir": cfg.get("models_dir", "")})
 
 

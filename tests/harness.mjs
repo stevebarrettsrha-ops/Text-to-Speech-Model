@@ -232,8 +232,8 @@ export async function boot({ log = console.log } = {}) {
   });
 
   // Through node:http like everything else here — see the note on request().
-  const comfyApi = async p => JSON.parse(
-    (await request(`http://127.0.0.1:${comfyPort}${p}`)).text);
+  const comfyApi = async (p, opts) => JSON.parse(
+    (await request(`http://127.0.0.1:${comfyPort}${p}`, opts)).text);
 
   return {
     base, api, post, runTake, comfyApi, dataDir, modelsDir,

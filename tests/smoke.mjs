@@ -248,6 +248,68 @@ try {
   /* -------------------------------------------------------------- models */
   await page.click('.nav[data-view="models"]');
   await sleep(1400);
+  const settings = await app.api('/api/hf/settings');
+  is(settings.vram_mb === 8191,
+     'the models page knows what the card holds', String(settings.vram_mb));
+  const tooBig = settings.curated.filter(c => c.fits === false).map(c => c.repo);
+  is(tooBig.length === 1 && tooBig[0] === 'OpenMOSS-Team/MOSS-TTS',
+     'exactly the 8B is marked as more than this card can hold',
+     tooBig.join(', ') || 'none');
+  // Nothing a first run downloads may be something the card cannot then load.
+  const defaults = settings.curated.filter(c => c.role !== 'optional');
+  is(defaults.every(c => c.fits !== false),
+     'everything first launch fetches will actually run',
+     defaults.map(c => `${c.repo.split('/')[1]}:${c.fits}`).join(' '));
+
+  // The self-test is the answer to "does this engine actually work", so it
+  // has to run the whole way and it has to fail when the engine is broken.
+  const st = async engine => {
+    const r = await app.post(`/api/selftest/${engine}`, {});
+    for (let i = 0; i < 90; i++) {
+      await sleep(700);
+      const t = await app.api(`/api/tasks?id=${r.task.id}&since=99999`);
+      if (t.state !== 'running') return t;
+    }
+    return null;
+  };
+  const pass = await st('moss');
+  const names = (pass.meta.steps || []).map(x => `${x.id}:${x.state}`);
+  is(pass.state === 'done' && (pass.meta.steps || []).every(x => x.state !== 'fail'),
+     'the MOSS self-test runs the whole way', names.join(' '));
+  is((pass.meta.steps || []).some(x => x.id === 'audio' && /of audio/.test(x.detail)),
+     'and proves audio came back',
+     (pass.meta.steps || []).find(x => x.id === 'audio')?.detail);
+
+  await app.comfyApi('/mock/hide/moss', { method: 'POST' });
+  const broken = await st('moss');
+  const nodeStep = (broken.meta.steps || []).find(x => x.id === 'nodes');
+  is(broken.state === 'error' && nodeStep && nodeStep.state === 'fail',
+     'and fails at the right step when ComfyUI has not loaded the nodes',
+     nodeStep && nodeStep.state);
+  // The schema is cached for two minutes; a self-test reading that cache
+  // reported nodes as loaded straight after they were hidden.
+  is(!(broken.meta.steps || []).some(x => x.id === 'audio'),
+     'stopping early rather than carrying on to generate');
+
+  // Put the nodes back and run it again. This is not tidying up: the app
+  // caches ComfyUI's schema for two minutes, so the run that proves recovery
+  // is also the thing that clears the stale "they are gone" answer for
+  // everything after it.
+  await app.comfyApi('/mock/hide/none', { method: 'POST' });
+  const again = await st('moss');
+  is(again.state === 'done',
+     'and passes again once the nodes are back, without waiting out the cache',
+     (again.meta.steps || []).map(x => `${x.id}:${x.state}`).join(' '));
+
+  const eightB = await app.api('/api/moss/8b');
+  is(eightB.through_comfyui.fits === false
+       && /AutoModel\.from_pretrained/.test(eightB.through_comfyui.why),
+     'the 8B report names the node as the limit, not the model');
+  const notFetchable = eightB.through_llama_cpp.steps.filter(s => !s.obtainable);
+  is(notFetchable.length === 2,
+     'and admits two prerequisites cannot be downloaded at all',
+     notFetchable.map(s => s.id).join(', '));
+
   const curated = await page.$$eval('#curated-list .fitem',
     e => e.map(x => x.querySelector('span').textContent.split(' · ')[0]));
   // Six Qwen folders and four MOSS ones, each row saying which engine it is
@@ -281,9 +343,19 @@ try {
   is(await page.$eval('#rowAttn', e => e.hidden),
      'the attention picker is hidden on MOSS, which has none');
   const mossModels = await page.$$eval('#model-sel option',
-    e => e.map(x => x.value));
-  is(mossModels.some(v => v.startsWith('OpenMOSS-Team/')),
-     'the model picker carries MOSS repo ids', mossModels.join(', '));
+    e => e.map(x => ({ v: x.value, t: x.textContent, off: x.disabled })));
+  is(mossModels.some(m => m.v.startsWith('OpenMOSS-Team/')),
+     'the model picker carries MOSS repo ids',
+     mossModels.map(m => m.v).join(', '));
+  // The stand-in reports an 8 GB card. The 8B wants ~18 GB through these
+  // nodes, so it has to be visible and unselectable rather than quietly
+  // offered and then failing inside ComfyUI.
+  const big = mossModels.find(m => m.v === 'OpenMOSS-Team/MOSS-TTS');
+  is(big && big.off && /will not fit/i.test(big.t),
+     'a model too big for the card is shown but cannot be chosen',
+     big && big.t);
+  is(!(await page.$eval('#model-sel', e => e.selectedOptions[0].disabled)),
+     'and is never what the picker lands on');
   const mossStatus = await app.api('/api/status?engine=moss');
   is(mossStatus.ready === true && mossStatus.capabilities.preset === false,
      'MOSS reports ready with no presets',

@@ -9,7 +9,7 @@ Two engines, switched from the picker on the Create page:
 |---|---|---|
 | Preset speakers | nine, read off the node | none — see below |
 | Clone from a clip | yes | yes |
-| Voice from a description | yes, 1.7B | yes, needs the 8B VoiceGenerator |
+| Voice from a description | yes, 1.7B | yes, 1.7B VoiceGenerator |
 | Smallest useful model | 0.9B | 1.7B, about 5 GB of VRAM |
 
 The layout is the Script Builder file you already had: raw structure on the
@@ -53,10 +53,10 @@ Nothing goes into your system Python.
 
 - Python 3.10 or newer (on Debian and Ubuntu, `python3-venv` too)
 - Git
-- An NVIDIA GPU with 8 GB or more is comfortable for Qwen3-TTS and for MOSS's
-  1.7B. MOSS's Delay 8B models want about 18 GB and are left un-ticked by
-  default. Less works with **Free GPU memory after each run** switched on. CPU
-  works but is slow.
+- An NVIDIA GPU with 8 GB or more runs everything downloaded by default:
+  Qwen3-TTS, MOSS's 1.7B and MOSS-VoiceGenerator. Only the MOSS 8B is out of
+  reach through these nodes, and it is left un-ticked. Less works with **Free
+  GPU memory after each run** switched on. CPU works but is slow.
 
 ### Model folders
 
@@ -99,15 +99,75 @@ Pulled into `ComfyUI/models/moss-tts/`:
 |---|---|---|---|
 | `OpenMOSS-Team--MOSS-Audio-Tokenizer` | codec | — | Shared codec; every MOSS model needs it |
 | `OpenMOSS-Team--MOSS-TTS-Local-Transformer` | 1.7B | ~5 GB | Speech and cloning, and the fast one |
+| `OpenMOSS-Team--MOSS-VoiceGenerator` | 1.7B | ~5 GB | Voice from a description |
 | `OpenMOSS-Team--MOSS-TTS` | 8B | ~18 GB | Delay 8B — better, far slower |
-| `OpenMOSS-Team--MOSS-VoiceGenerator` | 8B | ~18 GB | Voice from a description |
 
-Only the codec and the 1.7B are downloaded by default. The other two are Delay
-8B models wanting roughly 18 GB of VRAM, which no 8 GB card will hold, and the
-node's own README calls the 1.7B "the only model fast enough for practical
-iterative use on a single consumer GPU" — so they are a tick on the setup sheet
-and a button on the Models page, not a default. Downloading tens of gigabytes
-you cannot run is worse than not having them.
+The codec, the 1.7B and VoiceGenerator are downloaded by default: all three run
+on an 8 GB card, and since MOSS has no preset speakers, describing a voice is
+one of only two ways to pin one down.
+
+**Sizes come from [OpenMOSS's own model table](https://github.com/OpenMOSS/MOSS-TTS#released-models),
+not from the ComfyUI node's README**, which lists MOSS-VoiceGenerator as
+"Delay 8B, ~18 GB". `MossTTSDelay` is the *architecture*; OpenMOSS publishes
+VoiceGenerator at 1.7B. Taking the node README at its word had voice design
+hidden behind a warning that it would not run on 8 GB, when it fits about as
+comfortably as the base model.
+
+The 8B is a tick rather than a default, and the reason is this node rather than
+the model: it loads bf16 weights through `AutoModel.from_pretrained`, so 8B
+really does want ~18 GB here. OpenMOSS's own llama.cpp path fits the 8B on an
+8 GB card with Q4_K_M weights, staged loading and a quantized KV cache
+(`configs/llama_cpp/trt-8gb.yaml`) — but the ComfyUI node implements none of
+it, and that path is not a download. `GET /api/moss/8b` lists what it would
+take, and two of the five cannot be fetched at any speed:
+
+| Prerequisite | Can it be downloaded? |
+|---|---|
+| llama.cpp compiled from source, plus the C bridge | **No** — a build, not a package |
+| `pip install -e ".[llama-cpp-onnx]"` from OpenMOSS/MOSS-TTS | Yes |
+| `OpenMOSS-Team/MOSS-TTS-GGUF` (Q4_K_M + 33 embeddings + 33 LM heads) | Yes |
+| `OpenMOSS-Team/MOSS-Audio-Tokenizer-ONNX` | Yes |
+| TensorRT engines | **No** — OpenMOSS ship none; they are built against your GPU |
+
+Add `?check=1` and the two HuggingFace repos are looked up rather than taken on
+trust. Nothing in first launch assumes any of this is present.
+
+### Does it actually work?
+
+The Engine page has **Test Qwen3-TTS** and **Test MOSS-TTS**. Each generates one
+line on your own machine and reports every step:
+
+```
+ok    ComfyUI is answering                 http://127.0.0.1:8188
+ok    MOSS-TTS nodes are loaded
+ok    Model folders are on disk            MOSS-Audio-Tokenizer 1.1 GB · MOSS-TTS-Local-Transformer 3.4 GB
+ok    A graph can be built for it          MossTTSModelLoader → MossTTSGenerate → SaveAudioAdvanced
+ok    ComfyUI accepts the graph            prompt 0620e2bc
+ok    Speech comes back                    4.2s of audio, 24000 Hz, mono · 31s to generate · peak 62%
+warn  Ran without reaching for the network ComfyUI fetched something while generating…
+```
+
+It stops at the first step that breaks and names it, which is the difference
+between "it does not work" and "the weights in that folder never finished
+downloading". Silence counts as a failure: a clip of the right length full of
+zeros decodes perfectly and plays nothing.
+
+The last step is worth watching on MOSS. The node only passes `codec_local_path`
+to the TTSD model, so the 1.7B and VoiceGenerator resolve their audio tokenizer
+through `AutoProcessor.from_pretrained` — if that reaches HuggingFace during
+generation, this is where you will see it.
+
+### Will it run on this card?
+
+Every model carries a VRAM figure, and the app reads what the card actually
+has — `nvidia-smi --query-gpu=memory.total`, or ComfyUI's `/system_stats` when
+nvidia-smi is not on PATH. A model larger than the card is shown but greyed in
+the picker, and the Models page asks before downloading it. On an 8 GB card
+everything fetched by default runs: Qwen3-TTS in full, MOSS speech, MOSS
+cloning and MOSS voice design. Only the MOSS 8B is out of reach.
+
+Where the card cannot be read at all, nothing is hidden — an unknown card is
+not assumed to be a small one.
 
 The repo names come from the nodes' own source — `HF_MODEL_MAP` for Qwen,
 `utils/constants.py` for MOSS — not from either README, which list fewer.
@@ -244,9 +304,9 @@ run without touching the first one's takes.
 
 ```bash
 node tests/check.mjs     # everything compiles and the inline script parses
-npm run test:units       # 98 unit tests, standard library only
+npm run test:units       # 122 unit tests, standard library only
 npm install && npx playwright install chromium
-npm test                 # 68 checks driving the real page in headless Chromium
+npm test                 # 80 checks driving the real page in headless Chromium
 ```
 
 None of it needs a GPU, a model download or the network: `tests/mock_comfy.py`

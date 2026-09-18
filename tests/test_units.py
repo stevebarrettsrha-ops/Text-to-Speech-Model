@@ -623,11 +623,12 @@ class GpuDetection(unittest.TestCase):
             self.assertTrue(bootstrap._smi_candidates())
 
     def test_a_card_that_answers_is_a_card_with_a_driver(self):
-        done = subprocess.CompletedProcess([], 0, "NVIDIA GeForce RTX 4060\n", "")
+        done = subprocess.CompletedProcess([], 0,
+                                           "NVIDIA GeForce RTX 4060, 8188\n", "")
         with mock.patch.object(bootstrap, "_run", return_value=done):
             gpu = bootstrap.nvidia_gpu(refresh=True)
         self.assertEqual(gpu, {"name": "NVIDIA GeForce RTX 4060",
-                               "driver": True})
+                               "driver": True, "vram_mb": 8188})
 
     def test_a_card_with_no_driver_is_still_a_card(self):
         with mock.patch.object(bootstrap, "_run",
@@ -922,6 +923,26 @@ class NodesNotLoaded(unittest.TestCase):
         self.assertEqual(rows.get("node"), "Qwen3-TTS nodes")
         self.assertEqual(rows.get("node_moss"), "MOSS-TTS nodes")
 
+    def test_a_comfyui_we_do_not_own_is_not_reported_as_missing(self):
+        # "Connect to a ComfyUI I start myself" never records a comfy_dir, so
+        # the folder check finds nothing — and both node rows read "missing",
+        # with an Install button, in front of someone whose engine was working
+        # perfectly and whose pill said Engine ready. The running schema is the
+        # better witness: if the classes are loaded, they are installed.
+        items = manager.dependencies({"models_dir": self.cfg["models_dir"],
+                                      "comfy_url": "http://127.0.0.1:1"},
+                                     self.Engine(True))
+        rows = {i["id"]: i for i in items if i["id"] in ("node", "node_moss")}
+        self.assertEqual({r["state"] for r in rows.values()}, {"ok"})
+        self.assertTrue(all(r["action"] is None for r in rows.values()))
+        self.assertIn("ComfyUI you are running", rows["node"]["detail"])
+
+    def test_with_no_folder_and_no_engine_they_really_are_missing(self):
+        items = manager.dependencies({"models_dir": self.cfg["models_dir"],
+                                      "comfy_url": "http://127.0.0.1:1"}, None)
+        rows = {i["id"]: i for i in items if i["id"] in ("node", "node_moss")}
+        self.assertEqual({r["state"] for r in rows.values()}, {"missing"})
+
     def test_an_engine_turned_off_is_not_reported_as_missing(self):
         items = manager.dependencies(dict(self.cfg, want_moss=False),
                                      self.Engine(True))
@@ -1019,15 +1040,35 @@ class WhichModelsAreWanted(unittest.TestCase):
         self.assertIn("OpenMOSS-Team/MOSS-TTS-Local-Transformer",
                       [m["repo"] for m in got])
 
-    def test_the_delay_8b_models_are_a_tick_not_a_default(self):
-        # ~18 GB of VRAM each. Downloading tens of gigabytes someone cannot
-        # run is worse than not having them.
+    def test_only_the_real_8b_is_held_back(self):
+        # ~18 GB through this node, which loads bf16 weights. Downloading tens
+        # of gigabytes someone cannot run is worse than not having them.
         cfg = dict(bootstrap.DEFAULT_CONFIG)
         repos = [m["repo"] for m in bootstrap.wanted_models(cfg)]
         self.assertNotIn("OpenMOSS-Team/MOSS-TTS", repos)
         cfg["want_moss_8b"] = True
         self.assertIn("OpenMOSS-Team/MOSS-TTS",
                       [m["repo"] for m in bootstrap.wanted_models(cfg)])
+
+    def test_voice_design_is_not_mistaken_for_an_8b(self):
+        # The ComfyUI node's README calls MOSS-VoiceGenerator "Delay 8B,
+        # ~18 GB", conflating the architecture with the size. OpenMOSS
+        # publishes it at 1.7B, and believing the node README hid MOSS voice
+        # design behind a warning that it would not run on an 8 GB card.
+        entry = next(m for m in bootstrap.MOSS_MODEL_REPOS
+                     if m["repo"] == "OpenMOSS-Team/MOSS-VoiceGenerator")
+        self.assertEqual(entry["params"], "1.7B")
+        self.assertNotIn("18 GB", entry["note"])
+        # …and because it fits, it is fetched by default: MOSS has no preset
+        # speakers, so a description is one of only two ways to pin a voice.
+        self.assertIn("OpenMOSS-Team/MOSS-VoiceGenerator",
+                      [m["repo"] for m in
+                       bootstrap.wanted_models(dict(bootstrap.DEFAULT_CONFIG))])
+
+    def test_everything_fetched_by_default_fits_an_8gb_card(self):
+        for m in bootstrap.wanted_models(dict(bootstrap.DEFAULT_CONFIG)):
+            with self.subTest(repo=m["repo"]):
+                self.assertNotIn("8B", m["params"])
 
     def test_turning_moss_off_leaves_only_qwen(self):
         cfg = dict(bootstrap.DEFAULT_CONFIG, want_moss=False)
@@ -1194,6 +1235,237 @@ class BothEnginesOnDisk(unittest.TestCase):
         self.assertEqual(moss["role"], "required")
         self.assertTrue(moss["installed"])
         self.assertEqual(moss["engine_label"], "MOSS-TTS")
+
+
+class VramGuard(unittest.TestCase):
+    """A model that cannot be held by the card is worth saying so about before
+    the download, not after ComfyUI runs out of memory mid-take."""
+
+    def test_the_card_reports_its_memory(self):
+        done = subprocess.CompletedProcess(
+            [], 0, "NVIDIA GeForce RTX 4060, 8188\n", "")
+        with mock.patch.object(bootstrap, "_run", return_value=done):
+            gpu = bootstrap.nvidia_gpu(refresh=True)
+        self.assertEqual(gpu["name"], "NVIDIA GeForce RTX 4060")
+        self.assertEqual(gpu["vram_mb"], 8188)
+        bootstrap._GPU.clear()
+
+    def test_a_card_that_answers_without_a_number_is_still_a_card(self):
+        done = subprocess.CompletedProcess([], 0, "NVIDIA GeForce RTX 4060\n", "")
+        with mock.patch.object(bootstrap, "_run", return_value=done):
+            gpu = bootstrap.nvidia_gpu(refresh=True)
+        self.assertEqual(gpu["name"], "NVIDIA GeForce RTX 4060")
+        self.assertEqual(gpu["vram_mb"], 0)
+        bootstrap._GPU.clear()
+
+    def test_an_8gb_card_holds_the_1_7b_models_and_not_the_8b(self):
+        eight = 8188
+        for repo, want in (("OpenMOSS-Team/MOSS-TTS-Local-Transformer", True),
+                           ("OpenMOSS-Team/MOSS-VoiceGenerator", True),
+                           ("OpenMOSS-Team/MOSS-TTS", False)):
+            entry = next(m for m in bootstrap.MOSS_MODEL_REPOS
+                         if m["repo"] == repo)
+            with self.subTest(repo=repo):
+                self.assertIs(bootstrap.fits_vram(entry["vram_gb"], eight), want)
+
+    def test_an_unknown_card_is_never_treated_as_a_small_one(self):
+        # nvidia-smi missing is rule 5b's failure, and answering "will not fit"
+        # there would hide every model from someone who has the memory.
+        self.assertIsNone(bootstrap.fits_vram(18, 0))
+        rows = manager.curated({"models_dir": ""}, vram_mb=0)
+        self.assertTrue(all(r["fits"] is None for r in rows))
+
+    def test_the_models_page_marks_what_will_not_load(self):
+        rows = {r["repo"]: r for r in manager.curated({"models_dir": ""},
+                                                      vram_mb=8188)}
+        self.assertFalse(rows["OpenMOSS-Team/MOSS-TTS"]["fits"])
+        self.assertTrue(rows["OpenMOSS-Team/MOSS-VoiceGenerator"]["fits"])
+        self.assertTrue(rows["Qwen/Qwen3-TTS-12Hz-0.6B-Base"]["fits"])
+
+    def test_every_model_carries_a_figure_to_judge_it_by(self):
+        for eng in bootstrap.ENGINES.values():
+            for m in eng["models"]:
+                with self.subTest(repo=m["repo"]):
+                    self.assertIsInstance(m.get("vram_gb"), int)
+                    self.assertGreater(m["vram_gb"], 0)
+
+    def test_comfyui_answers_for_the_card_when_nvidia_smi_cannot(self):
+        # A portable ComfyUI carries its own CUDA and knows the card on a
+        # machine where nvidia-smi is not on PATH.
+        c = client_for({})
+        payload = {"devices": [{"name": "cuda:0", "vram_total": 8588886016}]}
+
+        class Reply:
+            status_code = 200
+
+            @staticmethod
+            def raise_for_status():
+                pass
+
+            @staticmethod
+            def json():
+                return payload
+
+        with mock.patch.object(comfy.requests, "get", return_value=Reply):
+            self.assertEqual(c.vram_mb(), 8191)
+
+    def test_an_engine_that_will_not_answer_reports_no_memory(self):
+        c = client_for({})
+        with mock.patch.object(comfy.requests, "get",
+                               side_effect=comfy.requests.ConnectionError()):
+            self.assertEqual(c.vram_mb(), 0)
+
+
+
+class Moss8bPrerequisites(unittest.TestCase):
+    """The quantized 8B is never assumed to be sitting on HuggingFace waiting,
+    and two of its prerequisites cannot be downloaded at all."""
+
+    def test_two_steps_are_not_downloadable_and_say_so(self):
+        steps = {s["id"]: s for s in bootstrap.GGUF_STEPS}
+        # llama.cpp is compiled from source; the TensorRT engines are built
+        # against the card in front of you. A first run that promised to fetch
+        # its way to a working 8B would be lying.
+        self.assertFalse(steps["toolchain"]["obtainable"])
+        self.assertFalse(steps["engines"]["obtainable"])
+        self.assertTrue(steps["weights"]["obtainable"])
+
+    def test_the_repos_are_looked_up_not_taken_on_trust(self):
+        seen = []
+
+        def tree(_cfg, repo, *a, **kw):
+            seen.append(repo)
+            return [{"path": "MOSS_TTS_Q4_K_M.gguf", "size": 1}]
+
+        with mock.patch.object(bootstrap, "hf_tree", tree):
+            out = bootstrap.gguf_available({})
+        self.assertEqual(sorted(seen), sorted([bootstrap.GGUF_REPO,
+                                               bootstrap.GGUF_TOKENIZER_REPO]))
+        self.assertTrue(out["ready"])
+
+    def test_a_repo_that_is_not_there_is_reported_not_guessed(self):
+        with mock.patch.object(bootstrap, "hf_tree",
+                               side_effect=RuntimeError("404 not found")):
+            out = bootstrap.gguf_available({})
+        self.assertFalse(out["ready"])
+        for repo in out["repos"].values():
+            self.assertFalse(repo["found"])
+            self.assertIn("404", repo["why"])
+
+    def test_the_8b_is_not_in_the_default_download_set(self):
+        # Whatever the llama.cpp path can do, first launch fetches nothing it
+        # cannot then load through the engine it actually ships with.
+        repos = [m["repo"] for m in
+                 bootstrap.wanted_models(dict(bootstrap.DEFAULT_CONFIG))]
+        self.assertNotIn("OpenMOSS-Team/MOSS-TTS", repos)
+        self.assertNotIn(bootstrap.GGUF_REPO, repos)
+
+
+
+class SelfTestSteps(unittest.TestCase):
+    """A self-test that only ever reports success is worth nothing, so each
+    way it can stop has its own check."""
+
+    class Engine:
+        def __init__(self, ready=True, speakers=("Eric",)):
+            self.ready, self._speakers = ready, list(speakers)
+
+        def schema(self, force=False):
+            return {}
+
+        def engine_ready(self, _engine):
+            return self.ready
+
+        def speakers(self):
+            return self._speakers
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="sb-self-"))
+        self.models = self.root / "models"
+        self.models.mkdir()
+        self.cfg = {"comfy_url": "http://127.0.0.1:1",
+                    "models_dir": str(self.models), "comfy_dir": "",
+                    "want_moss": True, "want_clone": False,
+                    "want_moss_design": False}
+        self.task = manager.Task("selftest", "Test")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _seed(self, engine, weights=True):
+        for m in bootstrap.wanted_models(self.cfg, engine):
+            d = bootstrap.model_dir(self.models, m["repo"], engine)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "config.json").write_text("{}")
+            if weights:
+                (d / "model.safetensors").write_bytes(b"\0" * 32)
+
+    def _run(self, engine="moss", online=True, client=None):
+        with mock.patch.object(bootstrap, "comfy_online", return_value=online):
+            try:
+                manager.selftest(self.cfg, client or self.Engine(), engine,
+                                 self.task)
+            except Exception:  # noqa: BLE001
+                pass
+        return {s["id"]: s for s in self.task.meta.get("steps", [])}
+
+    def test_a_dead_engine_stops_at_the_first_step(self):
+        steps = self._run(online=False)
+        self.assertEqual(steps["engine"]["state"], "fail")
+        self.assertNotIn("nodes", steps)
+
+    def test_nodes_that_are_not_loaded_stop_before_the_models(self):
+        steps = self._run(client=self.Engine(ready=False))
+        self.assertEqual(steps["engine"]["state"], "ok")
+        self.assertEqual(steps["nodes"]["state"], "fail")
+        self.assertNotIn("models", steps)
+
+    def test_the_node_list_is_read_fresh_not_from_the_cache(self):
+        # The schema is cached for two minutes, and the reason anyone presses
+        # Test is usually that something just changed. Reading the cache once
+        # reported "nodes are loaded" about a ComfyUI that had just been shown
+        # not to have them.
+        forced = []
+
+        class Watcher(self.Engine):
+            def schema(self, force=False):
+                forced.append(force)
+                return {}
+
+        self._seed("moss")
+        self._run(client=Watcher())
+        self.assertIn(True, forced)
+
+    def test_a_folder_with_no_weights_in_it_is_caught(self):
+        self._seed("moss", weights=False)
+        steps = self._run()
+        self.assertEqual(steps["models"]["state"], "fail")
+        self.assertIn("no weights", steps["models"]["detail"])
+        self.assertNotIn("graph", steps)
+
+    def test_a_missing_folder_is_named(self):
+        steps = self._run()
+        self.assertEqual(steps["models"]["state"], "fail")
+        self.assertIn("MOSS-TTS-Local-Transformer", steps["models"]["detail"])
+
+    def test_silence_counts_as_a_failure(self):
+        # The right number of frames, all zeros: it decodes perfectly and
+        # plays nothing, which is what a model that generated nothing sounds
+        # like.
+        self.assertEqual(manager._peak(b"\x00\x00" * 200, 2), 0.0)
+        loud = struct.pack("<h", 20000) * 200
+        self.assertGreater(manager._peak(loud, 2), 0.5)
+
+    def test_a_format_it_cannot_measure_is_not_called_silent(self):
+        # 24-bit or float audio is not a failure, it is simply not something
+        # this check can weigh — and -1 keeps it out of the silence branch.
+        self.assertEqual(manager._peak(b"\x00\x00\x00" * 60, 3), -1.0)
+        self.assertEqual(manager._peak(b"", 2), -1.0)
+
+    def test_weight_suffixes_cover_both_engines_shapes(self):
+        for suffix in (".safetensors", ".bin", ".gguf", ".onnx", ".npy"):
+            with self.subTest(suffix=suffix):
+                self.assertIn(suffix, manager.WEIGHT_SUFFIXES)
 
 
 if __name__ == "__main__":

@@ -292,6 +292,9 @@
   .state.warn,.state.wanted{color:#ffd693;border-color:rgba(255,176,32,.36);
          background:rgba(255,176,32,.08)}
   .state.off{color:var(--dim);border-style:dashed}
+  .state.fail{color:#ffa8a8;border-color:rgba(255,90,90,.36);background:rgba(255,90,90,.08)}
+  .state.skip{color:var(--dim)}
+  .state.running{color:#cbb6ff;border-color:rgba(150,110,255,.4)}
   .log{background:#08080a;border:1px solid var(--line-soft);border-radius:11px;padding:12px;
        font-family:ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace;font-size:11.5px;
        color:#9a9aa4;height:210px;overflow-y:auto;white-space:pre-wrap;line-height:1.55}
@@ -514,9 +517,9 @@
     <section class="page" data-page="models" hidden>
       <div class="panel">
         <h2>HuggingFace</h2>
-        <p class="sub">Voices come from the Qwen3-TTS collection and land in
-          ComfyUI/models/qwen-tts/Qwen/. A token is only needed for a gated repo; point
-          at a mirror if huggingface.co is slow where you are.</p>
+        <p class="sub">Voices come from the Qwen3-TTS and MOSS-TTS collections. A token
+          is only needed for a gated repo; point at a mirror if huggingface.co is slow
+          where you are.</p>
         <div class="frow">
           <input type="password" id="hf-token" placeholder="Access token (gated repos only)">
           <input type="text" id="hf-endpoint" placeholder="https://huggingface.co">
@@ -525,10 +528,11 @@
         <p class="note" id="hf-token-note"></p>
       </div>
       <div class="panel">
-        <h2>The Qwen3-TTS collection</h2>
-        <p class="sub">CustomVoice carries the preset speakers, Base does voice cloning,
-          VoiceDesign builds a voice from a description, and the tokenizer is needed by
-          all of them.</p>
+        <h2>Voices and models</h2>
+        <p class="sub">On Qwen3-TTS, CustomVoice carries the preset speakers, Base does
+          voice cloning and VoiceDesign builds a voice from a description. MOSS-TTS has
+          no presets: the 1.7B does speech and cloning, VoiceGenerator does descriptions.
+          Each engine needs its own tokenizer.</p>
         <div class="flist" id="curated-list"></div>
       </div>
       <div class="panel">
@@ -557,9 +561,15 @@
         <p class="sub">Install anything marked missing. It all runs from here — no command
           prompt, no manual downloads.</p>
         <div class="flist" id="dep-list"></div>
+        <div id="selftest" hidden style="margin-top:12px">
+          <div class="rowhead" style="margin:0 0 8px" id="selftest-title">Self-test</div>
+          <div class="flist" id="selftest-list"></div>
+        </div>
         <div class="rowbtn">
           <button class="btn" id="btnRecheck">Recheck</button>
           <button class="btn go" id="btnInstallAll">Install everything missing</button>
+          <button class="btn" id="btnTestQwen" title="Generate one line with Qwen3-TTS and report what happens">Test Qwen3-TTS</button>
+          <button class="btn" id="btnTestMoss" title="Generate one line with MOSS-TTS and report what happens">Test MOSS-TTS</button>
           <button class="btn" id="btnStartEngine">Start ComfyUI</button>
           <button class="btn" id="btnReRun">Run setup again</button>
         </div>
@@ -651,14 +661,14 @@
           <input type="checkbox" id="opt-17b"></div>
         <div class="switch"><label for="opt-moss">MOSS-TTS as a second engine</label>
           <input type="checkbox" id="opt-moss" checked></div>
-        <div class="switch"><label for="opt-moss-8b"
-          title="Delay 8B — about 18 GB of VRAM, and slow on one card">MOSS
-          Delay 8B (needs ~18 GB VRAM)</label>
-          <input type="checkbox" id="opt-moss-8b"></div>
         <div class="switch"><label for="opt-moss-design"
-          title="MOSS-VoiceGenerator is a Delay 8B model too">MOSS voice design
-          (needs ~18 GB VRAM)</label>
-          <input type="checkbox" id="opt-moss-design"></div>
+          title="MOSS-VoiceGenerator, 1.7B — about the same card as the base model">MOSS
+          voice design</label>
+          <input type="checkbox" id="opt-moss-design" checked></div>
+        <div class="switch"><label for="opt-moss-8b"
+          title="The 8B needs about 18 GB through these nodes, which load bf16 weights">MOSS
+          8B (needs ~18 GB VRAM)</label>
+          <input type="checkbox" id="opt-moss-8b"></div>
       </div>
       <div class="rowbtn">
         <button class="btn go" id="btnRunSetup">Start setup</button>
@@ -1061,7 +1071,7 @@ function renderSpeakerBody(n) {
       '" placeholder="A gentle female voice with a high pitch, speaking slowly">' +
       esc(s.instruct) + "</textarea>" +
       '<div class="note">' + (isMoss()
-        ? "Needs MOSS-VoiceGenerator — a Delay 8B model, so about 18 GB of VRAM. Tick it on the Models page."
+        ? "Needs MOSS-VoiceGenerator — 1.7B, the same size as the base model. One button on the Models page."
         : "Needs the 1.7B VoiceDesign model — one button on the Models page.") +
       "</div>";
     body.querySelector("[data-instruct]").addEventListener("input", function (e) {
@@ -1101,6 +1111,20 @@ async function loadVoices() {
   try {
     S.voices = await api("/api/voices?engine=" + encodeURIComponent(S.engine));
     fillSelect($("model-sel"), S.voices.models || [], "");
+    // A model the card cannot hold is shown but not selectable: seeing why it
+    // is greyed beats wondering where it went.
+    (S.voices.models || []).forEach(function (m) {
+      if (m && m.fits === false) {
+        var o = $("model-sel").querySelector('option[value="' + m.value + '"]');
+        if (o) o.disabled = true;
+      }
+    });
+    if ($("model-sel").selectedOptions[0] &&
+        $("model-sel").selectedOptions[0].disabled) {
+      var ok = Array.prototype.filter.call($("model-sel").options,
+        function (o) { return !o.disabled; })[0];
+      if (ok) $("model-sel").value = ok.value;
+    }
     fillSelect($("attn-sel"), S.voices.attentions || ["auto"], "auto");
     // MOSS has no attention picker on any of its nodes — it resolves flash
     // attention itself from the card. An empty select reading "auto" is fine;
@@ -1597,6 +1621,58 @@ async function installAllMissing() {
     toast("All set. Press Restart engine so ComfyUI loads the nodes.");
   } catch (e) { toast(e.message, true); }
 }
+async function runSelfTest(engine, btn) {
+  var box = $("selftest"), list = $("selftest-list");
+  var was = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "Testing…"; }
+  box.hidden = false;
+  list.innerHTML = '<div class="empty">Starting…</div>';
+  try {
+    var r = await api("/api/selftest/" + engine, { method: "POST" });
+    S.taskId = r.task.id; S.taskCursor = 0; $("task-log").textContent = "";
+    pollTasks();
+    var id = r.task.id, done = false;
+    while (!done) {
+      await new Promise(function (s) { setTimeout(s, 1200); });
+      var t = await api("/api/tasks?id=" + id + "&since=99999");
+      renderSelfTest(engine, t);
+      done = t.state !== "running";
+    }
+  } catch (e) {
+    list.innerHTML = '<div class="empty bad-text">' + esc(e.message) + "</div>";
+  }
+  if (btn) { btn.disabled = false; btn.textContent = was; }
+  loadDeps();
+}
+function renderSelfTest(engine, t) {
+  var steps = (t.meta && t.meta.steps) || [];
+  $("selftest-title").textContent = t.title +
+    (t.state === "running" ? " — running…"
+      : t.state === "done" ? " — it works"
+      : t.state === "cancelled" ? " — cancelled" : " — stopped");
+  var list = $("selftest-list");
+  list.innerHTML = "";
+  steps.forEach(function (s) {
+    var el = document.createElement("div");
+    el.className = "fitem";
+    el.innerHTML = '<div class="n"><b>' + esc(s.label) + "</b><span>" +
+      esc(s.detail || "") + '</span></div><div class="right">' +
+      '<span class="state ' + esc(s.state) + '">' + esc(s.state) +
+      "</span></div>";
+    list.appendChild(el);
+  });
+  // A task that stopped without a failing step failed before the first one.
+  if (t.state === "error" && !steps.some(function (s) { return s.state === "fail"; })) {
+    var el = document.createElement("div");
+    el.className = "fitem";
+    el.innerHTML = '<div class="n"><b>Stopped</b><span>' + esc(t.detail || "") +
+      '</span></div><div class="right"><span class="state fail">fail</span></div>';
+    list.appendChild(el);
+  }
+  if (!steps.length && t.state === "running") {
+    list.innerHTML = '<div class="empty">' + esc(t.detail || "Working…") + "</div>";
+  }
+}
 async function restartEngine() {
   try {
     var r = await api("/api/comfy/restart", { method: "POST" });
@@ -1687,27 +1763,44 @@ async function loadHf() {
     // The two layouts are not the same shape and saying so here is cheaper
     // than someone moving a MOSS folder into the Qwen tree and wondering why
     // the node downloads it again.
-    $("models-dir-note").textContent = s.models_dir
+    $("models-dir-note").textContent = (s.models_dir
       ? "Stored in " + s.models_dir + "/qwen-tts/Qwen/ and " +
         s.models_dir + "/moss-tts/"
-      : "No models folder set yet — run setup first.";
+      : "No models folder set yet — run setup first.") +
+      (s.vram_mb ? "  ·  " + (s.gpu_name || "This card") + " has " +
+        (s.vram_mb / 1024).toFixed(1) + " GB of VRAM, which is what the sizes "
+        + "below are measured against." : "");
     var box = $("curated-list");
     box.innerHTML = "";
     s.curated.forEach(function (c) {
       var el = document.createElement("div");
       el.className = "fitem";
+      // fits === false means this card cannot run it; null means we could not
+      // read the card, and an unknown card is not a small one.
+      var wont = c.fits === false;
       el.innerHTML = '<div class="n"><b>' + esc(c.repo.split("/")[1]) + "</b><span>" +
         esc(c.engine_label || "") + " · " + esc(c.note) + " · " + esc(c.params) +
+        (wont ? ' · <b style="color:var(--err)">needs ~' + c.vram_gb +
+                ' GB of VRAM — more than this card has</b>' : "") +
         '</span></div><div class="right">' +
         '<span class="state ' + (c.installed ? "ok"
+          : wont ? "warn"
           : c.role === "required" ? "missing" : c.role === "wanted" ? "wanted" : "") +
-        '">' + (c.installed ? "installed" : esc(c.role)) + "</span></div>";
+        '">' + (c.installed ? "installed" : wont ? "too big" : esc(c.role)) +
+        "</span></div>";
       var right = el.querySelector(".right");
       if (c.installed) {
         right.appendChild(mkBtn("Delete", function () { deleteModel(c.repo); }));
       } else {
-        var b = mkBtn("Download", function () { startDownload(c.repo, b); });
-        if (c.role !== "optional") b.className = "btn thin go";
+        var b = mkBtn("Download", function () {
+          // Downloading gigabytes that cannot then be loaded is the waste
+          // worth one confirm.
+          if (wont && !confirm(c.repo.split("/")[1] + " needs about " +
+              c.vram_gb + " GB of VRAM and this card has less, so it will " +
+              "fail to load. Download it anyway?")) return;
+          startDownload(c.repo, b);
+        });
+        if (c.role !== "optional" && !wont) b.className = "btn thin go";
         right.appendChild(b);
       }
       box.appendChild(el);
@@ -1802,8 +1895,8 @@ function renderPicks() {
   });
   opts.push({ mode: "managed", dir: "",
     title: "Install a fresh ComfyUI for Script Builder",
-    sub: "Downloads ComfyUI, adds the Qwen-TTS nodes, builds its own Python environment "
-       + "and fetches the voices. Nothing else on this machine changes." });
+    sub: "Downloads ComfyUI, adds both sets of speech nodes, builds its own Python "
+       + "environment and fetches the voices. Nothing else on this machine changes." });
   opts.push({ mode: "external", dir: "",
     title: "Connect to a ComfyUI I start myself",
     sub: "Set the address in Settings first. Setup adds the nodes and models only." });
@@ -1987,6 +2080,10 @@ function wire() {
     S.libFilter = e.target.value; renderLib(); });
 
   $("btnRecheck").addEventListener("click", function () { loadDeps(true); refreshStatus(); });
+  $("btnTestQwen").addEventListener("click", function (e) {
+    runSelfTest("qwen", e.currentTarget); });
+  $("btnTestMoss").addEventListener("click", function (e) {
+    runSelfTest("moss", e.currentTarget); });
   $("btnInstallAll").addEventListener("click", installAllMissing);
   $("btnStartEngine").addEventListener("click", startEngine);
   $("btnReRun").addEventListener("click", openSetup);
