@@ -1,0 +1,14 @@
+{
+  "name": "script-builder-tests",
+  "private": true,
+  "type": "module",
+  "description": "Dev tooling only. The app itself is Python — see requirements.txt.",
+  "scripts": {
+    "test": "node tests/smoke.mjs",
+    "test:units": "python3 -m unittest discover -s tests -p 'test_*.py' -v",
+    "check": "node tests/check.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.49.0"
+  }
+}

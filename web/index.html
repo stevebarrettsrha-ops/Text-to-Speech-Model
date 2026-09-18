@@ -691,6 +691,40 @@
 <script>
 "use strict";
 
+/* ========================= faults =========================
+   First thing in the file, because the faults worth catching are the ones
+   that happen during boot. A thrown error in here otherwise reaches only the
+   console, and the page just stops — the silent death the validation gate in
+   CLAUDE.md exists to catch before it ships. */
+(function () {
+  var shown = 0;
+  function report(what, detail) {
+    if (shown >= 3) return;          // one fault usually begets many
+    shown++;
+    try {
+      // toast() is declared further down, so during boot it may not exist yet.
+      if (typeof toast === "function") {
+        toast(what + ": " + detail + " — reload the page; if it keeps "
+              + "happening the console has the detail.", true);
+        return;
+      }
+      var el = document.getElementById("toast");
+      if (el) {
+        el.textContent = what + ": " + detail;
+        el.classList.add("bad");
+        el.hidden = false;
+      }
+    } catch (e) { /* never let the reporter be the thing that breaks */ }
+  }
+  window.addEventListener("error", function (e) {
+    report("Something went wrong", (e && e.message) || "script error");
+  });
+  window.addEventListener("unhandledrejection", function (e) {
+    var r = e && e.reason;
+    report("A request failed", (r && (r.message || r)) || "unknown");
+  });
+})();
+
 /* ========================= state ========================= */
 var S = {
   view: "home", mode: "multi", blocks: [],

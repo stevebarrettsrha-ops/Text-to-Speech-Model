@@ -22,12 +22,13 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 
 import bootstrap
 import manager
-from bootstrap import (APP_DIR, ComfyProcess, Progress, clean_url,
+from bootstrap import (APP_DIR, DATA_DIR, ComfyProcess, Progress, clean_url,
                        comfy_online, comfy_port, detect_comfy_dirs,
                        load_config, save_config)
 from comfy import ComfyClient, ComfyError
 
-DATA_DIR = APP_DIR / "data"
+# DATA_DIR comes from bootstrap so the two cannot drift apart, and so
+# SCRIPT_BUILDER_DATA moves both.
 TAKES_DIR = DATA_DIR / "takes"
 TAKES_PATH = DATA_DIR / "takes.json"
 WEB_DIR = APP_DIR / "web"

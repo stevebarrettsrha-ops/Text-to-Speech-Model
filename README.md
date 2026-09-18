@@ -176,6 +176,8 @@ is slow. Later lines are much quicker unless memory freeing is on.
 ```
 run.sh, run.bat  Launchers — find Python, build .venv, start server.py
 requirements.txt Flask and requests. That is the whole list.
+tests/           Unit tests, a browser smoke test and stand-ins for
+                 ComfyUI and HuggingFace so neither is needed to run them
 server.py        Flask API — speech jobs, takes, setup, dependencies, HuggingFace
 bootstrap.py     Python/ComfyUI/node discovery, installs, model snapshots, process
 manager.py       Dependency checks and installers, HuggingFace browsing
@@ -185,4 +187,21 @@ data/            config.json, takes.json, takes/   (created on first run)
 ```
 
 Port: set `SCRIPT_BUILDER_PORT`. Set `SCRIPT_BUILDER_NO_BROWSER=1` to stop it
-opening a tab.
+opening a tab. `SCRIPT_BUILDER_DATA` moves `data/`, which lets a second copy
+run without touching the first one's takes.
+
+---
+
+## Tests
+
+```bash
+node tests/check.mjs     # everything compiles and the inline script parses
+npm run test:units       # 43 unit tests, standard library only
+npm install && npx playwright install chromium
+npm test                 # 52 checks driving the real page in headless Chromium
+```
+
+None of it needs a GPU, a model download or the network: `tests/mock_comfy.py`
+and `tests/mock_hf.py` stand in for ComfyUI and HuggingFace, and the suite runs
+against a temporary data folder rather than your library. The same three run in
+CI on every push and pull request.

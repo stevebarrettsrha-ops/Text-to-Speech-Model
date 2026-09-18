@@ -79,6 +79,14 @@
    `sweep_orphan_takes()` clears what an earlier crash left.
 13. **The page carries its own favicon, inline.** The server has no static
    route, so without it every load asks for `/favicon.ico` and logs a 404.
+13b. **An unexpected fault reaches the person using it.** `error` and
+   `unhandledrejection` are hooked at the very top of the inline script,
+   because the faults worth catching are the ones during boot, and they report
+   through the toast. Without it the page simply stops — the silent death the
+   gate exists to catch before it ships. The reporter is defensive on purpose:
+   `toast()` is declared further down and may not exist yet, so it falls back
+   to writing the element directly, and it gives up after three so one fault
+   cannot bury the page.
 14. **Anything that grows is capped.** `progress.lines`, `Task.lines`,
    `ComfyProcess.lines`, `TASKS` and `takes.json` all have a limit; `jobs` was
    the one that did not, and a finished job holds the whole take while
@@ -110,20 +118,29 @@ designed voices interchangeable, lets one line be retried without redoing the
 script, and gives the per-block highlight during playback. The pause and the
 join are done in `server.py`, not in the node.
 
-## Validation gate — run after any edit
+## Tests — run after any edit
 
 ```bash
-python -m py_compile server.py comfy.py bootstrap.py manager.py
-python - <<'PY'
-import re, pathlib
-src = pathlib.Path('web/index.html').read_text()
-pathlib.Path('/tmp/sb.js').write_text('\n'.join(re.findall(r'<script>(.*?)</script>', src, re.S)))
-PY
-node --check /tmp/sb.js
+node tests/check.mjs     # the gate: everything compiles, the inline script parses
+npm run test:units       # 43 unit tests, standard library only
+npm test                 # 52 checks driving the real page in headless Chromium
 ```
 
-A missing function declaration in the inline script kills all interactivity
-silently — `node --check` is not optional.
+The gate is not optional: a missing function declaration in the inline script
+kills all interactivity silently, and nothing else catches it.
+
+Nothing in the suite needs a GPU, a model download or the network.
+`tests/mock_comfy.py` answers for ComfyUI — its `/object_info` is transcribed
+from the real node, and it runs ComfyUI's own graph validation, so a graph that
+passes here passes there. `tests/mock_hf.py` answers for HuggingFace, with
+`Range` support and switches to cut a transfer off mid-file or ignore a resume.
+
+`SCRIPT_BUILDER_DATA` moves `data/`, and the suite points it at a temporary
+directory. Without that, running the tests would overwrite a real library.
+
+Every check stands for something that broke once, so the names say what would
+break rather than what the function is called. Add to them when you fix
+something: a fault worth fixing is worth the test that would have caught it.
 
 ## Version floor
 

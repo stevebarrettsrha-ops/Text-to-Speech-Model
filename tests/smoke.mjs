@@ -1,0 +1,374 @@
+// Drives the real interface in headless Chromium against the stand-in ComfyUI.
+//
+// Every check here stands for something that broke at some point. A page error
+// or a failed request to the app is a failure, not a warning — a thrown error
+// in the inline script kills all interactivity silently, which is the whole
+// reason the validation gate in CLAUDE.md exists.
+//
+// Run with `npm test`. Needs no GPU, no model downloads and no network.
+import { chromium } from 'playwright';
+import { boot } from './harness.mjs';
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let passed = 0;
+const failures = [];
+
+function ok(name, detail = '') {
+  passed++;
+  console.log(`ok   ${name}${detail ? ` — ${detail}` : ''}`);
+}
+function bad(name, detail = '') {
+  failures.push(`${name}${detail ? ` — ${detail}` : ''}`);
+  console.error(`FAIL ${name}${detail ? ` — ${detail}` : ''}`);
+}
+const is = (cond, name, detail) => cond ? ok(name, detail) : bad(name, detail);
+
+const app = await boot();
+// CI runs `npx playwright install chromium` and Playwright finds its own.
+// CHROMIUM_PATH is for environments that ship a browser already.
+const browser = await chromium.launch(
+  process.env.CHROMIUM_PATH ? { executablePath: process.env.CHROMIUM_PATH } : {});
+const noise = [];
+
+try {
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  page.on('pageerror', e => noise.push(`page error: ${e.message}`));
+  page.on('console', m => {
+    if (m.type() === 'error') noise.push(`console: ${m.text()}`);
+  });
+  page.on('response', r => {
+    if (r.url().startsWith(app.base) && r.status() >= 400) {
+      noise.push(`HTTP ${r.status()} ${r.url().replace(app.base, '')}`);
+    }
+  });
+
+  const takes = () => app.api('/api/takes');
+
+  await page.goto(app.base, { waitUntil: 'networkidle' });
+  await sleep(1500);
+
+  /* ---------------------------------------------------------------- shell */
+  is(await page.title() === 'Script Builder', 'page title', await page.title());
+
+  const navs = await page.$$eval('.nav[data-view]', e => e.map(x => x.dataset.view));
+  const pages = ['home', 'create', 'library', 'models', 'engine'];
+  is(pages.every(v => navs.includes(v)), 'five pages in the rail', navs.join(', '));
+
+  is(await page.$eval('#veil-setup', e => e.hidden),
+     'setup panel stays shut when setup is complete');
+
+  const pill = (await page.textContent('#enginePill')).trim();
+  is(pill.includes('ready'), 'engine reports ready', pill);
+
+  for (const view of pages) {
+    await page.click(`.nav[data-view="${view}"]`);
+    await sleep(900);
+    const shown = await page.$eval(`[data-page="${view}"]`, e => !e.hidden);
+    const chars = await page.$eval(`[data-page="${view}"]`, e => e.innerText.trim().length);
+    is(shown && chars > 20, `page "${view}" renders`, `${chars} chars`);
+  }
+
+  /* --------------------------------------------------------- the builder */
+  await page.click('.nav[data-view="create"]');
+  await sleep(700);
+
+  // scrollHeight reads 0 while a page is hidden, so blocks rendered
+  // off-screen come back clipped unless resizeAll() runs when it is shown.
+  let heights = await page.$$eval('#blocks textarea',
+    e => e.map(x => x.getBoundingClientRect().height));
+  is(heights.length > 0 && heights.every(h => h > 10),
+     'textareas are sized once the page is on screen',
+     heights.map(Math.round).join('/'));
+
+  const voices = await page.$$eval('[data-voice="1"] option', o => o.map(x => x.value));
+  is(voices.includes('Serena') && voices.length === 9,
+     'preset voices come from the node', `${voices.length} voices`);
+
+  const models = await page.$$eval('#model-sel option', o => o.map(x => x.value));
+  is(JSON.stringify(models) === JSON.stringify(['0.6B', '1.7B']),
+     'model list comes from the node', models.join(', '));
+
+  const atts = await page.$$eval('#attn-sel option', o => o.map(x => x.value));
+  is(atts.includes('sdpa'), 'attention modes come from the node', atts.join(', '));
+
+  await page.click('#btnClearScript');
+  await sleep(300);
+  await page.fill('#style-input', 'Read briskly, like a trailer');
+  for (const [i, text] of ['The browser is driving this.',
+                           'And every line is its own graph.'].entries()) {
+    await page.click('#btnAdd');
+    await sleep(250);
+    (await page.$$('#blocks textarea'))[i].fill(text);
+    await sleep(200);
+  }
+  is((await page.$$('#blocks .blk')).length === 2, 'lines can be added');
+
+  const raw = (await page.textContent('#raw-text')).trim();
+  is(raw.includes('Read briskly') && raw.includes('Speaker 1:')
+     && raw.includes('Speaker 2:'), 'the raw structure mirrors the script');
+
+  await page.click('#blocks .blk:nth-child(2) [data-flip]');
+  await sleep(300);
+  is((await page.textContent('#raw-text')).split('\n')[2].startsWith('Speaker 1:'),
+     'the speaker chip flips a line');
+  await page.click('#blocks .blk:nth-child(2) [data-flip]');
+  await sleep(300);
+
+  await page.click('#blocks .blk:nth-child(1) [data-move][data-dir="1"]');
+  await sleep(400);
+  is((await page.$$eval('#blocks textarea', e => e.map(x => x.value)))[0]
+     === 'And every line is its own graph.', 'move reorders a line');
+  await page.click('#blocks .blk:nth-child(1) [data-move][data-dir="1"]');
+  await sleep(400);
+
+  await page.click('#segMode button[data-v="single"]');
+  await sleep(700);
+  is(await page.$$eval('#blocks .chip', e => e.every(x => x.className.includes('s1')))
+     && await page.$eval('#spk-2', e => e.hidden),
+     'one speaker collapses the script and hides the second');
+  await page.click('#blocks .blk:nth-child(1) [data-flip]');
+  await sleep(400);
+  is(await page.$$eval('#blocks .chip', e => e.every(x => x.className.includes('s1'))),
+     'flipping is refused in one-speaker mode');
+  await page.click('#segMode button[data-v="multi"]');
+  await sleep(600);
+
+  is(await page.$eval('#cardVoices', e => e.open), 'cards start open');
+  await page.click('#cardVoices > summary');
+  await sleep(400);
+  is(await page.$eval('#cardVoices', e => !e.open), 'cards collapse');
+  await page.click('#cardVoices > summary');
+  await sleep(400);
+
+  /* ------------------------------------------------------------ generate */
+  const before = (await takes()).length;
+  await page.click('#btnRun');
+  let made = false;
+  for (let i = 0; i < 60; i++) {
+    await sleep(1000);
+    if ((await takes()).length > before) { made = true; break; }
+  }
+  is(made, 'pressing Read produces a take');
+  await sleep(1500);
+
+  const npTitle = (await page.textContent('#npTitle')).trim();
+  is(npTitle && npTitle !== '—', 'the player bar picks the take up', npTitle);
+
+  const audio = await page.evaluate(() => {
+    const a = document.getElementById('audio');
+    return { src: a.currentSrc || a.src, dur: a.duration, t: a.currentTime };
+  });
+  is(audio.src.includes('/api/take/'), 'the player streams a clip',
+     audio.src.replace(app.base, ''));
+  is(audio.dur > 0 || audio.t > 0, 'the clip decodes',
+     `dur=${audio.dur} t=${audio.t.toFixed(2)}`);
+
+  /* ----------------------------------------------------------- transport */
+  const longTake = (await takes()).find(t => t.title === 'Transport test');
+  if (!longTake) {
+    bad('transport fixture missing');
+  } else {
+    await page.evaluate(t => { playTake(t, false); }, longTake);
+    await sleep(1200);
+    const read = () => page.evaluate(() => ({
+      flag: document.getElementById('lineFlag').textContent,
+      lines: S.take.lines.length,
+    }));
+    const seen = [await read()];
+    for (const btn of ['#btnNext', '#btnNext', '#btnPrev', '#btnPrev']) {
+      await page.click(btn);
+      await sleep(1400);
+      seen.push(await read());
+    }
+    const want = ['line 1 of 3', 'line 2 of 3', 'line 3 of 3',
+                  'line 2 of 3', 'line 1 of 3'];
+    is(JSON.stringify(seen.map(s => s.flag)) === JSON.stringify(want),
+       'skip walks forward and back', seen.map(s => s.flag).join(' -> '));
+    // stepLine used to hand playTake a sliced copy, which became S.take: the
+    // counter renumbered itself and the lines the back button needed were gone.
+    is(seen.every(s => s.lines === longTake.lines.length),
+       'skipping does not cut the take down',
+       `${longTake.lines.length} lines throughout`);
+  }
+
+  await page.click('#btnRepeat');
+  await sleep(300);
+  is(await page.evaluate(() => S.repeat), 'repeat toggles');
+  await page.click('#btnRepeat');
+  await sleep(200);
+  await page.click('#btnPlay');
+  await sleep(600);
+  is(await page.evaluate(() => document.getElementById('audio').paused),
+     'play/pause pauses');
+  await page.evaluate(() => stopAll());
+  await sleep(600);
+  const cleared = await page.evaluate(() => ({
+    playing: S.playing, flag: document.getElementById('lineFlag').textContent }));
+  is(!cleared.playing && !cleared.flag, 'stop clears the player');
+
+  /* ------------------------------------------------------------- library */
+  await page.click('.nav[data-view="library"]');
+  await sleep(900);
+  const cards = (await page.$$('#libGrid .gcard')).length;
+  is(cards > 0, 'the library lists takes', `${cards} cards`);
+
+  await page.fill('#libSearch', 'Transport test');
+  await sleep(600);
+  const filtered = (await page.$$('#libGrid .gcard')).length;
+  is(filtered > 0 && filtered < cards, 'search filters', `${cards} -> ${filtered}`);
+  await page.fill('#libSearch', 'zzz-nothing-matches');
+  await sleep(600);
+  is(await page.$eval('#libGrid', e => e.innerText.includes('Nothing here yet')),
+     'an empty search shows the empty state');
+  await page.fill('#libSearch', '');
+  await sleep(500);
+
+  await page.evaluate(t => loadTakeScript(t), longTake);
+  await sleep(900);
+  const loaded = await page.$$eval('#blocks textarea', e => e.map(x => x.value));
+  is(loaded.length === longTake.lines.length && loaded[0] === longTake.lines[0].text,
+     'a take loads back into the builder', `${loaded.length} lines`);
+  heights = await page.$$eval('#blocks textarea',
+    e => e.map(x => x.getBoundingClientRect().height));
+  is(heights.every(h => h > 10), 'the loaded-back lines are sized',
+     heights.map(Math.round).join('/'));
+
+  const countBefore = (await takes()).length;
+  page.once('dialog', d => d.accept());
+  await page.click('#takeList .trow:first-child [data-act="del"]');
+  await sleep(2000);
+  is((await takes()).length === countBefore - 1, 'delete removes a take',
+     `${countBefore} -> ${(await takes()).length}`);
+  const countAfter = (await takes()).length;
+  page.once('dialog', d => d.dismiss());
+  await page.click('#takeList .trow:first-child [data-act="del"]');
+  await sleep(1200);
+  is((await takes()).length === countAfter, 'cancelling the confirm keeps it');
+
+  /* -------------------------------------------------------------- models */
+  await page.click('.nav[data-view="models"]');
+  await sleep(1400);
+  const curated = (await page.$$('#curated-list .fitem')).length;
+  is(curated === 6, 'all six model folders are listed', String(curated));
+  const installed = await page.$$eval('#curated-list .state.ok', e => e.length);
+  is(installed >= 4, 'installed folders are marked', `${installed} installed`);
+
+  /* -------------------------------------------------------------- engine */
+  await page.click('.nav[data-view="engine"]');
+  await sleep(2500);
+  const deps = (await page.$$('#dep-list .fitem')).length;
+  is(deps >= 6, 'the dependency list renders', `${deps} rows`);
+
+  /* --------------------------------------------------------------- setup */
+  await page.click('#btnReRun');
+  await sleep(800);
+  is((await page.$$('#pick-list label')).length >= 2, 'setup offers its routes');
+  const labels = await page.$$('#pick-list label');
+  await labels[labels.length - 1].click();      // connect to a ComfyUI I run
+  await page.click('#btnRunSetup');
+  let setupDone = false;
+  for (let i = 0; i < 90; i++) {
+    await sleep(700);
+    if (await page.$eval('#setup-done', e => !e.hidden).catch(() => false)) {
+      setupDone = true; break;
+    }
+    if (await page.$eval('#setup-retry', e => !e.hidden).catch(() => false)) break;
+  }
+  is(setupDone, 'setup runs to completion');
+  const steps = await page.$$eval('#step-list .step',
+    e => e.map(x => x.querySelector('.lbl').innerText.trim()));
+  // Flask sorts the keys of a dict, which listed Check Python last — after the
+  // step that starts the engine — on the one screen where order is the point.
+  is(steps[0].startsWith('Check Python') && steps[steps.length - 1].startsWith('Start ComfyUI'),
+     'setup steps are in the order they run', steps.join(' | '));
+  // Escape deliberately will not dismiss a setup that has run — the panel is
+  // closed with its own button, which is what a person would press.
+  await page.click(setupDone ? '#setup-done' : '#setup-hide');
+  await sleep(600);
+  is(await page.$eval('#veil-setup', e => e.hidden), 'the setup panel closes');
+
+  /* ------------------------------------------------------------ settings */
+  await page.click('#navSettings');
+  await sleep(600);
+  await page.fill('#cfg-url', `  ${app.comfy.replace('http://', '')}/  `);
+  await page.click('#btnSaveCfg');
+  await sleep(1200);
+  await page.click('#btnCloseCfg');
+  await sleep(400);
+  is((await app.api('/api/status')).config.comfy_url === app.comfy,
+     'a typed address is normalised',
+     (await app.api('/api/status')).config.comfy_url);
+
+  /* ----------------------------------------------------------- shortcuts */
+  await page.click('.nav[data-view="create"]');
+  await sleep(600);
+  await page.keyboard.press('Control+Enter');
+  await sleep(1500);
+  is(await page.$eval('#btnStop', e => !e.hidden), 'Ctrl+Enter starts a run');
+  await page.click('#btnStop');
+  await sleep(1500);
+  is(await page.$eval('#btnStop', e => e.hidden), 'Stop resets the controls');
+
+  await page.click('#btnResetOpts');
+  await sleep(500);
+  is(await page.inputValue('#pause-sl') === '0.5', 'reset restores the defaults');
+
+  /* -------------------------------------------------------------- reload */
+  // Compared against what is on screen now, not a literal: earlier checks
+  // load a take back into the builder, which replaces the style text.
+  const draft = {
+    style: await page.inputValue('#style-input'),
+    lines: await page.$$eval('#blocks textarea', e => e.map(x => x.value)),
+  };
+  await page.reload({ waitUntil: 'networkidle' });
+  await sleep(1500);
+  await page.click('.nav[data-view="create"]');
+  await sleep(700);
+  const after = {
+    style: await page.inputValue('#style-input'),
+    lines: await page.$$eval('#blocks textarea', e => e.map(x => x.value)),
+  };
+  is(after.style === draft.style
+     && JSON.stringify(after.lines) === JSON.stringify(draft.lines),
+     'the draft survives a reload', `${after.lines.length} lines restored`);
+  heights = await page.$$eval('#blocks textarea',
+    e => e.map(x => x.getBoundingClientRect().height));
+  is(heights.every(h => h > 10), 'the restored lines are sized',
+     heights.map(Math.round).join('/'));
+
+  /* ---------------------------------------------------------- narrow view */
+  await page.setViewportSize({ width: 420, height: 880 });
+  await sleep(900);
+  const overflow = await page.evaluate(() =>
+    document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  // A grid item is min-width:auto, so the rail refused to shrink and widened
+  // the page instead of scrolling its own chips.
+  is(overflow <= 2, 'no horizontal overflow at 420px', `${overflow}px`);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await sleep(500);
+
+  /* ------------------------------------------------- faults are surfaced */
+  await page.evaluate(() => { setTimeout(() => { throw new Error('planted'); }, 0); });
+  await sleep(700);
+  const toast = await page.$eval('#toast', e => ({ hidden: e.hidden, text: e.textContent }));
+  is(!toast.hidden && /planted|went wrong/i.test(toast.text),
+     'an unexpected script error reaches the user', toast.text.slice(0, 60));
+  // That deliberate throw lands in the console too; not a real failure.
+  for (let i = noise.length - 1; i >= 0; i--) {
+    if (noise[i].includes('planted')) noise.splice(i, 1);
+  }
+} finally {
+  await browser.close();
+  await app.stop();
+}
+
+if (noise.length) {
+  for (const n of [...new Set(noise)]) bad('unexpected browser output', n);
+}
+
+console.log(`\n${passed} passed, ${failures.length} failed`);
+if (failures.length) {
+  console.error('\nfailures:');
+  for (const f of failures) console.error(`  - ${f}`);
+  process.exit(1);
+}
