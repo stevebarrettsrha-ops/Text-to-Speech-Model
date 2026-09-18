@@ -13,8 +13,10 @@ import shutil
 import struct
 import sys
 import tempfile
+import subprocess
 import threading
 import unittest
+from unittest import mock
 import wave
 from pathlib import Path
 
@@ -248,6 +250,7 @@ class PipProgress(unittest.TestCase):
         self.assertEqual(bootstrap.human_size(512), "512 B")
         self.assertEqual(bootstrap.human_size(921_200), "921 kB")
         self.assertEqual(bootstrap.human_size(16_900_000), "17 MB")
+        self.assertEqual(bootstrap.human_size(1_800_000), "1.8 MB")
         self.assertEqual(bootstrap.human_size(2_713_000_000), "2.71 GB")
 
 
@@ -268,8 +271,11 @@ class SetupSteps(unittest.TestCase):
         self.assertIsNone(prog.snapshot()["steps"][3]["pct"])
         prog.detail("deps", "downloading", 42.0)
         self.assertEqual(prog.snapshot()["steps"][3]["pct"], 42.0)
-        prog.detail("deps", "unpacking", None)       # keeps the last number
-        self.assertEqual(prog.snapshot()["steps"][3]["pct"], 42.0)
+        # Not "keeps the last number", which is what it used to do: pip goes
+        # quiet for the whole of the unpacking step, and a bar frozen at the
+        # download's last percentage reads as a run that finished and hung.
+        prog.detail("deps", "unpacking", None)
+        self.assertIsNone(prog.snapshot()["steps"][3]["pct"])
         prog.finish("deps", "done")
         self.assertIsNone(prog.snapshot()["steps"][3]["pct"])
 
@@ -598,6 +604,311 @@ class DownloadFiltering(unittest.TestCase):
         files = [{"path": "pytorch_model.bin", "size": 9}]
         self.assertEqual([f["path"] for f in bootstrap.wanted_files(files)],
                          ["pytorch_model.bin"])
+
+
+class GpuDetection(unittest.TestCase):
+    """torch 2.14.0+cpu on a machine holding an RTX 4060, because the only
+    test for a GPU was shutil.which("nvidia-smi")."""
+
+    def setUp(self):
+        bootstrap._GPU.clear()
+
+    def tearDown(self):
+        bootstrap._GPU.clear()
+
+    def test_nvidia_smi_is_looked_for_off_PATH_too(self):
+        # The regression exactly: which() comes back empty and the machine is
+        # declared GPU-less. There must still be somewhere left to look.
+        with mock.patch.object(bootstrap.shutil, "which", return_value=None):
+            self.assertTrue(bootstrap._smi_candidates())
+
+    def test_a_card_that_answers_is_a_card_with_a_driver(self):
+        done = subprocess.CompletedProcess([], 0, "NVIDIA GeForce RTX 4060\n", "")
+        with mock.patch.object(bootstrap, "_run", return_value=done):
+            gpu = bootstrap.nvidia_gpu(refresh=True)
+        self.assertEqual(gpu, {"name": "NVIDIA GeForce RTX 4060",
+                               "driver": True})
+
+    def test_a_card_with_no_driver_is_still_a_card(self):
+        with mock.patch.object(bootstrap, "_run",
+                               return_value=subprocess.CompletedProcess([], 1, "", "")), \
+             mock.patch.object(bootstrap, "_adapter_names",
+                               return_value=["NVIDIA GeForce RTX 4060"]):
+            gpu = bootstrap.nvidia_gpu(refresh=True)
+        self.assertEqual(gpu["name"], "NVIDIA GeForce RTX 4060")
+        self.assertFalse(gpu["driver"])
+
+    def test_the_index_follows_the_hardware(self):
+        with mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "RTX 4060", "driver": True}):
+            self.assertEqual(bootstrap.torch_index({}), bootstrap.CUDA_INDEX)
+        with mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "", "driver": False}):
+            self.assertEqual(bootstrap.torch_index({}), bootstrap.CPU_INDEX)
+
+    def test_a_chosen_index_is_never_second_guessed(self):
+        picked = "https://download.pytorch.org/whl/cu121"
+        with mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "", "driver": False}):
+            self.assertEqual(bootstrap.torch_index({"torch_index": picked}),
+                             picked)
+
+    def test_the_build_tag_comes_out_of_the_index(self):
+        for index, want in ((bootstrap.CUDA_INDEX, "cu128"),
+                            (bootstrap.CPU_INDEX, "cpu"),
+                            ("https://download.pytorch.org/whl/rocm6.2", "rocm6.2"),
+                            ("", ""), ("https://pypi.org/simple", "")):
+            with self.subTest(index=index):
+                self.assertEqual(bootstrap.torch_build(index), want)
+
+    def test_no_gpu_message_names_the_card_it_can_see(self):
+        with mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "NVIDIA GeForce RTX 4060",
+                                             "driver": True}):
+            text = manager.no_cuda_reason("2.14.0+cpu")
+        self.assertIn("RTX 4060", text)
+        self.assertIn("Reinstall", text)
+        self.assertNotIn("no GPU found", text)
+
+    def test_no_gpu_message_says_so_when_there_really_is_none(self):
+        with mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "", "driver": False}):
+            self.assertIn("no NVIDIA GPU", manager.no_cuda_reason("2.14.0+cpu"))
+
+
+class TorchReinstall(unittest.TestCase):
+    """pip counts torch 2.14.0+cpu as satisfying `torch`, so Reinstall against
+    the CUDA index changed nothing at all."""
+
+    def _attempt(self, installed, index):
+        calls = []
+        with mock.patch.object(bootstrap, "installed_torch",
+                               return_value=installed), \
+             mock.patch.object(bootstrap, "_run",
+                               side_effect=lambda cmd, **kw: calls.append(cmd)
+                               or subprocess.CompletedProcess(cmd, 0, "", "")):
+            dropped = bootstrap.drop_mismatched_torch("py", index, lambda _m: None)
+        return dropped, calls
+
+    def test_a_cpu_build_is_removed_before_the_cuda_one_lands(self):
+        dropped, calls = self._attempt("2.14.0+cpu", bootstrap.CUDA_INDEX)
+        self.assertTrue(dropped)
+        self.assertTrue(any("uninstall" in c for c in calls[0]))
+
+    def test_a_matching_build_is_left_alone(self):
+        dropped, calls = self._attempt("2.14.0+cu128", bootstrap.CUDA_INDEX)
+        self.assertFalse(dropped)
+        self.assertEqual(calls, [])
+
+    def test_an_untagged_wheel_is_not_reinstalled_on_a_guess(self):
+        # Plain PyPI wheels carry no +tag; which build they are depends on the
+        # platform, so there is nothing to compare and nothing to do.
+        dropped, calls = self._attempt("2.14.0", bootstrap.CUDA_INDEX)
+        self.assertFalse(dropped)
+        self.assertEqual(calls, [])
+
+    def test_nothing_is_removed_when_no_torch_is_there(self):
+        dropped, calls = self._attempt("", bootstrap.CUDA_INDEX)
+        self.assertFalse(dropped)
+        self.assertEqual(calls, [])
+
+
+class PipReadiness(unittest.TestCase):
+    """`--progress-bar raw` arrived in pip 24.1 and a fresh venv ships 24.0,
+    so the longest step of the install had no number at all."""
+
+    OLD = ("  --progress-bar <progress_bar>\n"
+           "                              Specify whether the progress bar "
+           "should be used [on, off] (default: on)\n")
+    NEW = ("  --progress-bar <progress_bar>\n"
+           "                              Specify whether the progress bar "
+           "should be used. [auto, on,\n"
+           "                              off, raw] (default: auto)\n")
+
+    def setUp(self):
+        bootstrap._PIP_RAW.clear()
+        bootstrap._PIP_READY.clear()
+
+    tearDown = setUp
+
+    def test_raw_is_asked_for_not_guessed_from_a_version(self):
+        with mock.patch.object(bootstrap, "_run", return_value=
+                               subprocess.CompletedProcess([], 0, self.OLD, "")):
+            self.assertEqual(bootstrap.pip_raw_progress("py"), [])
+        bootstrap._PIP_RAW.clear()
+        with mock.patch.object(bootstrap, "_run", return_value=
+                               subprocess.CompletedProcess([], 0, self.NEW, "")):
+            self.assertEqual(bootstrap.pip_raw_progress("py"),
+                             ["--progress-bar", "raw"])
+
+    def test_the_answer_is_remembered_per_interpreter(self):
+        run = mock.Mock(return_value=subprocess.CompletedProcess([], 0,
+                                                                 self.NEW, ""))
+        with mock.patch.object(bootstrap, "_run", run):
+            bootstrap.pip_raw_progress("py")
+            bootstrap.pip_raw_progress("py")
+        self.assertEqual(run.call_count, 1)
+
+    def test_an_old_pip_is_upgraded_and_asked_again(self):
+        answers = [subprocess.CompletedProcess([], 0, self.OLD, ""),   # probe
+                   subprocess.CompletedProcess([], 0, "ok", ""),       # upgrade
+                   subprocess.CompletedProcess([], 0, self.NEW, "")]   # re-probe
+        seen = []
+        with mock.patch.object(bootstrap, "_run",
+                               side_effect=lambda cmd, **kw: seen.append(cmd)
+                               or answers[len(seen) - 1]):
+            bootstrap.pip_ready("py", lambda _m: None)
+        self.assertIn("--upgrade", seen[1])
+        self.assertEqual(bootstrap.pip_raw_progress("py"),
+                         ["--progress-bar", "raw"])
+
+    def test_a_pip_that_already_reports_is_left_alone(self):
+        run = mock.Mock(return_value=subprocess.CompletedProcess([], 0,
+                                                                 self.NEW, ""))
+        with mock.patch.object(bootstrap, "_run", run):
+            bootstrap.pip_ready("py", lambda _m: None)
+        self.assertEqual(run.call_count, 1)      # the probe, and no upgrade
+
+    def test_a_failed_upgrade_is_not_a_failed_install(self):
+        with mock.patch.object(bootstrap, "_run", side_effect=OSError("boom")):
+            bootstrap.pip_ready("py", lambda _m: None)   # must not raise
+
+
+class QuietPipPhases(unittest.TestCase):
+    """pip prints nothing at all while it unpacks a 2.7 GB wheel."""
+
+    def test_a_download_line_records_its_size(self):
+        state = {}
+        text, pct = bootstrap.pip_progress(
+            "Downloading torch-2.5.1+cu128-cp312-cp312-win_amd64.whl (2.7 GB)",
+            state)
+        self.assertIsNone(pct)
+        self.assertIn("2.70 GB", text)
+        self.assertEqual(state["phase"], "download")
+
+    def test_a_size_in_any_unit_reads_as_that_size(self):
+        for line, want in (
+                ("Downloading torch-2.5.1.whl (2.7 GB)", "2.70 GB"),
+                ("Downloading torchaudio-2.5.1.whl (1.8 MB)", "1.8 MB"),
+                ("Downloading six-1.17.0.whl (11 kB)", "11 kB")):
+            with self.subTest(line=line):
+                self.assertIn(want, bootstrap.pip_progress(line, {})[0])
+
+    def test_the_unpack_step_counts_its_packages(self):
+        state = {}
+        text, pct = bootstrap.pip_progress(
+            "Installing collected packages: torch, sympy, filelock", state)
+        self.assertIsNone(pct)
+        self.assertEqual(state["packages"], 3)
+        self.assertEqual(state["phase"], "install")
+        self.assertIn("3 packages", text)
+
+    def test_the_quiet_line_shows_bytes_and_never_a_fake_percentage(self):
+        state = {"what": "Unpacking 11 packages"}
+        line = bootstrap.quiet_detail(state, 1_400_000_000, 123)
+        self.assertIn("1.40 GB written", line)
+        self.assertIn("2m 03s", line)
+        self.assertNotIn("%", line)
+        # Never "1.40 GB of 2.70 GB downloaded": a wheel unpacks to more than
+        # it downloads, so weighing one against the other prints "199 MB of
+        # 88 MB", which reads as a fault rather than as progress.
+        self.assertNotIn(" of ", line)
+
+    def test_the_clock_runs_before_anything_has_been_written(self):
+        line = bootstrap.quiet_detail({"what": "Collecting torch"}, 0, 65)
+        self.assertIn("Collecting torch", line)
+        self.assertIn("1m 05s", line)
+        self.assertNotIn("written", line)
+
+    def test_a_small_wheel_does_not_round_to_zero(self):
+        # "0 of 1 MB" reads as a stuck download rather than a small one.
+        state = {"what": "pygments", "since": 0}
+        text, _pct = bootstrap.pip_progress("Progress 130000 of 1300000", state)
+        self.assertIn("0.1 of 1.3 MB", text)
+
+    def test_dir_size_adds_up_and_gives_up_when_told_to(self):
+        root = Path(tempfile.mkdtemp(prefix="sb-dirsize-"))
+        try:
+            (root / "sub").mkdir()
+            (root / "a.bin").write_bytes(b"x" * 1000)
+            (root / "sub" / "b.bin").write_bytes(b"y" * 2000)
+            self.assertEqual(bootstrap.dir_size(root), 3000)
+            self.assertLess(bootstrap.dir_size(root, budget=1), 3000)
+            self.assertEqual(bootstrap.dir_size(root / "nowhere"), 0)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class NodeImportDiagnosis(unittest.TestCase):
+    """"Installed but ComfyUI has not loaded them" is a dead end for anyone
+    running from a launcher with no console to read."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="sb-node-"))
+        self.node = self.root / "custom_nodes" / bootstrap.NODE_DIR_NAME
+        self.node.mkdir(parents=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_the_real_exception_comes_back(self):
+        (self.node / "__init__.py").write_text(
+            "import a_package_that_is_not_installed\n")
+        why = bootstrap.node_import_error(sys.executable, self.root)
+        self.assertIn("ModuleNotFoundError", why)
+        self.assertIn("a_package_that_is_not_installed", why)
+
+    def test_an_import_that_works_says_nothing(self):
+        (self.node / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n")
+        self.assertEqual(bootstrap.node_import_error(sys.executable, self.root), "")
+
+    def test_nodes_that_are_not_there_say_that_instead(self):
+        shutil.rmtree(self.node)
+        self.assertIn("not installed",
+                      bootstrap.node_import_error(sys.executable, self.root))
+
+
+class NodesNotLoaded(unittest.TestCase):
+    """ComfyUI reads custom_nodes once, at startup, so installing them into a
+    running engine leaves it running without them."""
+
+    class Engine:
+        def __init__(self, loaded):
+            self.loaded = loaded
+
+        def has(self, _cls):
+            return self.loaded
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="sb-deps-"))
+        (self.root / "main.py").write_text("")
+        node = self.root / "custom_nodes" / bootstrap.NODE_DIR_NAME
+        node.mkdir(parents=True)
+        (node / "nodes.py").write_text("")
+        (self.root / "models").mkdir()
+        self.cfg = {"comfy_dir": str(self.root),
+                    "models_dir": str(self.root / "models"),
+                    "comfy_url": "http://127.0.0.1:1"}
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _node_item(self, loaded):
+        items = manager.dependencies(self.cfg, self.Engine(loaded))
+        return next(i for i in items if i["id"] == "node")
+
+    def test_an_engine_without_the_classes_offers_a_restart(self):
+        item = self._node_item(False)
+        self.assertEqual(item["state"], "warn")
+        # The old text said "check the ComfyUI console", which is not a thing
+        # anyone running from a launcher can do.
+        self.assertEqual(item["action"], "restart")
+        self.assertIn("Restart", item["detail"])
+
+    def test_an_engine_that_loaded_them_offers_an_update(self):
+        item = self._node_item(True)
+        self.assertEqual(item["state"], "ok")
+        self.assertEqual(item["action"], "update")
 
 
 if __name__ == "__main__":

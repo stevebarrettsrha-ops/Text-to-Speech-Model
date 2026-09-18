@@ -1097,8 +1097,31 @@ function body(lines, title) {
     pause: parseFloat($("pause-sl").value), temperature: parseFloat($("temp-sl").value)
   };
 }
+/* What stands between this script and a take, and where to go about it.
+   The button used to read "Set up the engine" and open the setup dialog for
+   every one of these — including an engine that is set up and merely needs a
+   restart, which the dialog cannot do. Name the actual blocker and go to the
+   thing that clears it. */
+function blocker(st) {
+  if (!st) return { label: "Checking the engine…", go: function () { show("engine"); } };
+  if (st.ready) return { label: "Read the script", go: null };
+  if (st.setup_running) return { label: "Setting up…", go: openSetup };
+  if (!st.setup_complete) return { label: "Set up the engine", go: openSetup };
+  if (!st.comfy_online) return { label: "Start the engine",
+    go: function () { show("engine"); startEngine(); } };
+  if (!st.nodes_ready) return { label: "Restart the engine",
+    go: function () { show("engine"); restartEngine(); } };
+  if (st.models_known === false || (st.missing_models || []).length) {
+    return { label: "Download the models", go: function () { show("models"); } };
+  }
+  return { label: "Set up the engine", go: openSetup };
+}
 async function runScript() {
-  if (!S.status || !S.status.ready) { openSetup(); return; }
+  if (!S.status || !S.status.ready) {
+    var b = blocker(S.status);
+    if (b.go) b.go();
+    return;
+  }
   var lines = S.blocks.filter(function (b) { return b.text.trim(); })
     .map(function (b) { return { speaker: S.mode === "single" ? 1 : b.spk,
                                  text: b.text.trim() }; });
@@ -1385,11 +1408,19 @@ async function removeTake(t) {
 }
 
 /* ========================= engine page ========================= */
-async function loadDeps() {
+async function loadDeps(fresh) {
   var box = $("dep-list");
   try {
-    var d = await api("/api/deps");
+    var d = await api("/api/deps" + (fresh ? "?fresh=1" : ""));
     $("torch-index").value = d.torch_index || "";
+    // Say what Automatic picked. "Automatic" on its own is what let a machine
+    // with an RTX 4060 in it quietly take the CPU build.
+    var gpu = d.gpu || {};
+    $("torch-index").options[0].textContent = !gpu.name
+      ? "Automatic — no NVIDIA GPU found (CPU build)"
+      : gpu.driver
+        ? "Automatic — " + gpu.name + " (CUDA build)"
+        : "Automatic — " + gpu.name + ", driver not answering (CUDA build)";
     box.innerHTML = "";
     var bad = 0;
     d.items.forEach(function (it) {
@@ -1405,6 +1436,8 @@ async function loadDeps() {
         right.appendChild(mkBtn("Open Models", function () { show("models"); }));
       } else if (it.action === "start") {
         right.appendChild(mkBtn("Start", startEngine));
+      } else if (it.action === "restart") {
+        right.appendChild(mkBtn("Restart engine", restartEngine));
       } else if (it.action) {
         var label = it.action === "update" ? "Update"
           : it.action === "reinstall" ? "Reinstall" : "Install";
@@ -1470,7 +1503,19 @@ async function installAllMissing() {
       if (!ok) { toast("Stopped at " + missing[i] + " — see the activity log.", true); return; }
       await loadDeps();
     }
-    toast("All set. Restart ComfyUI so it loads the nodes.");
+    // ComfyUI reads custom_nodes at startup, so whatever was just installed
+    // is not loaded yet. The node row now carries the button that does it.
+    toast("All set. Press Restart engine so ComfyUI loads the nodes.");
+  } catch (e) { toast(e.message, true); }
+}
+async function restartEngine() {
+  try {
+    var r = await api("/api/comfy/restart", { method: "POST" });
+    S.taskId = r.task.id; S.taskCursor = 0; $("task-log").textContent = "";
+    pollTasks();
+    toast("Restarting ComfyUI so it loads the nodes. The first start is slow.");
+    if (await waitForTask(r.task.id)) toast("Nodes loaded.");
+    loadDeps();
   } catch (e) { toast(e.message, true); }
 }
 async function startEngine() {
@@ -1756,7 +1801,7 @@ async function refreshStatus() {
     : st.models_known === false ? "No models folder" : "Engine loading";
   $("modelsTag").hidden = !(st.missing_models && st.missing_models.length);
   $("engineTag").hidden = !!(st.comfy_online && st.nodes_ready);
-  $("runLabel").textContent = st.ready ? "Read the script" : "Set up the engine";
+  $("runLabel").textContent = blocker(st).label;
   $("gpuMetric").querySelector("span").textContent =
     st.ready ? "ready" : st.comfy_online ? "loading" : "offline";
   var c = st.config || {};
@@ -1836,7 +1881,7 @@ function wire() {
   $("libSearch").addEventListener("input", function (e) {
     S.libFilter = e.target.value; renderLib(); });
 
-  $("btnRecheck").addEventListener("click", function () { loadDeps(); refreshStatus(); });
+  $("btnRecheck").addEventListener("click", function () { loadDeps(true); refreshStatus(); });
   $("btnInstallAll").addEventListener("click", installAllMissing);
   $("btnStartEngine").addEventListener("click", startEngine);
   $("btnReRun").addEventListener("click", openSetup);

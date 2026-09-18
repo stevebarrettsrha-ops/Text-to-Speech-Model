@@ -259,6 +259,51 @@ try {
   const deps = (await page.$$('#dep-list .fitem')).length;
   is(deps >= 6, 'the dependency list renders', `${deps} rows`);
 
+  // torch 2.14.0+cpu landed on a machine with an RTX 4060 in it, because the
+  // only test for a GPU was shutil.which("nvidia-smi"). The panel now says
+  // out loud what Automatic resolved to, so a wrong answer is visible.
+  const depPayload = await app.api('/api/deps');
+  is(depPayload.gpu && typeof depPayload.gpu.name === 'string'
+       && typeof depPayload.gpu.driver === 'boolean',
+     'the engine report says what GPU it found',
+     JSON.stringify(depPayload.gpu));
+  is(/\/whl\/(cpu|cu\d+)$/.test(depPayload.torch_auto || ''),
+     'Automatic resolves to a real wheel index', depPayload.torch_auto);
+  const autoLabel = await page.$eval('#torch-index option', e => e.textContent);
+  is(autoLabel.startsWith('Automatic —')
+       && (depPayload.gpu.name
+             ? autoLabel.includes(depPayload.gpu.name)
+             : /no NVIDIA GPU found/.test(autoLabel)),
+     'the PyTorch picker says what Automatic chose', autoLabel);
+
+  // Restarting an engine that was never set up is a sentence, not a stack
+  // trace — and never a 500.
+  const restart = await app.post('/api/comfy/restart', {});
+  is(typeof restart.error === 'string' && restart.error.length > 0,
+     'restarting an engine with no install says so', restart.error);
+  for (let i = noise.length - 1; i >= 0; i--) {
+    if (noise[i].includes('/api/comfy/restart')) noise.splice(i, 1);
+  }
+
+  // The primary button used to read "Set up the engine" for every one of
+  // these, and open a setup dialog that cannot restart an engine.
+  const labels2 = await page.evaluate(() => ({
+    ready: blocker({ ready: true }).label,
+    fresh: blocker({ ready: false, setup_complete: false }).label,
+    during: blocker({ ready: false, setup_running: true }).label,
+    offline: blocker({ ready: false, setup_complete: true, comfy_online: false }).label,
+    nodes: blocker({ ready: false, setup_complete: true, comfy_online: true,
+                     nodes_ready: false }).label,
+    models: blocker({ ready: false, setup_complete: true, comfy_online: true,
+                      nodes_ready: true, missing_models: ['Qwen/x'] }).label,
+  }));
+  is(labels2.ready === 'Read the script' && labels2.fresh === 'Set up the engine'
+       && labels2.during === 'Setting up…'
+       && labels2.offline === 'Start the engine'
+       && labels2.nodes === 'Restart the engine'
+       && labels2.models === 'Download the models',
+     'the primary button names the actual blocker', JSON.stringify(labels2));
+
   /* --------------------------------------------------------------- setup */
   await page.click('#btnReRun');
   await sleep(800);
