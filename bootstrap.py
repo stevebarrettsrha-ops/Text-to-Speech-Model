@@ -194,10 +194,18 @@ class Progress:
             self.steps[key]["pct"] = None
 
     def detail(self, key: str, detail: str, pct: float | None = None) -> None:
+        """pct None puts the bar away rather than leaving the last one up.
+
+        A download that finishes and hands over to a step with nothing to
+        measure — unpacking a wheel, resolving dependencies — used to leave the
+        bar frozen at 100% for the minutes that followed, which reads as a run
+        that has finished and hung. An absent bar reads as "no number yet",
+        which is the truth.
+        """
         with self._lock:
             self.steps[key]["detail"] = detail
-            if pct is not None:
-                self.steps[key]["pct"] = max(0.0, min(100.0, float(pct)))
+            self.steps[key]["pct"] = None if pct is None \
+                else max(0.0, min(100.0, float(pct)))
 
     def finish(self, key: str, detail: str = "") -> None:
         with self._lock:
@@ -490,8 +498,11 @@ def human_size(n: float) -> str:
     ten megabytes as "0.00 of 0.00 GB"."""
     if n >= 1e9:
         return f"{n / 1e9:.2f} GB"
-    if n >= 1e6:
+    if n >= 1e7:
         return f"{n / 1e6:.0f} MB"
+    if n >= 1e6:
+        # A decimal below ten megabytes, or a 1.8 MB wheel reads as "2 MB".
+        return f"{n / 1e6:.1f} MB"
     if n >= 1e3:
         return f"{n / 1e3:.0f} kB"
     return f"{int(n)} B"
@@ -710,17 +721,28 @@ def pip_progress(line: str, state: dict):
         state["what"] = (parts[1].split("-")[0] if len(parts) > 1
                          else "package")
         state["since"] = time.time()
+        state["phase"] = "download"
         # Shown as well as recorded: where pip is too old for raw progress
         # this line and the clock below are the whole account of a download.
-        size = re.search(r"\(([\d.]+\s*[kKMG]?B)\)", line)
+        size = re.search(r"\(([\d.]+)\s*([kKMG]?)B\)", line)
+        bytes_ = 0.0
+        if size:
+            scale = {"": 1, "k": 1e3, "K": 1e3, "M": 1e6, "G": 1e9}
+            bytes_ = float(size.group(1)) * scale[size.group(2)]
         return (f"Downloading {state['what']}"
-                + (f" — {size.group(1)}" if size else ""), None)
+                + (f" — {human_size(bytes_)}" if size else ""), None)
     if line.startswith("Installing collected packages"):
         # Nothing is printed again until this finishes, and for a 2.7 GB
-        # PyTorch that is minutes of writing thousands of files. Say which
-        # part is slow rather than leaving the last download's name up.
-        state["what"] = "Unpacking and installing — the slow part"
-        return ("Unpacking and installing — the slow part", None)
+        # PyTorch that is minutes of writing thousands of files. pip_install's
+        # heartbeat measures site-packages growing so there is still a number
+        # moving; all this can do is name the phase and count the packages.
+        names = [n.strip() for n in line.split(":", 1)[-1].split(",")
+                 if n.strip()] if ":" in line else []
+        state["packages"] = len(names)
+        state["phase"] = "install"
+        state["what"] = (f"Unpacking {len(names)} packages" if len(names) > 1
+                         else "Unpacking and installing — the slow part")
+        return (state["what"], None)
     if line.startswith(("Building", "Preparing", "Getting requirements")):
         state["what"] = line[:60]
         return (line[:60], None)
@@ -736,8 +758,14 @@ def pip_progress(line: str, state: dict):
     speed = got / elapsed
     if total <= 0:
         return (f"{what} — {got / 1e6:.0f} MB so far", None)
-    size = (f"{got / 1e9:.2f} of {total / 1e9:.2f} GB" if total >= 1e9
-            else f"{got / 1e6:.0f} of {total / 1e6:.0f} MB")
+    if total >= 1e9:
+        size = f"{got / 1e9:.2f} of {total / 1e9:.2f} GB"
+    elif total >= 1e7:
+        size = f"{got / 1e6:.0f} of {total / 1e6:.0f} MB"
+    else:
+        # Rounding to whole megabytes showed a 1.3 MB wheel as "0 of 1 MB",
+        # which reads as a stuck download rather than a small one.
+        size = f"{got / 1e6:.1f} of {total / 1e6:.1f} MB"
     # Clamped here so every consumer gets a sane number: Progress.detail
     # clamps its own, but a Task on the Engine page takes what it is given and
     # would set a bar to a negative width.
@@ -752,23 +780,122 @@ def pip_progress(line: str, state: dict):
             f"{int(left // 60)}m {int(left % 60):02d}s left", pct)
 
 
-def pip_raw_progress(python: str) -> list[str]:
+_PIP_RAW: dict[str, list[str]] = {}
+
+
+def pip_raw_progress(python: str, refresh: bool = False) -> list[str]:
     """`--progress-bar raw` if this pip offers it, asked rather than guessed.
 
     A version number is the wrong test: pip 24.0 takes only on/off and exits
     with "invalid choice: 'raw'" — passing it there does not merely lose the
     percentage, it fails the install. pip's own help lists the choices, so
-    read them.
+    read them. Cached per interpreter, because the answer only changes when
+    pip_ready() upgrades pip and then asks again.
     """
+    key = str(python)
+    if not refresh and key in _PIP_RAW:
+        return _PIP_RAW[key]
+    flags: list[str] = []
     try:
-        out = _run([str(python), "-m", "pip", "install", "--help"], timeout=60)
+        out = _run([key, "-m", "pip", "install", "--help"], timeout=60)
         block = re.search(r"--progress-bar[^\n]*\n(?:\s{6,}[^\n]*\n)*",
                           out.stdout or "")
         if block and re.search(r"\braw\b", block.group(0)):
-            return ["--progress-bar", "raw"]
+            flags = ["--progress-bar", "raw"]
     except Exception:  # noqa: BLE001
         pass
-    return []
+    _PIP_RAW[key] = flags
+    return flags
+
+
+_PIP_READY: set[str] = set()
+
+
+def pip_ready(python: str, log) -> None:
+    """Get this interpreter a pip that can report progress. Once, per pip.
+
+    `--progress-bar raw` arrived in pip 24.1, and it is the only account of a
+    2.7 GB download that survives being piped — pip draws nothing at all when
+    it is not talking to a terminal. A venv ships whatever pip its base Python
+    bundled, which for Python 3.11 is 24.0, so without this the longest step of
+    the install is a blank panel for ten minutes. That is the bug report:
+    "not showing me how much gigabyte the file is and how much is done".
+
+    An upgrade that fails is not fatal — the install still runs, it just runs
+    quietly — so this never raises.
+    """
+    key = str(python)
+    if key in _PIP_READY:
+        return
+    _PIP_READY.add(key)
+    if pip_raw_progress(key):
+        return
+    log("Updating pip first so the download can report a percentage…")
+    try:
+        out = _run([key, "-m", "pip", "install", "--upgrade", "pip",
+                    "--disable-pip-version-check"], timeout=900)
+        if out.returncode != 0:
+            log("Could not update pip — the install will run without a "
+                "percentage. " + (out.stderr or out.stdout or "")[-200:])
+    except Exception as exc:  # noqa: BLE001
+        log(f"Could not update pip ({exc}) — the install will run without a "
+            "percentage.")
+    pip_raw_progress(key, refresh=True)
+
+
+_SITE: dict[str, str] = {}
+
+
+def site_packages(python: str) -> str:
+    """Where this interpreter unpacks wheels, asked once and remembered."""
+    key = str(python)
+    if key not in _SITE:
+        try:
+            out = _run([key, "-c", "import sysconfig;"
+                                   "print(sysconfig.get_paths()['purelib'])"],
+                       timeout=60)
+            _SITE[key] = (out.stdout or "").strip().splitlines()[-1] \
+                if out.returncode == 0 and (out.stdout or "").strip() else ""
+        except Exception:  # noqa: BLE001
+            _SITE[key] = ""
+    return _SITE[key]
+
+
+def dir_size(path, budget: int = 400_000) -> int:
+    """Bytes under `path`, giving up after `budget` files.
+
+    This runs on a timer while pip unpacks, and a site-packages with torch in
+    it is fifty thousand files — the cap is there so a pathological tree can
+    never turn the progress report into the slow part.
+    """
+    total, seen = 0, 0
+    for root, _dirs, files in os.walk(str(path), onerror=lambda _e: None):
+        for name in files:
+            try:
+                total += os.stat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+            seen += 1
+            if seen >= budget:
+                return total
+    return total
+
+
+def quiet_detail(state: dict, written: int, seconds: int) -> str:
+    """What to show while pip is saying nothing. Pulled out to be testable.
+
+    No percentage, on purpose. A wheel unpacks to more than it downloads, by a
+    ratio that varies per package, so a bar worked out from the download size
+    would sit pinned at 100% for minutes — worse than no bar. A byte count that
+    keeps climbing is the honest version of "how much of the progress is done".
+    """
+    head = state.get("what") or "Working"
+    if written:
+        # Bytes written, and deliberately not "of the 2.7 GB downloaded": a
+        # wheel unpacks to more than it downloads, so that reads as 199 of 88
+        # and looks like a bug rather than progress.
+        head += f" — {human_size(written)} written"
+    return f"{head} — {seconds // 60}m {seconds % 60:02d}s so far"
 
 
 def pip_install(python: str, args: list[str], log, on_detail=None) -> None:
@@ -777,6 +904,7 @@ def pip_install(python: str, args: list[str], log, on_detail=None) -> None:
     pct is None when there is no number to show — pip says nothing measurable
     while it resolves dependencies or unpacks a wheel.
     """
+    pip_ready(python, log)
     cmd = [python, "-m", "pip", "install"] + args + pip_raw_progress(python)
     log("$ " + " ".join(cmd[:8]) + (" …" if len(cmd) > 8 else ""))
 
@@ -785,16 +913,22 @@ def pip_install(python: str, args: list[str], log, on_detail=None) -> None:
     last_pct = [-1.0]
     started = time.time()
     stop = threading.Event()
+    # Measured before pip runs, so what the unpacking step reports is bytes
+    # this install wrote and not the size of everything already there.
+    site = site_packages(python) if on_detail else ""
+    base_size = dir_size(site) if site else 0
 
     def tick() -> None:
         # Unpacking a 2.7 GB wheel prints nothing for minutes. Keep a clock
-        # running so the panel never looks like it has died.
+        # running so the panel never looks like it has died — and, once pip
+        # is writing, weigh site-packages so the number moves.
         while not stop.wait(5):
             if not on_detail or time.time() - last[0] < 5:
                 continue
-            waited = int(time.time() - started)
-            on_detail(f"{state.get('what') or 'Working'} — "
-                      f"{waited // 60}m {waited % 60:02d}s so far", None)
+            written = (max(dir_size(site) - base_size, 0)
+                       if site and state.get("phase") == "install" else 0)
+            on_detail(quiet_detail(state, written,
+                                   int(time.time() - started)), None)
 
     # The context manager closes the pipe and reaps the child even if reading
     # its output raises, which a bare Popen left to garbage collection did not.
@@ -837,18 +971,217 @@ def pip_install(python: str, args: list[str], log, on_detail=None) -> None:
         raise RuntimeError("pip install failed — see the log.")
 
 
+def _smi_candidates() -> list[str]:
+    """Every place nvidia-smi might be, PATH first.
+
+    The Windows driver drops it in System32, which is normally on PATH — but
+    "normally" is what rule 5 already burned us on: a shortcut, a service, or a
+    venv activated from a trimmed environment can hand the process a PATH
+    without it, and shutil.which then reports no GPU on a machine that has one.
+    """
+    found = shutil.which("nvidia-smi")
+    cands = [found] if found else []
+    if platform.system() == "Windows":
+        root = os.environ.get("SystemRoot") or r"C:\Windows"
+        cands.append(str(Path(root) / "System32" / "nvidia-smi.exe"))
+        for base in {os.environ.get("ProgramFiles") or r"C:\Program Files",
+                     os.environ.get("ProgramW6432") or r"C:\Program Files"}:
+            cands.append(str(Path(base) / "NVIDIA Corporation" / "NVSMI"
+                             / "nvidia-smi.exe"))
+    else:
+        cands += ["/usr/bin/nvidia-smi", "/usr/local/bin/nvidia-smi",
+                  "/opt/bin/nvidia-smi"]
+    seen, out = set(), []
+    for c in cands:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _adapter_names() -> list[str]:
+    """Display adapters, for the case where the driver is not installed.
+
+    nvidia-smi ships with the driver, so its absence means "no usable GPU",
+    not "no GPU" — and telling someone with an RTX 4060 that they have no GPU
+    is both wrong and unactionable. These names come from the machine itself.
+    """
+    system = platform.system()
+    try:
+        if system == "Windows":
+            out = _run(["powershell", "-NoProfile", "-Command",
+                        "Get-CimInstance Win32_VideoController | "
+                        "Select-Object -ExpandProperty Name"], timeout=30)
+            return [l.strip() for l in (out.stdout or "").splitlines() if l.strip()]
+        if system == "Linux":
+            names = []
+            gpus = Path("/proc/driver/nvidia/gpus")
+            for entry in gpus.iterdir() if gpus.is_dir() else []:
+                text = (entry / "information").read_text(errors="replace") \
+                    if (entry / "information").exists() else ""
+                match = re.search(r"Model:\s*(.+)", text)
+                if match:
+                    names.append(match.group(1).strip())
+            if names:
+                return names
+            out = _run(["lspci"], timeout=20)
+            return [l.strip() for l in (out.stdout or "").splitlines()
+                    if "VGA" in l or "3D controller" in l]
+    except Exception:  # noqa: BLE001
+        pass
+    return []
+
+
+_GPU: dict = {}
+
+
+def nvidia_gpu(refresh: bool = False) -> dict:
+    """What NVIDIA hardware is here, and whether its driver answers.
+
+    Returns {"name": str, "driver": bool}. `driver` False with a name means
+    the card is in the machine but nvidia-smi did not run, which is a driver
+    problem and says so — a different sentence from "no GPU".
+
+    Cached: dependencies() asks on every Recheck, and a PowerShell query per
+    poll would be a second of the user's machine for an answer that cannot
+    change without a reboot.
+    """
+    if _GPU and not refresh:
+        return _GPU
+    name, driver = "", False
+    for smi in _smi_candidates():
+        try:
+            out = _run([smi, "--query-gpu=name", "--format=csv,noheader"],
+                       timeout=30)
+        except Exception:  # noqa: BLE001
+            continue
+        if out.returncode != 0:
+            continue
+        first = next((l.strip() for l in (out.stdout or "").splitlines()
+                      if l.strip()), "")
+        if first:
+            name, driver = first, True
+            break
+    if not name:
+        name = next((n for n in _adapter_names() if "nvidia" in n.lower()), "")
+    _GPU.clear()
+    _GPU.update({"name": name, "driver": driver})
+    return _GPU
+
+
+CUDA_INDEX = "https://download.pytorch.org/whl/cu128"
+CPU_INDEX = "https://download.pytorch.org/whl/cpu"
+
+
 def torch_index(cfg: dict) -> str:
     if cfg.get("torch_index"):
         return cfg["torch_index"]
     if platform.system() == "Darwin":
         return ""
-    if shutil.which("nvidia-smi"):
-        try:
-            if _run(["nvidia-smi"], timeout=20).returncode == 0:
-                return "https://download.pytorch.org/whl/cu128"
-        except Exception:
-            pass
-    return "https://download.pytorch.org/whl/cpu"
+    return CUDA_INDEX if nvidia_gpu()["name"] else CPU_INDEX
+
+
+def torch_build(index: str) -> str:
+    """The local version tag the wheels at `index` carry: cu128, cpu, or "".
+
+    pip treats torch 2.14.0+cpu as satisfying a plain `torch`, so asking the
+    CUDA index for it changes nothing: the build has to be compared, and the
+    old one uninstalled, before the right one can land.
+    """
+    match = re.search(r"/whl/(cu\d+|cpu|rocm[\d.]*)", index or "")
+    return match.group(1) if match else ""
+
+
+def installed_torch(python: str) -> str:
+    """The torch already in this environment, "" if there is none."""
+    try:
+        out = _run([str(python), "-c", "import torch;print(torch.__version__)"],
+                   timeout=180)
+    except Exception:  # noqa: BLE001
+        return ""
+    if out.returncode != 0 or not (out.stdout or "").strip():
+        return ""
+    return out.stdout.strip().splitlines()[-1].strip()
+
+
+def drop_mismatched_torch(python: str, index: str, log) -> bool:
+    """Remove a torch whose build is not the one being asked for.
+
+    pip treats `torch` as satisfied by torch 2.14.0+cpu, so pointing it at the
+    CUDA index and asking again changes nothing at all — which is why pressing
+    Reinstall on a CPU build left the CPU build in place and the GPU unused.
+    The old build has to go first. Nothing is removed when the builds already
+    agree, so a Reinstall that only wants to repair a broken install is still
+    the cheap operation it looks like.
+    """
+    wanted = torch_build(index)
+    if not wanted:
+        return False
+    have = installed_torch(python)
+    if not have:
+        return False
+    current = have.split("+")[1] if "+" in have else ""
+    # A wheel from the default PyPI index carries no local tag and is the CUDA
+    # build on Linux, the CPU build on Windows — it cannot be matched against
+    # a tag, so it is left alone rather than reinstalled on a guess.
+    if not current or current == wanted:
+        return False
+    log(f"Installed torch is {have}, but the {wanted} build was asked for — "
+        "removing it first, because pip counts the old one as good enough.")
+    try:
+        _run([str(python), "-m", "pip", "uninstall", "-y",
+              "torch", "torchaudio", "torchvision"], timeout=900)
+    except Exception as exc:  # noqa: BLE001
+        log(f"Could not remove the old torch ({exc}) — carrying on.")
+        return False
+    return True
+
+
+NODE_PROBE = """
+import importlib.util, sys
+root, pkg = sys.argv[1], sys.argv[2]
+sys.path.insert(0, root)
+spec = importlib.util.spec_from_file_location("qwen_tts_probe",
+                                              pkg + "/__init__.py")
+mod = importlib.util.module_from_spec(spec)
+try:
+    spec.loader.exec_module(mod)
+except BaseException as exc:
+    print("FAILED " + type(exc).__name__ + ": " + str(exc)[:400])
+    sys.exit(2)
+print("OK")
+"""
+
+
+def node_import_error(python: str, comfy_dir: Path) -> str:
+    """Why ComfyUI could not load the Qwen-TTS nodes, in one sentence.
+
+    ComfyUI prints its import failures to its own console and carries on, so
+    "Installed but ComfyUI has not loaded them" was as far as the Engine panel
+    could get — a dead end for anyone running it from a launcher with no
+    console to read. Importing the package in the same interpreter, with the
+    ComfyUI folder on sys.path the way ComfyUI puts it there, reproduces the
+    failure and gets the actual exception back: almost always a package the
+    node needs that is not installed.
+
+    Returns "" when the import succeeds, which means the running ComfyUI is
+    simply older than the install and wants a restart.
+    """
+    node_path = comfy_dir / "custom_nodes" / NODE_DIR_NAME
+    if not (node_path / "__init__.py").exists():
+        return "The Qwen-TTS nodes are not installed."
+    try:
+        out = _run([str(python), "-c", NODE_PROBE, str(comfy_dir),
+                    str(node_path)], cwd=str(comfy_dir), timeout=600)
+    except Exception as exc:  # noqa: BLE001
+        return f"Could not test the import: {exc}"
+    text = ((out.stdout or "") + (out.stderr or "")).strip()
+    if out.returncode == 0 and text.endswith("OK"):
+        return ""
+    for line in reversed(text.splitlines()):
+        if line.startswith("FAILED "):
+            return line[len("FAILED "):]
+    return text[-400:] or "The import failed without saying why."
 
 
 # --------------------------------------------------------------------------- #
@@ -978,8 +1311,20 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
                 prog.detail("deps", "Installing PyTorch — the long one…")
                 pip_install(str(target), ["--upgrade", "pip", "wheel"],
                             prog.log, say)
-                args = ["torch", "torchaudio"]
                 idx = torch_index(cfg)
+                gpu = nvidia_gpu()
+                if gpu["name"]:
+                    prog.log(f"Graphics: {gpu['name']}"
+                             + ("" if gpu["driver"] else
+                                " (driver not answering — nvidia-smi did not "
+                                "run, so a CPU build may be the safe one)"))
+                else:
+                    prog.log("No NVIDIA GPU found — installing the CPU build.")
+                # A second setup run over an environment that already has the
+                # wrong build would otherwise change nothing: pip counts
+                # torch+cpu as satisfying `torch`.
+                drop_mismatched_torch(str(target), idx, prog.log)
+                args = ["torch", "torchaudio"]
                 if idx:
                     args += ["--index-url", idx]
                 pip_install(str(target), args, prog.log, say)
@@ -1025,7 +1370,29 @@ def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
             if not comfy_online(url):
                 raise RuntimeError(f"ComfyUI is not answering at {url}.")
         elif comfy_online(url):
-            prog.log("ComfyUI is already running")
+            # It was already up when this run installed the nodes into it, and
+            # ComfyUI reads custom_nodes once, at startup — so it is running
+            # without them, which is the "Nodes not loaded" the Engine panel
+            # then reports with nothing the user can do about it. Bounce it.
+            if comfy.alive():
+                prog.detail("launch", "Restarting ComfyUI so it loads the "
+                                      "Qwen-TTS nodes…")
+                prog.log("Restarting ComfyUI so it picks up the nodes")
+                comfy.stop()
+                for _ in range(30):
+                    if not comfy_online(url):
+                        break
+                    time.sleep(1)
+                comfy.start(cfg["python"], Path(cfg["comfy_dir"]),
+                            comfy_port(url), prog)
+                if not wait_for_comfy(url, timeout=900):
+                    raise RuntimeError(
+                        "ComfyUI did not come back after the restart.\n"
+                        + "\n".join(comfy.tail(25)))
+            else:
+                prog.log("ComfyUI is already running, and Script Builder did "
+                         "not start it — restart it yourself so it loads the "
+                         "Qwen-TTS nodes.")
         else:
             comfy.start(cfg["python"], Path(cfg["comfy_dir"]),
                         comfy_port(url), prog)

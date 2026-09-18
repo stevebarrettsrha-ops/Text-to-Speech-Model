@@ -296,6 +296,9 @@ def api_status():
     payload = {
         "comfy_online": online,
         "setup_complete": bool(cfg.get("setup_complete")),
+        # So the Create page can say "Setting up…" rather than offer a setup
+        # that is already running.
+        "setup_running": bool(progress.running),
         "models_known": models_known,
         "missing_models": missing,
         "detected": detect_comfy_dirs(),
@@ -375,6 +378,59 @@ def api_comfy_start():
     return jsonify({"ok": True})
 
 
+@app.post("/api/comfy/restart")
+def api_comfy_restart():
+    """Stop ComfyUI and start it again, then say whether the nodes loaded.
+
+    ComfyUI reads custom_nodes once, at startup. Installing the Qwen-TTS nodes
+    into an engine that is already running leaves it running without them, and
+    "Installed but ComfyUI has not loaded them" is not something anyone can act
+    on from a launcher with no console. This is the act.
+    """
+    py = bootstrap.comfy_python(cfg)
+    if not cfg.get("comfy_dir") or not py:
+        return jsonify({"error": "Run setup first."}), 400
+    url = cfg["comfy_url"]
+    if comfy_online(url) and not comfy_proc.alive():
+        return jsonify({"error": "Something else started that ComfyUI, so "
+                                 "Script Builder cannot restart it. Restart it "
+                                 "yourself so it loads the nodes."}), 400
+
+    def run(task: manager.Task) -> None:
+        if comfy_proc.alive():
+            task.set(detail="Stopping ComfyUI…")
+            comfy_proc.stop()
+            for _ in range(30):
+                if not comfy_online(url):
+                    break
+                time.sleep(1)
+        task.set(detail="Starting ComfyUI — the first start is slow…")
+        comfy_proc.start(py, Path(cfg["comfy_dir"]), comfy_port(url), progress)
+        if not bootstrap.wait_for_comfy(url, timeout=900):
+            raise RuntimeError("ComfyUI did not come back.\n"
+                               + "\n".join(comfy_proc.tail(25)))
+        # force=True: the schema is cached for two minutes, and two minutes of
+        # "still missing" after a restart that fixed it is the wrong answer.
+        client.schema(force=True)
+        if client.has("CustomVoiceNode") or client.has("VoiceDesignNode"):
+            task.set(detail="Restarted — the Qwen-TTS nodes are loaded.")
+            return
+        task.set(detail="ComfyUI is up but the nodes are still missing — "
+                        "finding out why…")
+        for line in comfy_proc.tail(80):
+            if "IMPORT FAILED" in line or "Qwen" in line:
+                task.log(line)
+        why = bootstrap.node_import_error(py, Path(cfg["comfy_dir"]))
+        raise RuntimeError(
+            why or "ComfyUI did not load the nodes, but importing them by hand "
+                   "works — so something else in custom_nodes is failing "
+                   "first. Check the ComfyUI console.")
+
+    return jsonify({"ok": True,
+                    "task": manager.spawn("engine", "Restart ComfyUI",
+                                          run).view()})
+
+
 @app.post("/api/config")
 def api_config():
     body = request.get_json(silent=True) or {}
@@ -394,8 +450,14 @@ def api_config():
 @app.get("/api/deps")
 def api_deps():
     live = client if comfy_online(cfg["comfy_url"]) else None
+    # The GPU answer is cached — it costs a PowerShell query on Windows and
+    # cannot change without a reboot. Recheck asks again anyway, because
+    # installing the driver is exactly what someone does between two presses.
+    gpu = bootstrap.nvidia_gpu(refresh=request.args.get("fresh") == "1")
     return jsonify({"items": manager.dependencies(cfg, live),
-                    "torch_index": cfg.get("torch_index", "")})
+                    "torch_index": cfg.get("torch_index", ""),
+                    "gpu": gpu,
+                    "torch_auto": bootstrap.torch_index({})})
 
 
 @app.post("/api/deps/<dep_id>/install")

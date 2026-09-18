@@ -146,6 +146,32 @@ def _probe(python: str, code: str, timeout: int = 90) -> tuple[int, str]:
 # --------------------------------------------------------------------------- #
 # dependency report
 # --------------------------------------------------------------------------- #
+def no_cuda_reason(version: str) -> str:
+    """Why torch cannot see a GPU, in the words that fit this machine.
+
+    "no GPU found" was reported to someone holding an RTX 4060, because all
+    the check knew was that torch.cuda.is_available() came back False. The
+    usual cause is the build: a wheel tagged +cpu has no CUDA in it at all and
+    never will, whatever hardware is underneath. Look at the machine before
+    blaming it.
+    """
+    gpu = bootstrap.nvidia_gpu()
+    build = version.split("+")[1] if "+" in version else ""
+    if gpu["name"] and build == "cpu":
+        return (f"torch {version} — this is the CPU-only build, but {gpu['name']} "
+                "is here. Pick the NVIDIA build above and press Reinstall.")
+    if gpu["name"] and not gpu["driver"]:
+        return (f"torch {version} — {gpu['name']} is here but its driver is not "
+                "answering. Install the NVIDIA driver, then press Recheck.")
+    if gpu["name"]:
+        return (f"torch {version} — {gpu['name']} is here but this build cannot "
+                "use it. Pick the NVIDIA build above and press Reinstall.")
+    if build == "cpu":
+        return (f"torch {version} — the CPU-only build, and no NVIDIA GPU was "
+                "found. Speech will be slow.")
+    return f"torch {version} — no NVIDIA GPU found, speech will be slow."
+
+
 def dependencies(cfg: dict, client=None) -> list[dict]:
     items: list[dict] = []
 
@@ -176,11 +202,15 @@ def dependencies(cfg: dict, client=None) -> list[dict]:
         items.append({
             "id": "node", "label": "Qwen-TTS nodes",
             "state": "ok" if loaded is not False else "warn",
+            # ComfyUI reads custom_nodes once, at startup, so the usual cause
+            # is an engine that was already running when they were installed.
+            # Restart is the fix and the diagnosis both: if they still do not
+            # load, that task imports them and reports the real exception.
             "detail": (str(comfy_dir / "custom_nodes" / NODE_DIR_NAME)
                        if loaded is not False else
-                       "Installed but ComfyUI has not loaded them — check the "
-                       "ComfyUI console for IMPORT FAILED, then restart it."),
-            "action": "update"})
+                       "Installed, but this ComfyUI started before they were. "
+                       "Restart it so it loads them."),
+            "action": "update" if loaded is not False else "restart"})
     else:
         items.append({"id": "node", "label": "Qwen-TTS nodes", "state": "missing",
                       "detail": "flybirdxx/ComfyUI-Qwen-TTS is not installed.",
@@ -209,9 +239,9 @@ def dependencies(cfg: dict, client=None) -> list[dict]:
                                   "detail": f"torch {d['v']} — GPU: {d['dev']}",
                                   "action": "reinstall"})
                 else:
-                    items.append({"id": "torch", "label": "PyTorch", "state": "warn",
-                                  "detail": f"torch {d['v']} — no GPU found, "
-                                            "speech will be slow.",
+                    items.append({"id": "torch", "label": "PyTorch",
+                                  "state": "warn",
+                                  "detail": no_cuda_reason(d["v"]),
                                   "action": "reinstall"})
             except Exception:
                 items.append({"id": "torch", "label": "PyTorch", "state": "unknown",
@@ -306,9 +336,14 @@ def install_dependency(dep_id: str, cfg: dict, opts: dict) -> Task:
 
 
 def _reporter(task: Task):
-    """pip progress into the task the Engine panel is showing."""
+    """pip progress into the task the Engine panel is showing.
+
+    A pct of None is 0 here, and the panel hides a bar at 0 — the same reason
+    Progress.detail clears its own: a bar left at 100% while pip unpacks for
+    ten silent minutes reads as a run that finished and hung.
+    """
     def say(text: str, pct: float | None) -> None:
-        task.set(detail=text, **({"pct": pct} if pct is not None else {}))
+        task.set(detail=text, pct=0.0 if pct is None else pct)
     return say
 
 
@@ -400,6 +435,7 @@ def _install_torch(task: Task, cfg: dict, opts: dict) -> None:
     task.set(detail="Installing PyTorch — this is the long one…")
     bootstrap.pip_install(str(target), ["--upgrade", "pip", "wheel"],
                           task.log, say)
+    bootstrap.drop_mismatched_torch(str(target), index, task.log)
     args = ["torch", "torchaudio"]
     if index:
         args += ["--index-url", index]

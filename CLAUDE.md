@@ -39,6 +39,20 @@
    so the nodes still fail to import.
 5. **Python detection is by execution, never PATH lookup.** Windows Store stubs
    resolve on PATH and fail to run.
+5b. **So is GPU detection.** `torch_index` gated on
+   `shutil.which("nvidia-smi")` and, when that came back empty, installed the
+   CPU wheel index on a machine with an RTX 4060 in it — so torch arrived as
+   `2.14.0+cpu` and the Engine panel reported "no GPU found" to someone holding
+   a GPU. `nvidia_gpu()` runs nvidia-smi from PATH *and* from the places the
+   driver puts it, and falls back to the display-adapter list, which tells a
+   missing driver apart from a missing card. The two get different sentences.
+5c. **A build already installed satisfies pip, so Reinstall must uninstall
+   first.** pip counts torch 2.14.0+cpu as satisfying `torch`; pointing it at
+   the CUDA index and asking again changes nothing, which is why pressing
+   Reinstall on the CPU build left the CPU build in place.
+   `drop_mismatched_torch` compares the `+tag` against the index and removes
+   the old one — and does nothing when they agree, or when the wheel carries
+   no tag and there is nothing to compare.
 6. **Downloads are resumable, and nothing is renamed until it is whole.** Stream
    to `<name>.part`, `Range` on retry, atomic `replace()` — but only once what
    arrived accounts for the size the listing gave. A dropped connection ends the
@@ -108,6 +122,33 @@
    `pct` that is None until there is a real number — a bar sitting at 0% for
    fifteen minutes reads as broken — and `download_repo`'s percentage is
    spread across the folders so the bar crosses the step once.
+16b. **pip 24.1 is the floor for a percentage, and a fresh venv is below it.**
+   `--progress-bar raw` arrived in pip 24.1; `python -m venv` hands you the pip
+   its base Python bundled, which for 3.11 and 3.12 is 24.0. So the probe
+   above correctly found no raw support and the longest step of the install
+   showed no number at all. `pip_ready` upgrades pip once per interpreter
+   before the first long install and asks again. It never raises: an upgrade
+   that fails costs the percentage, not the install.
+16c. **The unpacking step is measured, not guessed, and never given a bar.**
+   pip prints nothing between "Installing collected packages" and
+   "Successfully installed" — minutes, for a 2.7 GB torch. The heartbeat weighs
+   site-packages against a baseline taken before pip ran, so a real byte count
+   climbs. It is deliberately not shown as a percentage of the download: a
+   wheel unpacks to more than it downloads, so that reads "199 MB of 88 MB" and
+   looks like a fault. `Progress.detail(pct=None)` *clears* the bar rather than
+   leaving the last one up, or the download's final 100% sits there for the
+   whole silent stretch and reads as a run that finished and hung.
+17. **ComfyUI reads `custom_nodes` once, at startup.** Installing the Qwen-TTS
+   nodes into an engine that is already running leaves it running without
+   them — the "Nodes not loaded" warning with nothing behind it. `run_setup`
+   restarts the engine it owns; the Engine panel offers Restart, and if the
+   nodes still do not appear, `node_import_error` imports the package in
+   ComfyUI's own interpreter and reports the real exception. "Check the ComfyUI
+   console" is not an instruction anyone running from a launcher can follow.
+18. **The primary button names the blocker it can actually clear.** It read
+   "Set up the engine" and opened the setup dialog for every not-ready state,
+   including an engine that is set up and merely needs restarting — which that
+   dialog cannot do. `blocker(status)` returns the label and where to go.
 
 ## Why line-by-line, not DialogueInferenceNode
 
