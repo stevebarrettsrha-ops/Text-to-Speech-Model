@@ -8,6 +8,7 @@ names say what would break rather than what the function is called.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -577,6 +578,60 @@ class DeadEngine(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("stopped answering", message)
         self.assertNotIn("HTTPConnectionPool", message)
+
+
+class ComfyUISomeoneElseStarted(unittest.TestCase):
+    """CLAUDE.md rule 18: the sentence names the blocker it can actually clear.
+
+    Connecting to a ComfyUI you start yourself records managed False with no
+    comfy_dir. When that ComfyUI stops answering, "run setup for it from the
+    Engine panel" sends you to a dialog that cannot start someone else's
+    process — the address is the thing that can be acted on.
+    """
+
+    def setUp(self):
+        self.saved = copy.deepcopy(server.cfg)
+
+    def tearDown(self):
+        server.cfg.clear()
+        server.cfg.update(self.saved)
+
+    def _external(self, engine="qwen"):
+        slot = bootstrap.engine_cfg(server.cfg, engine)
+        slot.update({"managed": False, "comfy_dir": "", "python": "",
+                     "auto_start": True,
+                     # Nothing is listening here.
+                     "comfy_url": "http://127.0.0.1:1"})
+        return slot
+
+    def test_a_ComfyUI_that_stopped_names_its_address(self):
+        slot = self._external()
+        why = server.activate("qwen")
+        self.assertIn(slot["comfy_url"], why)
+        self.assertNotIn("run setup", why.lower())
+
+    def test_an_engine_never_set_up_still_says_run_setup(self):
+        slot = bootstrap.engine_cfg(server.cfg, "qwen")
+        slot.update({"managed": True, "comfy_dir": "", "python": "",
+                     "comfy_url": "http://127.0.0.1:1"})
+        self.assertIn("run setup", server.activate("qwen").lower())
+
+    def test_one_started_elsewhere_is_told_apart_from_one_on_disk(self):
+        # Picking a ComfyUI already on disk also records managed False, but it
+        # has a folder — that one Script Builder can start.
+        self.assertTrue(server.started_elsewhere(
+            {"managed": False, "comfy_dir": ""}))
+        self.assertFalse(server.started_elsewhere(
+            {"managed": False, "comfy_dir": "/opt/ComfyUI"}))
+        self.assertFalse(server.started_elsewhere(
+            {"managed": True, "comfy_dir": ""}))
+
+    def test_restart_says_who_has_to_do_it(self):
+        self._external()
+        with server.app.test_client() as web:
+            r = web.post("/api/comfy/restart?engine=qwen")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("127.0.0.1:1", r.get_json()["error"])
 
 
 class Interpreters(unittest.TestCase):
