@@ -447,8 +447,10 @@ def api_status():
         "comfy_online": online,
         "engine": engine,
         "engines": [{"id": e["id"], "label": e["label"], "blurb": e["blurb"],
+                     "role": e.get("role", "secondary"),
                      "enabled": bootstrap.engine_enabled(cfg, e["id"])}
                     for e in bootstrap.ENGINES.values()],
+        "primary_engine": bootstrap.start_engine(cfg),
         "setup_complete": bool(cfg.get("setup_complete")),
         # So the Create page can say "Setting up…" rather than offer a setup
         # that is already running.
@@ -1082,6 +1084,20 @@ def main() -> None:
     swept = sweep_orphan_takes()
     if swept:
         progress.log(f"Cleared {swept} unfinished take folder(s).")
+    # Every launch opens on the primary engine, whichever one the last session
+    # ended on. MOSS is a deliberate switch made on the Create page, and it
+    # lasts that session: an app that quietly came back up holding the
+    # secondary engine's models is one that chose for you, and on 8 GB that
+    # choice costs the card.
+    primary = bootstrap.start_engine(cfg)
+    if cfg.get("engine") != primary:
+        was = cfg.get("engine")
+        cfg["engine"] = primary
+        save_config(cfg)
+        if was:
+            progress.log(f"Opening on {bootstrap.ENGINES[primary]['label']}, "
+                         f"the primary engine — the last session ended on "
+                         f"{bootstrap.ENGINES.get(was, {}).get('label', was)}.")
     if cfg.get("setup_complete") and cfg.get("auto_start_comfy", True) \
             and not engine_online():
         # Only the engine that is selected. The other would sit on the card

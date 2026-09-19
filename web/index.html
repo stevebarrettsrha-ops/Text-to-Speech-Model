@@ -1148,8 +1148,15 @@ function fillEngines(list, current) {
     if (e.enabled === false) return;
     var o = document.createElement("option");
     o.value = e.id;
-    o.textContent = e.label;
-    o.title = e.blurb || "";
+    // Which engine the app opens on is worth saying in the one place the
+    // choice is made: the secondary is a switch for this session, and the
+    // next launch is back on the primary.
+    o.textContent = e.label + (e.role === "primary" ? " · primary"
+                               : e.role ? " · secondary" : "");
+    o.title = (e.blurb || "") + (e.role === "primary"
+      ? " Every launch opens on this engine."
+      : e.role ? " A switch for this session; the next launch opens on the "
+                 + "primary engine." : "");
     sel.appendChild(o);
   });
   if (!sel.options.length) {
@@ -1165,7 +1172,8 @@ async function setEngine(id) {
   S.voices = {};
   saveDraft();
   // Remembered server-side so a reload, and the next /api/status, come back
-  // on the engine that is showing rather than snapping to Qwen.
+  // on the engine that is showing rather than snapping to the primary
+  // mid-session. A fresh launch does reset it — see start_engine().
   try {
     await api("/api/config", { method: "POST",
       headers: { "Content-Type": "application/json" },

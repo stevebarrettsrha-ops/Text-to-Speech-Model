@@ -580,6 +580,41 @@ class DeadEngine(unittest.TestCase):
         self.assertNotIn("HTTPConnectionPool", message)
 
 
+class WhichEngineALaunchOpensOn(unittest.TestCase):
+    """Qwen is primary: every launch opens on it, whichever engine the last
+    session ended on. MOSS is a switch made on the Create page and lasting that
+    session — an app that quietly came back up holding the secondary engine's
+    models has chosen for you, and on 8 GB that choice costs the card. Being
+    secondary is about what is loaded at launch, never about what is
+    installed: first run still fetches both."""
+
+    def test_the_primary_is_where_a_launch_starts(self):
+        self.assertEqual(bootstrap.start_engine({}), "qwen")
+        self.assertEqual(bootstrap.PRIMARY_ENGINE, "qwen")
+
+    def test_last_session_ending_on_moss_does_not_move_it(self):
+        self.assertEqual(bootstrap.start_engine({"engine": "moss"}), "qwen")
+
+    def test_turning_the_primary_off_falls_to_one_that_is_on(self):
+        # Qwen cannot be turned off today, so this is the shape of the answer
+        # rather than a live case: never return an engine that is disabled.
+        with mock.patch.object(bootstrap, "engine_enabled",
+                               side_effect=lambda c, e: e == "moss"):
+            self.assertEqual(bootstrap.start_engine({}), "moss")
+
+    def test_both_engines_are_still_wanted_on_a_first_run(self):
+        # Secondary is not "optional": the setup sheet ticks MOSS by default
+        # and its models are in the first-run list.
+        wanted = {m["repo"] for m in bootstrap.wanted_models(
+            dict(bootstrap.DEFAULT_CONFIG))}
+        self.assertTrue(any(r.startswith("OpenMOSS-Team/") for r in wanted))
+        self.assertTrue(any(r.startswith("Qwen/") for r in wanted))
+
+    def test_the_roles_are_on_the_engines_themselves(self):
+        self.assertEqual(bootstrap.ENGINES["qwen"]["role"], "primary")
+        self.assertEqual(bootstrap.ENGINES["moss"]["role"], "secondary")
+
+
 class AutoStartingASlowEngine(unittest.TestCase):
     """Starting an engine is not the same as it being ready, and the boot path
     asks for exactly that: launch it, do not wait. Reading the schema straight

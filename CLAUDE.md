@@ -190,6 +190,17 @@
    Auto-starting a slow engine therefore stopped the app from booting at all,
    a few lines under a comment promising that could not happen.
 
+18g. **Qwen is the primary engine, and every launch opens on it.** MOSS is a
+   switch made on the Create page, and it lasts that session: `main()` sets
+   `cfg["engine"]` from `start_engine(cfg)` before anything is started, so an
+   app that last ended on MOSS comes back on Qwen rather than quietly bringing
+   the secondary engine's models up on the card. The in-session choice is still
+   saved — a reload has to come back on the engine that is showing — which is
+   why the reset lives at launch rather than in `current_engine()`. Secondary
+   is about what is loaded at startup, never about what is installed: first run
+   still installs both engines and downloads both sets of models, and
+   `start_engine` never returns an engine that is turned off.
+
 19. **Two engines, and everything that differs between them lives in
    `ENGINES`.** Node repo, node folder, the file that proves it is installed,
    the models sub-folder, the folder layout and the model list are one table
@@ -324,8 +335,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 144 unit tests, standard library only
-npm test                 # 89 checks driving the real page in headless Chromium
+npm run test:units       # 149 unit tests, standard library only
+npm test                 # 90 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script

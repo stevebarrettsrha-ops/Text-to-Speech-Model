@@ -330,6 +330,14 @@ try {
        && engines.some(e => e.id === 'moss'),
      'both engines are offered', engines.map(e => e.label).join(', '));
 
+  // Which engine a launch opens on is worth saying where the choice is made.
+  const roles = await app.api('/api/status');
+  is(roles.primary_engine === 'qwen'
+       && engines.find(e => e.id === 'qwen').label.includes('primary')
+       && engines.find(e => e.id === 'moss').label.includes('secondary'),
+     'the picker says which engine is primary',
+     engines.map(e => e.label).join(' | '));
+
   // MOSS has no speaker enum on any node, so "Preset" would open an empty
   // dropdown. The same slot has to become the model's own voice instead.
   await page.selectOption('#engine-sel', 'moss');
