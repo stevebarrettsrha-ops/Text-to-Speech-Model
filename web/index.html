@@ -90,6 +90,10 @@
   .btn.go{background:linear-gradient(100deg,var(--accent),var(--accent-2));color:#fff}
   .btn.thin{padding:7px 13px;font-size:12.5px}
   .btn:disabled{opacity:.45;cursor:not-allowed}
+  .btn .spin{display:inline-block;width:12px;height:12px;border:2px solid currentColor;
+    border-right-color:transparent;border-radius:50%;margin-right:7px;
+    vertical-align:-2px;animation:rot .8s linear infinite}
+  @keyframes rot{to{transform:rotate(360deg)}}
   .note{font-size:12.5px;color:var(--dim);margin:10px 0 0;line-height:1.55}
   .bad-text{color:#ff9a9a}
   input[type=text],input[type=password],select,textarea{background:#1a1a1f;
@@ -1144,8 +1148,15 @@ function fillEngines(list, current) {
     if (e.enabled === false) return;
     var o = document.createElement("option");
     o.value = e.id;
-    o.textContent = e.label;
-    o.title = e.blurb || "";
+    // Which engine the app opens on is worth saying in the one place the
+    // choice is made: the secondary is a switch for this session, and the
+    // next launch is back on the primary.
+    o.textContent = e.label + (e.role === "primary" ? " · primary"
+                               : e.role ? " · secondary" : "");
+    o.title = (e.blurb || "") + (e.role === "primary"
+      ? " Every launch opens on this engine."
+      : e.role ? " A switch for this session; the next launch opens on the "
+                 + "primary engine." : "");
     sel.appendChild(o);
   });
   if (!sel.options.length) {
@@ -1161,7 +1172,8 @@ async function setEngine(id) {
   S.voices = {};
   saveDraft();
   // Remembered server-side so a reload, and the next /api/status, come back
-  // on the engine that is showing rather than snapping to Qwen.
+  // on the engine that is showing rather than snapping to the primary
+  // mid-session. A fresh launch does reset it — see start_engine().
   try {
     await api("/api/config", { method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1223,6 +1235,11 @@ function blocker(st) {
   if (!st.setup_complete) return { label: "Set up the engine", go: openSetup };
   if (!st.comfy_online) return { label: "Start the engine",
     go: function () { show("engine"); startEngine(); } };
+  // A different ComfyUI on that port has every symptom of nodes that failed
+  // to load, and restarting ours — which is what this button used to offer —
+  // changes nothing, because ours is not the one answering.
+  if (st.foreign) return { label: "Another ComfyUI is on that port",
+    go: function () { show("engine"); } };
   if (!st.nodes_ready) return { label: "Restart the engine",
     go: function () { show("engine"); restartEngine(); } };
   if (st.models_known === false || (st.missing_models || []).length) {
@@ -1538,7 +1555,11 @@ async function loadDeps(fresh) {
     box.innerHTML = "";
     var bad = 0;
     d.items.forEach(function (it) {
-      if (it.state === "missing") bad++;
+      // A warning on the engine row means something is answering that is not
+      // ours, which is as blocking as a missing install and has to raise the
+      // badge. Optional models warn too, and those are not a problem.
+      if (it.state === "missing"
+          || (it.state === "warn" && it.id.indexOf("engine") === 0)) bad++;
       var el = document.createElement("div");
       el.className = "fitem";
       el.innerHTML = '<div class="n"><b>' + esc(it.label) + "</b><span>" +
@@ -1598,6 +1619,19 @@ function waitForTask(id) {
     tick();
   });
 }
+/* A button that is actually doing something says so and cannot be pressed
+   again until it is done. Returns handles to update the label or restore it. */
+function busy(btn, label) {
+  if (!btn) return { label: function () {}, done: function () {} };
+  var old = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span>' + esc(label);
+  return {
+    label: function (text) {
+      btn.innerHTML = '<span class="spin"></span>' + esc(text); },
+    done: function () { btn.disabled = false; btn.innerHTML = old; },
+  };
+}
 async function installAllMissing() {
   // Each engine installs its own chain, in order, one engine after the other.
   var order = ["git"];
@@ -1605,32 +1639,44 @@ async function installAllMissing() {
     ["comfyui", "node", "torch", "node_reqs"].forEach(function (b) {
       order.push(b + "_" + e); });
   });
+  var b = busy($("btnInstallAll"), "Checking what is missing…");
   try {
     var d = await api("/api/deps");
     var missing = order.filter(function (id) {
       return d.items.some(function (i) { return i.id === id && i.state === "missing"; });
     });
     if (!missing.length) { toast("Nothing missing. Try Start ComfyUI."); return; }
-    toast("Installing " + missing.length + " item(s), one after another.");
+    var labelOf = function (id) {
+      var row = d.items.filter(function (i) { return i.id === id; })[0];
+      return (row && row.label) || id;
+    };
     for (var i = 0; i < missing.length; i++) {
+      // The row's own label, and how far down the list this is: an install
+      // that runs for twenty minutes should say which of its parts is running.
+      b.label("Installing " + labelOf(missing[i]) +
+              " (" + (i + 1) + " of " + missing.length + ")…");
       var r = await api("/api/deps/" + missing[i] + "/install", { method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ torch_index: $("torch-index").value }) });
       S.taskId = r.task.id; S.taskCursor = 0; $("task-log").textContent = "";
       pollTasks();
       var ok = await waitForTask(r.task.id);
-      if (!ok) { toast("Stopped at " + missing[i] + " — see the activity log.", true); return; }
+      if (!ok) {
+        toast("Stopped at " + labelOf(missing[i]) + " — see the activity log.",
+              true);
+        return;
+      }
       await loadDeps();
     }
     // ComfyUI reads custom_nodes at startup, so whatever was just installed
     // is not loaded yet. The node row now carries the button that does it.
     toast("All set. Press Test on the Engine page to prove it works.");
   } catch (e) { toast(e.message, true); }
+  finally { b.done(); }
 }
 async function runSelfTest(engine, btn) {
   var box = $("selftest"), list = $("selftest-list");
-  var was = btn ? btn.textContent : "";
-  if (btn) { btn.disabled = true; btn.textContent = "Testing…"; }
+  var b = busy(btn, "Testing…");
   box.hidden = false;
   list.innerHTML = '<div class="empty">Starting…</div>';
   try {
@@ -1647,7 +1693,7 @@ async function runSelfTest(engine, btn) {
   } catch (e) {
     list.innerHTML = '<div class="empty bad-text">' + esc(e.message) + "</div>";
   }
-  if (btn) { btn.disabled = false; btn.textContent = was; }
+  b.done();
   loadDeps();
 }
 function renderSelfTest(engine, t) {
@@ -1690,13 +1736,77 @@ async function restartEngine() {
     loadDeps();
   } catch (e) { toast(e.message, true); }
 }
-async function startEngine() {
+var engineStarting = false;
+async function startEngine(ev) {
+  if (engineStarting) {
+    toast("It is already starting — its console is in the Activity log.");
+    return;
+  }
+  var label = S.engineLabel || "the engine";
+  var engine = S.engine;
+  // Whichever button was pressed wears the spinner — the Engine page's, the
+  // one on its dependency row, or Settings' — and a call from the Create
+  // page's blocker falls back to the Engine page's. currentTarget is read
+  // now: it is null by the first await.
+  var btn = ev && ev.currentTarget && ev.currentTarget.tagName === "BUTTON"
+    ? ev.currentTarget : $("btnStartEngine");
+  var b = busy(btn, "Starting…");
+  engineStarting = true;
   try {
-    await api("/api/comfy/start?engine=" + encodeURIComponent(S.engine),
+    var r = await api("/api/comfy/start?engine=" + encodeURIComponent(engine),
       { method: "POST" });
-    toast("Starting " + (S.engineLabel || "the engine") +
-          ". The first start is slow.");
+    // Nothing was started when the address already answers. Claiming to have
+    // started it is how this button came to look broken — and when what
+    // answers is a different ComfyUI, that is the whole cause of nodes that
+    // will not load, so say it rather than leaving them to guess.
+    if (r && r.already) {
+      toast(r.foreign ? r.foreign + " Stop that one, or give this engine a "
+                        + "free port in Settings."
+                      : "The engine is already running on that address.",
+            !!r.foreign);
+      return;
+    }
+    // There is no honest percentage for a model load, so show the real thing
+    // instead: elapsed time on the button and ComfyUI's own console below.
+    $("task-title").textContent = "Starting " + label + " — the first start "
+      + "loads the model, which can take a few minutes. Its console:";
+    var began = Date.now();
+    while (Date.now() - began < 5 * 60 * 1000) {
+      await new Promise(function (tick) { setTimeout(tick, 1500); });
+      b.label("Starting… " + Math.round((Date.now() - began) / 1000) + "s");
+      try {
+        var snap = await api("/api/setup/state?since=999999&engine="
+                             + encodeURIComponent(engine));
+        if (snap.comfy_tail && snap.comfy_tail.length) {
+          var log = $("task-log");
+          log.textContent = snap.comfy_tail.join("\n");
+          log.scrollTop = log.scrollHeight;
+        }
+      } catch (e) { /* the console feed is a nicety */ }
+      var st = null;
+      try {
+        st = await api("/api/status?engine=" + encodeURIComponent(engine));
+      } catch (e) { continue; }
+      if (st.comfy_online) {
+        $("task-title").textContent = label + " is up.";
+        toast(label + " is up.");
+        refreshStatus(); loadDeps();
+        return;
+      }
+      var slot = (st.installs || {})[engine] || {};
+      if (slot.running === false) {
+        $("task-title").textContent = label + " stopped while starting — its "
+          + "last words are below.";
+        toast(label + " stopped while starting — see the Activity log.", true);
+        return;
+      }
+    }
+    $("task-title").textContent = "Still not answering after five minutes — "
+      + "its console is below.";
+    toast(label + " did not come up within five minutes — see the Activity "
+          + "log.", true);
   } catch (e) { toast(e.message, true); }
+  finally { engineStarting = false; b.done(); loadDeps(); }
 }
 var taskTimer = null;
 async function pollTasks() {
@@ -2093,7 +2203,13 @@ function wire() {
   $("libSearch").addEventListener("input", function (e) {
     S.libFilter = e.target.value; renderLib(); });
 
-  $("btnRecheck").addEventListener("click", function () { loadDeps(true); refreshStatus(); });
+  $("btnRecheck").addEventListener("click", async function (e) {
+    // Recheck genuinely works for its answer — the PyTorch probe alone runs a
+    // Python in another process — so it says so rather than sitting still.
+    var b = busy(e.currentTarget, "Checking…");
+    try { await loadDeps(true); await refreshStatus(); }
+    finally { b.done(); }
+  });
   $("btnTestQwen").addEventListener("click", function (e) {
     runSelfTest("qwen", e.currentTarget); });
   $("btnTestMoss").addEventListener("click", function (e) {

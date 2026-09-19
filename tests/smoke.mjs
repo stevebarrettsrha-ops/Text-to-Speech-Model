@@ -330,6 +330,14 @@ try {
        && engines.some(e => e.id === 'moss'),
      'both engines are offered', engines.map(e => e.label).join(', '));
 
+  // Which engine a launch opens on is worth saying where the choice is made.
+  const roles = await app.api('/api/status');
+  is(roles.primary_engine === 'qwen'
+       && engines.find(e => e.id === 'qwen').label.includes('primary')
+       && engines.find(e => e.id === 'moss').label.includes('secondary'),
+     'the picker says which engine is primary',
+     engines.map(e => e.label).join(' | '));
+
   // MOSS has no speaker enum on any node, so "Preset" would open an empty
   // dropdown. The same slot has to become the model's own voice instead.
   await page.selectOption('#engine-sel', 'moss');
@@ -440,13 +448,86 @@ try {
                      nodes_ready: false }).label,
     models: blocker({ ready: false, setup_complete: true, comfy_online: true,
                       nodes_ready: true, missing_models: ['Qwen/x'] }).label,
+    // Restarting ours changes nothing when what answers is not ours.
+    foreign: blocker({ ready: false, setup_complete: true, comfy_online: true,
+                       nodes_ready: false,
+                       foreign: 'answered by the ComfyUI in /elsewhere' }).label,
   }));
   is(labels2.ready === 'Read the script' && labels2.fresh === 'Set up the engine'
        && labels2.during === 'Setting up…'
        && labels2.offline === 'Start the engine'
        && labels2.nodes === 'Restart the engine'
-       && labels2.models === 'Download the models',
+       && labels2.models === 'Download the models'
+       && labels2.foreign === 'Another ComfyUI is on that port',
      'the primary button names the actual blocker', JSON.stringify(labels2));
+
+  /* ------------------------------------------------- whose ComfyUI is this */
+  // 8188 is the port every ComfyUI picks by default, so the one answering is
+  // quite often somebody else's — and that looks exactly like nodes that will
+  // not load: every folder present, every install complete, no classes.
+  const engineRow = () => app.api('/api/deps').then(
+    d => d.items.find(i => i.id === 'engine_qwen'));
+  // Pretend Qwen has an install of its own, so there is something for the
+  // engine answering to be compared against.
+  await app.post('/api/config', { for_engine: 'qwen', comfy_dir: '/opt/Qwen-TTS' });
+  const unverified = await engineRow();
+  is(unverified.state === 'ok' && /cannot be confirmed/.test(unverified.detail),
+     'an engine that will not say where it runs from is not simply "ok"',
+     unverified.detail);
+
+  await app.comfyApi('/mock/argv', { method: 'POST',
+    body: JSON.stringify({ root: '/opt/Qwen-TTS' }) }, 'qwen');
+  const ours = await engineRow();
+  is(ours.state === 'ok' && ours.detail.includes('/opt/Qwen-TTS'),
+     'and a verified one names the install that answered', ours.detail);
+
+  await app.comfyApi('/mock/argv', { method: 'POST',
+    body: JSON.stringify({ root: '/somewhere/else/ComfyUI' }) }, 'qwen');
+  const squatting = await engineRow();
+  is(squatting.state === 'warn'
+       && squatting.detail.includes('/somewhere/else/ComfyUI')
+       && squatting.detail.includes('/opt/Qwen-TTS'),
+     'and warns, naming both folders, when it is a different ComfyUI',
+     squatting.detail);
+
+  // Start cannot fix that, and must not pretend it started anything.
+  const started = await app.post('/api/comfy/start?engine=qwen', {});
+  is(started.already === true && /somewhere\/else/.test(started.foreign || ''),
+     'Start says what is already answering instead of claiming to start it',
+     JSON.stringify(started));
+
+  await app.comfyApi('/mock/argv', { method: 'POST',
+    body: JSON.stringify({ root: '' }) }, 'qwen');
+  await app.post('/api/config', { for_engine: 'qwen', comfy_dir: '' });
+  const back = await engineRow();
+  is(back.state === 'ok' && !/warn/.test(back.state),
+     'and goes green again once ours is the one answering', back.detail);
+
+  /* ------------------------------------- the buttons say what they are doing */
+  // Pressed while something already answers, Start used to toast "Starting…"
+  // and change nothing — the button that looked broken because it was lying.
+  await page.click('#btnStartEngine');
+  await sleep(1200);
+  const startSaid = await page.$eval('#toast', e => e.textContent);
+  is(/already running/i.test(startSaid) && !/Starting/.test(startSaid),
+     'Start does not claim to start an engine that is already up', startSaid);
+  is(await page.$eval('#btnStartEngine', e => !e.disabled
+       && e.textContent.trim() === 'Start ComfyUI'),
+     'and the button comes back rather than staying spun');
+
+  // Start the engine sat silent for the minutes a model load takes.
+  const spun = await page.evaluate(async () => {
+    const btn = document.getElementById('btnRecheck');
+    const handle = busy(btn, 'Checking…');
+    const mid = { disabled: btn.disabled, html: btn.innerHTML };
+    handle.done();
+    return { mid, after: { disabled: btn.disabled, html: btn.innerHTML } };
+  });
+  is(spun.mid.disabled && spun.mid.html.includes('spin')
+       && spun.mid.html.includes('Checking…')
+       && !spun.after.disabled && spun.after.html === 'Recheck',
+     'a working button holds a spinner, is disabled, and comes back',
+     JSON.stringify(spun));
 
   /* --------------------------------------------------------------- setup */
   await page.click('#btnReRun');

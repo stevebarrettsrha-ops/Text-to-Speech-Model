@@ -207,6 +207,7 @@ ENGINES = {
         "subdir": QWEN_SUBDIR,
         "layout": "org",
         "models": MODEL_REPOS,
+        "role": "primary",
         "blurb": "Preset speakers, cloning and voice design. Small and fast.",
     },
     "moss": {
@@ -220,10 +221,27 @@ ENGINES = {
         "subdir": MOSS_SUBDIR,
         "layout": "flat",
         "models": MOSS_MODEL_REPOS,
+        "role": "secondary",
         "blurb": "Zero-shot cloning and voice design, no preset speakers.",
     },
 }
 DEFAULT_ENGINE = "qwen"
+# Qwen is the primary engine: every launch begins on it, whichever engine the
+# last session ended on. MOSS is a deliberate switch, made on the Create page
+# and lasting that session. Both are still installed and downloaded on first
+# run — being secondary is about which one is loaded and holding the card when
+# the app opens, not about what is on disk.
+PRIMARY_ENGINE = DEFAULT_ENGINE
+
+
+def start_engine(cfg: dict) -> str:
+    """The engine a launch opens on: the primary, unless it is turned off."""
+    if engine_enabled(cfg, PRIMARY_ENGINE):
+        return PRIMARY_ENGINE
+    for eid in ENGINES:
+        if engine_enabled(cfg, eid):
+            return eid
+    return PRIMARY_ENGINE
 
 
 def engine_of(repo: str) -> str:
