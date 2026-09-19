@@ -72,6 +72,17 @@ def engine_online(engine: str = "") -> bool:
     return comfy_online(bootstrap.engine_url(cfg, engine or current_engine()))
 
 
+def started_elsewhere(slot: dict) -> bool:
+    """Is this engine one the person starts themselves?
+
+    The external route records managed False and leaves comfy_dir empty; an
+    engine that was never set up has managed True. Telling the second group to
+    run setup is right, and telling the first group to is rule 18 in reverse —
+    setup cannot start someone else's ComfyUI, and the address can.
+    """
+    return slot.get("managed") is False and not slot.get("comfy_dir")
+
+
 def activate(engine: str, prog=None, wait: bool = True) -> str:
     """Make this the engine that is running, and the only one.
 
@@ -94,6 +105,10 @@ def activate(engine: str, prog=None, wait: bool = True) -> str:
             return ""
         slot = bootstrap.engine_cfg(cfg, engine)
         py = bootstrap.comfy_python(cfg, engine)
+        if started_elsewhere(slot):
+            return (f"{bootstrap.ENGINES[engine]['label']}'s ComfyUI is not "
+                    f"answering at {url}. Start it, or change the address in "
+                    "Settings.")
         if not slot.get("comfy_dir") or not py:
             return (f"{bootstrap.ENGINES[engine]['label']} has no ComfyUI set "
                     "up yet — run setup for it from the Engine panel.")
@@ -588,6 +603,11 @@ def api_comfy_restart():
     slot = bootstrap.engine_cfg(cfg, engine)
     comfy_proc = PROCS[engine]
     py = bootstrap.comfy_python(cfg, engine)
+    if started_elsewhere(slot):
+        return jsonify({"error": "Script Builder did not start that ComfyUI, "
+                                 "so it cannot restart it. Start it again at "
+                                 f"{slot['comfy_url']} so it loads the "
+                                 "nodes."}), 400
     if not slot.get("comfy_dir") or not py:
         return jsonify({"error": "Run setup first."}), 400
     url = slot["comfy_url"]

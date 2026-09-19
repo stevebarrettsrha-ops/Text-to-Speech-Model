@@ -149,6 +149,13 @@
    "Set up the engine" and opened the setup dialog for every not-ready state,
    including an engine that is set up and merely needs restarting — which that
    dialog cannot do. `blocker(status)` returns the label and where to go.
+18b. **A ComfyUI someone else started is not an engine that was never set up.**
+   The external route records `managed` False with no `comfy_dir`, so when that
+   ComfyUI stops answering, `activate` used to send them to a setup dialog that
+   cannot start another process — and Restart said "Run setup first" for the
+   same reason. `started_elsewhere(slot)` tells the two apart (an existing
+   ComfyUI picked off disk is also `managed` False, but it has a folder, and
+   that one we can start), and both paths now name the address instead.
 
 19. **Two engines, and everything that differs between them lives in
    `ENGINES`.** Node repo, node folder, the file that proves it is installed,
@@ -284,7 +291,7 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 131 unit tests, standard library only
+npm run test:units       # 135 unit tests, standard library only
 npm test                 # 81 checks driving the real page in headless Chromium
 ```
 
