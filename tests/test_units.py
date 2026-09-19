@@ -580,6 +580,98 @@ class DeadEngine(unittest.TestCase):
         self.assertNotIn("HTTPConnectionPool", message)
 
 
+class AutoStartingASlowEngine(unittest.TestCase):
+    """Starting an engine is not the same as it being ready, and the boot path
+    asks for exactly that: launch it, do not wait. Reading the schema straight
+    afterwards raised out of activate() — a few lines under a comment promising
+    that an engine which cannot start is never a reason the app fails to boot,
+    which is precisely what it became."""
+
+    def setUp(self):
+        self.saved = copy.deepcopy(server.cfg)
+        self.root = Path(tempfile.mkdtemp(prefix="sb-slow-"))
+        (self.root / "main.py").write_text("")
+
+    def tearDown(self):
+        server.cfg.clear()
+        server.cfg.update(self.saved)
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_activate_returns_rather_than_raising_while_it_comes_up(self):
+        slot = bootstrap.engine_cfg(server.cfg, "qwen")
+        slot.update({"comfy_dir": str(self.root), "python": sys.executable,
+                     "managed": True, "auto_start": True,
+                     # Nothing is listening, and nothing will be for a while.
+                     "comfy_url": "http://127.0.0.1:1"})
+        with mock.patch.object(server.PROCS["qwen"], "start"), \
+             mock.patch.object(server, "comfy_online", return_value=False):
+            self.assertEqual(server.activate("qwen", wait=False), "")
+
+
+class WhoIsAnsweringThePort(unittest.TestCase):
+    """8188 is the port every ComfyUI picks, so the one answering is often
+    somebody else's — and that has every symptom of nodes that failed to load:
+    the folders are all on disk, the install is complete, and the classes are
+    not there. The engine row has to say which install answered."""
+
+    def _client(self, payload):
+        c = comfy.ComfyClient("http://127.0.0.1:1")
+
+        class Resp:
+            def raise_for_status(self): pass
+            def json(self): return payload
+
+        with mock.patch.object(comfy.requests, "get", return_value=Resp()):
+            return c.engine_root()
+
+    def test_the_folder_comes_off_the_reported_argv(self):
+        self.assertEqual(
+            self._client({"system": {"argv": ["/opt/ComfyUI/main.py", "--port"]}}),
+            "/opt/ComfyUI")
+
+    def test_a_windows_path_is_read_on_any_platform(self):
+        self.assertEqual(
+            self._client({"system": {"argv": ["D:\\AI\\ComfyUI\\main.py"]}}),
+            "D:\\AI\\ComfyUI")
+
+    def test_a_build_that_does_not_report_argv_is_not_a_mismatch(self):
+        # Older ComfyUI says nothing here. Empty must never read as "someone
+        # else's" — crying wolf about the usual case teaches people to ignore
+        # the row that matters.
+        self.assertEqual(self._client({"system": {"os": "posix"}}), "")
+        self.assertTrue(manager.same_install("/opt/ComfyUI", ""))
+
+    def test_the_same_folder_written_two_ways_is_one_install(self):
+        self.assertTrue(manager.same_install("/opt/ComfyUI", "/opt/ComfyUI/"))
+        self.assertTrue(manager.same_install("/opt/./ComfyUI", "/opt/ComfyUI"))
+        self.assertFalse(manager.same_install("/opt/ComfyUI", "/opt/OtherUI"))
+
+    def test_a_green_row_says_which_install_answered(self):
+        row = manager.engine_row("Qwen3-TTS", "_qwen", "http://127.0.0.1:8188",
+                                 True, "/opt/Qwen", "/opt/Qwen")
+        self.assertEqual(row["state"], "ok")
+        self.assertIn("/opt/Qwen", row["detail"])
+
+    def test_an_unverifiable_engine_says_so_instead_of_only_ok(self):
+        row = manager.engine_row("Qwen3-TTS", "_qwen", "http://127.0.0.1:8188",
+                                 True, "/opt/Qwen", "")
+        self.assertEqual(row["state"], "ok")
+        self.assertIn("cannot be confirmed", row["detail"])
+
+    def test_a_different_ComfyUI_on_the_port_is_a_warning_naming_both(self):
+        row = manager.engine_row("Qwen3-TTS", "_qwen", "http://127.0.0.1:8188",
+                                 True, "/opt/Qwen", "/home/me/ComfyUI")
+        self.assertEqual(row["state"], "warn")
+        self.assertIn("/home/me/ComfyUI", row["detail"])
+        self.assertIn("/opt/Qwen", row["detail"])
+
+    def test_an_engine_that_is_off_still_offers_start(self):
+        row = manager.engine_row("MOSS-TTS", "_moss", "http://127.0.0.1:8189",
+                                 False, "/opt/Moss", "")
+        self.assertEqual(row["state"], "off")
+        self.assertEqual(row["action"], "start")
+
+
 class ComfyUISomeoneElseStarted(unittest.TestCase):
     """CLAUDE.md rule 18: the sentence names the blocker it can actually clear.
 

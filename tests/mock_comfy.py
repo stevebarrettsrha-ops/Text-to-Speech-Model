@@ -22,6 +22,9 @@ app = Flask(__name__)
 HISTORY = {}
 LOG = []
 INTERRUPTED = threading.Event()
+# Empty means "this build does not report argv", which is a real
+# case: older ComfyUI does not, and it must not read as a mismatch.
+ARGV_ROOT = {"root": ""}
 
 ATT = ["auto", "sage_attn", "flash_attn", "sdpa", "eager"]
 LANG = ["Auto", "Chinese", "English", "Japanese", "Korean", "French", "German",
@@ -200,10 +203,23 @@ VRAM = {"total": 8588886016}
 
 @app.get("/system_stats")
 def stats():
-    return jsonify({"system": {"os": "posix", "comfyui_version": "mock"},
+    # Real ComfyUI reports its own argv here, which starts with the main.py it
+    # was launched from — the only way to tell whose ComfyUI is answering a
+    # port. ARGV_ROOT is what this stand-in claims to have been started from.
+    argv = ([str(Path(ARGV_ROOT["root"]) / "main.py")]
+            if ARGV_ROOT["root"] else [])
+    return jsonify({"system": {"os": "posix", "comfyui_version": "mock",
+                               "argv": argv},
                     "devices": [{"name": "mock", "type": "cuda",
                                  "vram_total": VRAM["total"],
                                  "vram_free": VRAM["total"] // 2}]})
+
+
+@app.post("/mock/argv")
+def mock_argv():
+    """Answer as the ComfyUI in some other folder, or stop saying at all."""
+    ARGV_ROOT["root"] = (request.get_json(silent=True) or {}).get("root", "")
+    return jsonify({"root": ARGV_ROOT["root"]})
 
 
 @app.post("/mock/vram/<int:mb>")

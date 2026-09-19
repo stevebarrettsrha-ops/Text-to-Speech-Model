@@ -124,7 +124,17 @@ def activate(engine: str, prog=None, wait: bool = True) -> str:
         if wait and not bootstrap.wait_for_comfy(url, timeout=900):
             return (f"{bootstrap.ENGINES[engine]['label']}'s ComfyUI did not "
                     "come up.\n" + "\n".join(PROCS[engine].tail(20)))
-        for_engine(engine).schema(force=True)
+        # Warming the schema cache is a nicety, not a precondition. With
+        # wait=False the engine has only just been launched and is not
+        # answering yet, so this read raised ComfyError straight out of
+        # activate() — and the one caller that passes wait=False is the boot
+        # path, which is how auto-starting a slow engine stopped the app from
+        # booting at all, a few lines under a comment promising it could not.
+        try:
+            if comfy_online(url):
+                for_engine(engine).schema(force=True)
+        except Exception:  # noqa: BLE001
+            pass
         return ""
 
 jobs: dict[str, dict] = {}
@@ -479,6 +489,12 @@ def api_status():
                 for e in bootstrap.ENGINES}
         except Exception as exc:  # noqa: BLE001
             payload["schema_error"] = str(exc)
+    # Only when the nodes are not loaded: that is the one symptom another
+    # ComfyUI holding the port produces, and asking costs a request to an
+    # engine the page polls every few seconds. Restarting ours would not fix
+    # it, so the page must not offer that as the way out.
+    payload["foreign"] = (foreign_engine(engine)
+                          if online and not payload["nodes_ready"] else "")
     payload["ready"] = bool(online and payload["nodes_ready"]
                             and models_known and not missing)
     return jsonify(payload)
@@ -570,9 +586,40 @@ def api_setup_start():
 @app.get("/api/setup/state")
 def api_setup_state():
     snap = progress.snapshot(int(request.args.get("since", 0)))
-    snap["comfy_tail"] = [l for e in bootstrap.ENGINES
-                          for l in PROCS[e].tail(6)]
+    # With `engine`, only that engine's console. Start the engine streams this
+    # while it waits, and two engines' output interleaved is not a console
+    # anyone can read — it is the first start's model load that has to be
+    # legible, and that belongs to one of them.
+    want = request.args.get("engine")
+    if want in bootstrap.ENGINES:
+        snap["comfy_tail"] = PROCS[want].tail(40)
+    else:
+        snap["comfy_tail"] = [l for e in bootstrap.ENGINES
+                              for l in PROCS[e].tail(6)]
     return jsonify(snap)
+
+
+def foreign_engine(engine: str) -> str:
+    """Why the ComfyUI answering this engine's address is not this engine's.
+
+    Empty when it is ours, when there is no managed install to compare
+    against, or when the engine will not say where it runs from. 8188 is the
+    port every ComfyUI picks by default, so on this app's own port the one
+    answering is quite often somebody else's — and that looks exactly like
+    nodes that will not load, however many times they are installed.
+    """
+    slot = bootstrap.engine_cfg(cfg, engine)
+    if not slot.get("comfy_dir"):
+        return ""
+    try:
+        root = for_engine(engine).engine_root()
+    except Exception:  # noqa: BLE001
+        return ""
+    if not root or manager.same_install(slot["comfy_dir"], root):
+        return ""
+    return (f"{slot['comfy_url']} is answered by the ComfyUI in {root}, not "
+            f"{bootstrap.ENGINES[engine]['label']}'s own in "
+            f"{slot['comfy_dir']}.")
 
 
 @app.post("/api/comfy/start")
@@ -581,7 +628,12 @@ def api_comfy_start():
     if engine not in bootstrap.ENGINES:
         return jsonify({"error": f"There is no '{engine}' engine."}), 400
     if engine_online(engine):
-        return jsonify({"ok": True, "already": True})
+        # Nothing is started when the address already answers. Saying
+        # "starting" here is how this button came to look broken: pressed,
+        # claims to work, changes nothing, and never mentions that something
+        # else holds the port.
+        return jsonify({"ok": True, "already": True,
+                        "foreign": foreign_engine(engine)})
     why = activate(engine, wait=False)
     if why:
         return jsonify({"error": why}), 400

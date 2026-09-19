@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import array
 import io
+import os
 import platform
 import shutil
 import subprocess
@@ -207,6 +208,55 @@ def _torch_row(py_comfy: str, suffix: str, label: str) -> dict:
             "action": "reinstall"}
 
 
+def same_install(comfy_dir: str, engine_root: str) -> bool:
+    """Is the ComfyUI answering the address the one we are managing?"""
+    if not comfy_dir or not engine_root:
+        return True                      # nothing to compare: do not cry wolf
+    try:
+        return (Path(comfy_dir).resolve() == Path(engine_root).resolve()
+                or os.path.normcase(os.path.normpath(comfy_dir))
+                == os.path.normcase(os.path.normpath(engine_root)))
+    except OSError:
+        return True
+
+
+def engine_row(label: str, suffix: str, url: str, online: bool,
+               comfy_dir: str, engine_root: str) -> dict:
+    """The Engine page's row for one engine, saying what actually answered.
+
+    "ok" on its own reads as verified, and the identity check used to speak up
+    only on a mismatch — so an engine that matches and an engine that will not
+    say where it runs from looked identical. The second is exactly how another
+    ComfyUI holding the port passes for a healthy one, with its nodes missing
+    and the folders on disk all present.
+    """
+    if not online:
+        return {"id": "engine" + suffix, "label": f"Engine · {label}",
+                "state": "off",
+                "detail": url + " — not running. Only the engine you are "
+                                "using is kept up, so the other is not on the "
+                                "card.",
+                "action": "start"}
+    if not same_install(comfy_dir, engine_root):
+        return {"id": "engine" + suffix, "label": f"Engine · {label}",
+                "state": "warn",
+                "detail": f"{url} is answered by the ComfyUI in "
+                          f"{engine_root}, not {label}'s own in {comfy_dir}. "
+                          "Its nodes will read as missing however many times "
+                          "they are installed. Stop that one, or give this "
+                          "engine a free port in Settings.",
+                "action": None}
+    if engine_root:
+        where = " — the ComfyUI in " + engine_root
+    elif comfy_dir:
+        where = (" — this engine does not say where it runs from, so it "
+                 "cannot be confirmed as the one in " + comfy_dir)
+    else:
+        where = ""
+    return {"id": "engine" + suffix, "label": f"Engine · {label}",
+            "state": "ok", "detail": url + where, "action": None}
+
+
 def dependencies(cfg: dict, clients=None, engine: str = "") -> list[dict]:
     """What each engine needs, engine by engine.
 
@@ -351,15 +401,16 @@ def dependencies(cfg: dict, clients=None, engine: str = "") -> list[dict]:
                           "detail": "Set up this engine first.",
                           "action": "models"})
 
-        # Is it up ----------------------------------------------------------- #
+        # Is it up, and is it ours ------------------------------------------- #
         online = bootstrap.comfy_online(slot["comfy_url"])
-        items.append({"id": "engine" + suffix, "label": f"Engine · {label}",
-                      "state": "ok" if online else "off",
-                      "detail": slot["comfy_url"] + ("" if online else
-                                " — not running. Only the engine you are "
-                                "using is kept up, so the other is not on the "
-                                "card."),
-                      "action": None if online else "start"})
+        root = ""
+        if online and client:
+            try:
+                root = client.engine_root()
+            except Exception:  # noqa: BLE001
+                root = ""
+        items.append(engine_row(label, suffix, slot["comfy_url"], online,
+                                slot.get("comfy_dir") or "", root))
     return items
 
 

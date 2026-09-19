@@ -157,6 +157,39 @@
    ComfyUI picked off disk is also `managed` False, but it has a folder, and
    that one we can start), and both paths now name the address instead.
 
+18c. **A button that is working says so, and says what it is doing.** Start
+   the engine sat silent for the minutes a model load takes, so it read as
+   dead; `busy(btn, label)` holds a spinner and disables the button, and each
+   caller keeps it truthful — Start counts the seconds and streams ComfyUI's
+   own console into the Activity panel (there is no honest percentage for a
+   model load, so there is no bar), Install everything missing reads
+   "Installing PyTorch · MOSS-TTS (2 of 3)…" from the rows' own labels, and
+   Recheck says "Checking…" because it genuinely works for its answer. Start
+   ends in one of three named states: up, stopped while starting, or five
+   minutes with no answer. A second press says it is already starting rather
+   than firing again.
+18d. **`already` is not `started`.** `/api/comfy/start` returns `already` when
+   something answers the address, and the page used to toast "Starting…"
+   regardless: pressed, claims to work, changes nothing. It now says what is
+   there — and when that is a *different* ComfyUI, says which.
+18e. **Which ComfyUI answered is read, not assumed.** 8188 is the port every
+   ComfyUI picks by default, so the one holding it is quite often somebody
+   else's — and that has every symptom of nodes that failed to load: folders
+   all present, install complete, no classes. `/system_stats` reports the
+   process's own argv, so `ComfyClient.engine_root()` says which install is
+   answering and `manager.engine_row` names it. "ok" alone used to cover two
+   different silences — a match, and an engine that will not say — and the
+   second is how a foreign ComfyUI passes for a healthy one, so the row now
+   says which of the two it is. A mismatch is a `warn` that names both folders
+   and raises the Engine badge, and `blocker()` stops offering Restart for it:
+   restarting ours changes nothing when ours is not the one answering.
+18f. **Warming the schema cache is never a precondition.** `activate(engine,
+   wait=False)` launched ComfyUI and then read `/object_info` from it
+   immediately — the engine is still starting, so the read raised out of
+   `activate`, and the boot path is the one caller that passes `wait=False`.
+   Auto-starting a slow engine therefore stopped the app from booting at all,
+   a few lines under a comment promising that could not happen.
+
 19. **Two engines, and everything that differs between them lives in
    `ENGINES`.** Node repo, node folder, the file that proves it is installed,
    the models sub-folder, the folder layout and the model list are one table
@@ -291,8 +324,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 135 unit tests, standard library only
-npm test                 # 81 checks driving the real page in headless Chromium
+npm run test:units       # 144 unit tests, standard library only
+npm test                 # 89 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script
