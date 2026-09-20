@@ -190,6 +190,23 @@
    Auto-starting a slow engine therefore stopped the app from booting at all,
    a few lines under a comment promising that could not happen.
 
+17b. **The probe loads a node pack the way ComfyUI does: under the folder's
+   own name, registered in `sys.modules` before it runs.** Both halves matter.
+   Every node pack's `__init__.py` opens with relative imports, and a relative
+   import resolves through the parent already in `sys.modules` — so a package
+   executed under a made-up name that was never registered dies with
+   `ModuleNotFoundError` naming *the probe*. A real install reported exactly
+   that: "No module named 'qwen_tts_probe'", which names nothing anyone can
+   act on. The probe exists to get the node's own exception out of ComfyUI's
+   console; printing its own scaffolding instead is the one failure it must
+   not have.
+17c. **A fix names the control that is actually left to press.** The PyTorch
+   row said "Pick the NVIDIA build above and press Reinstall" on a panel whose
+   picker already read "Automatic — NVIDIA GeForce RTX 4060 (CUDA build)".
+   Where Automatic already resolves to a CUDA index the sentence is just
+   "Press Reinstall."; the picker is named only where choosing it would change
+   something. Rule 18 in a second place.
+
 18g. **Qwen is the primary engine, and every launch opens on it.** MOSS is a
    switch made on the Create page, and it lasts that session: `main()` sets
    `cfg["engine"]` from `start_engine(cfg)` before anything is started, so an
@@ -335,7 +352,7 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 149 unit tests, standard library only
+npm run test:units       # 155 unit tests, standard library only
 npm test                 # 90 checks driving the real page in headless Chromium
 ```
 

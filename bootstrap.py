@@ -1399,18 +1399,33 @@ def drop_mismatched_torch(python: str, index: str, log) -> bool:
     return True
 
 
+# Loaded exactly the way ComfyUI loads a custom node pack: under the folder's
+# own name, and registered in sys.modules *before* it is executed. Both halves
+# matter. A node pack's __init__.py is full of relative imports ("from .nodes
+# import NODE_CLASS_MAPPINGS"), and a relative import resolves through the
+# parent already in sys.modules — so a package executed under a made-up name
+# that was never registered fails with ModuleNotFoundError naming *the probe*,
+# which is what this reported from a real install: "No module named
+# 'qwen_tts_probe'". The probe existing at all is to get the node's own
+# exception out of ComfyUI's console; printing its own scaffolding instead is
+# the one failure it must not have.
 NODE_PROBE = """
-import importlib.util, sys
+import importlib.util, os, sys
 root, pkg = sys.argv[1], sys.argv[2]
 sys.path.insert(0, root)
-spec = importlib.util.spec_from_file_location("qwen_tts_probe",
-                                              pkg + "/__init__.py")
+name = os.path.basename(os.path.normpath(pkg))
+spec = importlib.util.spec_from_file_location(
+    name, os.path.join(pkg, "__init__.py"),
+    submodule_search_locations=[pkg])
 mod = importlib.util.module_from_spec(spec)
+sys.modules[name] = mod
 try:
     spec.loader.exec_module(mod)
 except BaseException as exc:
     print("FAILED " + type(exc).__name__ + ": " + str(exc)[:400])
     sys.exit(2)
+finally:
+    sys.modules.pop(name, None)
 print("OK")
 """
 

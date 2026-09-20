@@ -160,15 +160,22 @@ def no_cuda_reason(version: str) -> str:
     """
     gpu = bootstrap.nvidia_gpu()
     build = version.split("+")[1] if "+" in version else ""
+    # What the picker is set to now. Told to "pick the NVIDIA build above" by a
+    # panel whose picker already reads "Automatic — NVIDIA GeForce RTX 4060
+    # (CUDA build)", the only honest next move is the one button that is left,
+    # and the sentence should say so rather than send them hunting.
+    fix = ("Press Reinstall." if bootstrap.torch_build(bootstrap.torch_index({}))
+           .startswith("cu") else "Pick the NVIDIA build above and press "
+                                  "Reinstall.")
     if gpu["name"] and build == "cpu":
         return (f"torch {version} — this is the CPU-only build, but {gpu['name']} "
-                "is here. Pick the NVIDIA build above and press Reinstall.")
+                f"is here. {fix}")
     if gpu["name"] and not gpu["driver"]:
         return (f"torch {version} — {gpu['name']} is here but its driver is not "
                 "answering. Install the NVIDIA driver, then press Recheck.")
     if gpu["name"]:
         return (f"torch {version} — {gpu['name']} is here but this build cannot "
-                "use it. Pick the NVIDIA build above and press Reinstall.")
+                f"use it. {fix}")
     if build == "cpu":
         return (f"torch {version} — the CPU-only build, and no NVIDIA GPU was "
                 "found. Speech will be slow.")

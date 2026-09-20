@@ -580,6 +580,55 @@ class DeadEngine(unittest.TestCase):
         self.assertNotIn("HTTPConnectionPool", message)
 
 
+class WhyTheNodesDidNotLoad(unittest.TestCase):
+    """The probe exists to get the node pack's own exception out of ComfyUI's
+    console, where nobody running from a launcher can read it. Reporting its
+    own scaffolding instead is the one failure it must not have — and it did:
+    a real install answered "ModuleNotFoundError: No module named
+    'qwen_tts_probe'", which names nothing the person can act on."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="sb-probe-"))
+        self.nodes = (self.root / "custom_nodes"
+                      / bootstrap.ENGINES["qwen"]["node_dir"])
+        self.nodes.mkdir(parents=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _write(self, init_body: str, extra: dict | None = None):
+        (self.nodes / "__init__.py").write_text(init_body)
+        for name, body in (extra or {}).items():
+            (self.nodes / name).write_text(body)
+
+    def test_a_pack_with_relative_imports_loads(self):
+        # Every real node pack opens like this. Executed under a name that was
+        # never registered in sys.modules, the relative import has no parent to
+        # resolve through and dies naming the probe.
+        self._write("from .nodes import NODE_CLASS_MAPPINGS\n",
+                    {"nodes.py": "NODE_CLASS_MAPPINGS = {}\n"})
+        self.assertEqual(
+            bootstrap.node_import_error(sys.executable, self.root, "qwen"), "")
+
+    def test_the_real_missing_package_is_what_comes_back(self):
+        self._write("import transformers_that_is_not_here\n")
+        why = bootstrap.node_import_error(sys.executable, self.root, "qwen")
+        self.assertIn("transformers_that_is_not_here", why)
+        self.assertNotIn("probe", why)
+
+    def test_a_pack_that_raises_reports_its_own_exception(self):
+        self._write('raise RuntimeError("torch is the CPU build")\n')
+        why = bootstrap.node_import_error(sys.executable, self.root, "qwen")
+        self.assertIn("torch is the CPU build", why)
+        self.assertTrue(why.startswith("RuntimeError"), why)
+
+    def test_nodes_that_are_not_there_say_so(self):
+        shutil.rmtree(self.nodes)
+        self.assertIn("not installed",
+                      bootstrap.node_import_error(sys.executable, self.root,
+                                                  "qwen"))
+
+
 class WhichEngineALaunchOpensOn(unittest.TestCase):
     """Qwen is primary: every launch opens on it, whichever engine the last
     session ended on. MOSS is a switch made on the Create page and lasting that
@@ -877,6 +926,28 @@ class GpuDetection(unittest.TestCase):
         with mock.patch.object(bootstrap, "nvidia_gpu",
                                return_value={"name": "", "driver": False}):
             self.assertIn("no NVIDIA GPU", manager.no_cuda_reason("2.14.0+cpu"))
+
+    def test_it_does_not_send_them_hunting_for_a_setting_already_set(self):
+        # Reported from a panel whose picker read "Automatic — NVIDIA GeForce
+        # RTX 4060 (CUDA build)" beside a row telling them to pick the NVIDIA
+        # build. With a card present Automatic already is that build, so the
+        # only move left is the button.
+        with mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "NVIDIA GeForce RTX 4060",
+                                             "driver": True}):
+            text = manager.no_cuda_reason("2.14.0+cpu")
+        self.assertIn("Press Reinstall", text)
+        self.assertNotIn("above", text)
+
+    def test_it_does_name_the_picker_when_automatic_would_not_do_it(self):
+        # Where Automatic would not resolve to CUDA — no card visible to
+        # nvidia-smi — the picker is the way out and has to be named.
+        with mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "NVIDIA GeForce RTX 4060",
+                                             "driver": True}), \
+             mock.patch.object(bootstrap, "torch_index", return_value=""):
+            text = manager.no_cuda_reason("2.14.0+cpu")
+        self.assertIn("Pick the NVIDIA build above", text)
 
 
 class TorchReinstall(unittest.TestCase):
