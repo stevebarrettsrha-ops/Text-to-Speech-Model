@@ -9,6 +9,7 @@ names say what would break rather than what the function is called.
 from __future__ import annotations
 
 import copy
+import io
 import json
 import os
 import shutil
@@ -17,6 +18,7 @@ import sys
 import tempfile
 import subprocess
 import threading
+import time
 import unittest
 from unittest import mock
 import wave
@@ -2193,6 +2195,16 @@ class WhenThePortWillNotBeGivenUp(EngineFixture):
         self.assertEqual(bootstrap.kill_pid(victim.pid), "stopped")
         self.assertEqual(bootstrap.kill_pid(victim.pid), "already gone")
 
+    def test_a_fresh_process_cmdline_survives_the_exec_race(self):
+        path = mock.Mock()
+        path.exists.return_value = True
+        path.read_bytes.side_effect = [b"", b"", b"python\0main.py\0"]
+        with mock.patch.object(bootstrap, "Path", return_value=path), \
+                mock.patch.object(bootstrap.time, "sleep") as sleep:
+            self.assertEqual(bootstrap.pid_cmdline(123), "python main.py")
+        self.assertEqual(path.read_bytes.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
 
 class WeightsTheEngineCannotReach(EngineFixture):
     """Script Builder's version of the stale-model-scan warning.
@@ -2375,6 +2387,154 @@ class ALaunchEndsWithAWorkingEngine(EngineFixture):
         server.ensure_engine_at_boot()
         self.assertFalse(server.PROCS["qwen"].alive())
         self.assertFalse(bootstrap.comfy_online(f"http://127.0.0.1:{port}"))
+
+
+class ProductionLaunch(unittest.TestCase):
+    """Exercise the real entry point, not only its startup helper.
+
+    A unit call to ``ensure_engine_at_boot`` can pass even if ``main`` stops
+    invoking it, invokes it before loading the saved configuration, or fails
+    to bring up the web application alongside it.  This is the launch shape a
+    packaged user actually runs: a fresh server process and an offline,
+    managed ComfyUI install.
+    """
+
+    def test_server_launch_starts_its_managed_engine(self):
+        root = Path(tempfile.mkdtemp(prefix="sb-production-launch-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        data = root / "data"
+        data.mkdir()
+        install = fake_install(root)
+        app_port, engine_port = free_port(), free_port()
+        config = copy.deepcopy(bootstrap.DEFAULT_CONFIG)
+        config.update({"setup_complete": True, "engine": "moss"})
+        config["engines"] = {
+            "qwen": dict(bootstrap.engine_defaults("qwen"),
+                         comfy_url=f"http://127.0.0.1:{engine_port}",
+                         comfy_dir=str(install),
+                         models_dir=str(install / "models"),
+                         python=sys.executable),
+            "moss": bootstrap.engine_defaults("moss"),
+        }
+        (data / "config.json").write_text(json.dumps(config))
+        env = {**os.environ,
+               "SCRIPT_BUILDER_DATA": str(data),
+               "SCRIPT_BUILDER_PORT": str(app_port),
+               "SCRIPT_BUILDER_NO_BROWSER": "1"}
+        app_proc = subprocess.Popen(
+            [sys.executable, str(REPO / "server.py")], env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        engine_url = f"http://127.0.0.1:{engine_port}"
+        try:
+            deadline = time.time() + 30
+            app_url = f"http://127.0.0.1:{app_port}"
+            while time.time() < deadline:
+                try:
+                    if requests.get(app_url, timeout=1).status_code == 200:
+                        break
+                except requests.RequestException:
+                    pass
+                time.sleep(0.1)
+            else:
+                self.fail("server.py did not make the application reachable")
+
+            self.assertTrue(online(engine_url, 30),
+                            "launch did not start the managed ComfyUI")
+            log = requests.get(f"{app_url}/api/comfy/log?engine=qwen",
+                               timeout=5).json()
+            self.assertTrue(log["running"])
+            self.assertTrue(log["online"])
+            self.assertIn("Starting the engine",
+                          "\n".join(log["lines"]))
+
+            # Read through the same public API as the browser and inspect the
+            # bytes it returns.  "Engine online" is not production-ready if
+            # the first prompt cannot travel through ComfyUI and come back as
+            # decodable, non-silent audio.
+            speak = requests.post(f"{app_url}/api/speak", json={
+                "mode": "multi", "style": "Clear and natural",
+                "title": "Production launch audio",
+                "lines": [{"speaker": 1,
+                           "text": "The production launch can speak."},
+                          {"speaker": 2,
+                           "text": "It can design a second voice too."}],
+                "speakers": {"1": {"name": "Narrator",
+                                    "kind": "preset", "speaker": "Ryan"},
+                             "2": {"name": "Designed voice",
+                                   "kind": "design",
+                                   "instruct": "A warm, confident voice"}},
+                "model": "0.6B", "attention": "auto", "pause": 0.2,
+            }, timeout=5)
+            self.assertEqual(speak.status_code, 200, speak.text)
+            job_id = speak.json()["job"]
+            deadline = time.time() + 30
+            job = None
+            while time.time() < deadline:
+                jobs = requests.get(f"{app_url}/api/jobs", timeout=5).json()
+                job = next((item for item in jobs if item["id"] == job_id), None)
+                if job and job["status"] != "running":
+                    break
+                time.sleep(0.1)
+            self.assertIsNotNone(job, "audio job disappeared")
+            self.assertEqual(job["status"], "done", job)
+            take = job["take"]
+            audio = requests.get(f"{app_url}/api/take/{take['id']}", timeout=5)
+            self.assertEqual(audio.status_code, 200)
+            with wave.open(io.BytesIO(audio.content), "rb") as wav:
+                self.assertGreater(wav.getnframes(), 0)
+                self.assertGreater(wav.getframerate(), 0)
+                raw = wav.readframes(wav.getnframes())
+            samples = struct.unpack(f"<{len(raw) // 2}h", raw)
+            self.assertGreater(max(map(abs, samples)), 0,
+                               "generated WAV contains only silence")
+
+            # Voice cloning is the third advertised Qwen workflow. Feed the
+            # take back through the upload endpoint, then require a second
+            # generation to complete with that server-side reference name.
+            upload = requests.post(
+                f"{app_url}/api/upload-reference",
+                files={"file": ("reference.wav", audio.content, "audio/wav")},
+                timeout=5)
+            self.assertEqual(upload.status_code, 200, upload.text)
+            clone = requests.post(f"{app_url}/api/speak", json={
+                "mode": "single", "title": "Production clone audio",
+                "lines": [{"speaker": 1,
+                           "text": "The cloned voice path works."}],
+                "speakers": {"1": {"name": "Clone", "kind": "clone",
+                                    "ref_audio": upload.json()["name"],
+                                    "ref_text": "The production launch can speak."}},
+                "model": "0.6B", "attention": "auto",
+            }, timeout=5)
+            self.assertEqual(clone.status_code, 200, clone.text)
+            clone_id = clone.json()["job"]
+            deadline = time.time() + 30
+            clone_job = None
+            while time.time() < deadline:
+                jobs = requests.get(f"{app_url}/api/jobs", timeout=5).json()
+                clone_job = next((item for item in jobs
+                                  if item["id"] == clone_id), None)
+                if clone_job and clone_job["status"] != "running":
+                    break
+                time.sleep(0.1)
+            self.assertIsNotNone(clone_job, "clone job disappeared")
+            self.assertEqual(clone_job["status"], "done", clone_job)
+
+            # Launch always returns to the primary engine, rather than
+            # silently restoring the secondary engine from the last session.
+            saved = json.loads((data / "config.json").read_text())
+            self.assertEqual(saved["engine"], "qwen")
+        finally:
+            app_proc.terminate()
+            try:
+                app_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                app_proc.kill()
+                app_proc.wait(timeout=5)
+            # SIGTERM can bypass Flask's finally block on some interpreters;
+            # never let the test's stand-in engine escape into the next test.
+            for pid in bootstrap.port_pids(engine_port):
+                bootstrap.kill_pid(pid)
 
 
 if __name__ == "__main__":
