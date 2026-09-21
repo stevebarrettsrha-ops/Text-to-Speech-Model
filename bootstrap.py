@@ -902,35 +902,47 @@ class ComfyProcess:
             raise RuntimeError(
                 f"ComfyUI could not be started with {python} — {exc}. "
                 "Run setup again from Settings.") from exc
-        threading.Thread(target=self._pump, args=(prog,), daemon=True).start()
+        # Give the reader the process it owns.  Looking it up through
+        # ``self.proc`` in the thread races with a quick stop/start: start()
+        # replaces that attribute while the old reader is still draining its
+        # pipe, which can leave the old Popen (and its descriptor) unclosed.
+        threading.Thread(target=self._pump, args=(self.proc, prog),
+                         daemon=True).start()
 
-    def _pump(self, prog: Progress) -> None:
-        assert self.proc and self.proc.stdout
-        for line in self.proc.stdout:
-            line = line.rstrip()
-            with self._lock:
-                self.lines.append(line)
-                if len(self.lines) > 2000:
-                    del self.lines[:1000]
-            if any(k in line for k in ("Error", "Traceback", "error:",
-                                       "Qwen", "Starting server",
-                                       "IMPORT FAILED")):
-                prog.log(f"ComfyUI: {line}")
+    def _pump(self, proc: subprocess.Popen, prog: Progress) -> None:
+        assert proc.stdout
+        try:
+            for line in proc.stdout:
+                line = line.rstrip()
+                with self._lock:
+                    self.lines.append(line)
+                    if len(self.lines) > 2000:
+                        del self.lines[:1000]
+                if any(k in line for k in ("Error", "Traceback", "error:",
+                                           "Qwen", "Starting server",
+                                           "IMPORT FAILED")):
+                    prog.log(f"ComfyUI: {line}")
+        finally:
+            proc.stdout.close()
 
     def tail(self, n: int = 40) -> list[str]:
         with self._lock:
             return self.lines[-n:]
 
     def stop(self) -> None:
-        if self.alive():
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
             try:
-                self.proc.terminate()
-                self.proc.wait(timeout=15)
+                proc.terminate()
+                proc.wait(timeout=15)
             except Exception:
                 try:
-                    self.proc.kill()
+                    proc.kill()
+                    proc.wait(timeout=5)
                 except Exception:
                     pass
+        if self.proc is proc:
+            self.proc = None
 
 
 def comfy_online(url: str) -> bool:
@@ -1066,8 +1078,16 @@ def pid_cmdline(pid: int) -> str:
             return lines[0] if lines else ""
         cmd = Path(f"/proc/{pid}/cmdline")
         if cmd.exists():
-            return cmd.read_bytes().replace(b"\0", b" ").decode(
-                "utf-8", "replace").strip()
+            # A freshly forked process briefly has an empty cmdline while the
+            # child crosses exec().  Treating that transient as "unreadable"
+            # makes the port-takeover guard lose the very command it uses to
+            # decide whether a process is safe to stop.
+            for attempt in range(5):
+                value = cmd.read_bytes().replace(b"\0", b" ").decode(
+                    "utf-8", "replace").strip()
+                if value or attempt == 4:
+                    return value
+                time.sleep(0.01)
         return _run(["ps", "-p", str(pid), "-o", "command="],
                     timeout=25).stdout.strip()
     except Exception:  # noqa: BLE001
@@ -1584,6 +1604,26 @@ def drop_mismatched_torch(python: str, index: str, log) -> bool:
     return True
 
 
+def install_requested_torch(python: str, cfg: dict, log, on_detail=None) -> None:
+    """Install the selected PyTorch build *after* every requirements file.
+
+    Requirements belonging to ComfyUI or a custom node may name ``torch``.
+    On Windows, resolving those files from PyPI can replace a CUDA wheel with
+    the CPU wheel.  Installing CUDA first therefore does not guarantee that it
+    is still installed when ComfyUI starts.  This final pass is intentionally
+    shared by setup and the repair buttons so every installation route leaves
+    the requested build in place.
+    """
+    index = torch_index(cfg)
+    gpu = nvidia_gpu()
+    log(f"Graphics: {gpu['name'] or 'no NVIDIA GPU found'}")
+    drop_mismatched_torch(python, index, log)
+    args = ["torch", "torchaudio"]
+    if index:
+        args += ["--index-url", index]
+    pip_install(python, args, log, on_detail)
+
+
 # Loaded exactly the way ComfyUI loads a custom node pack: under the folder's
 # own name, and registered in sys.modules *before* it is executed. Both halves
 # matter. A node pack's __init__.py is full of relative imports ("from .nodes
@@ -1816,18 +1856,8 @@ def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
                     raise RuntimeError("venv creation failed: " +
                                        (res.stderr or res.stdout)[-600:])
             target = vpy
-            prog.detail("deps", f"Installing PyTorch for {label} — the long "
-                                "one…")
             pip_install(str(target), ["--upgrade", "pip", "wheel"],
                         prog.log, say)
-            idx = torch_index(cfg)
-            gpu = nvidia_gpu()
-            prog.log(f"Graphics: {gpu['name'] or 'no NVIDIA GPU found'}")
-            drop_mismatched_torch(str(target), idx, prog.log)
-            args = ["torch", "torchaudio"]
-            if idx:
-                args += ["--index-url", idx]
-            pip_install(str(target), args, prog.log, say)
             prog.detail("deps", f"Installing {label}'s ComfyUI requirements…")
             pip_install(str(target), ["-r", str(comfy_dir / "requirements.txt")],
                         prog.log, say)
@@ -1838,6 +1868,10 @@ def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
             pip_install(str(target), ["-r", str(reqs)], prog.log, say)
         else:
             prog.log(f"No requirements.txt in {eng['node_dir']} — skipping.")
+        if slot.get("managed") and not portable_python(comfy_dir):
+            prog.detail("deps", f"Installing PyTorch for {label} — the long "
+                                "one…")
+            install_requested_torch(str(target), cfg, prog.log, say)
         return
 
     if step == "launch":
