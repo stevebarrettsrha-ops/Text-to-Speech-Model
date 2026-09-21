@@ -18,6 +18,7 @@ import webbrowser
 import zipfile
 from pathlib import Path
 
+import requests
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
 import bootstrap
@@ -25,7 +26,7 @@ import manager
 from bootstrap import (APP_DIR, DATA_DIR, ComfyProcess, Progress, clean_url,
                        comfy_online, comfy_port, detect_comfy_dirs,
                        load_config, save_config)
-from comfy import ComfyClient, ComfyError
+from comfy import ComfyClient, ComfyError, root_from_argv
 
 # DATA_DIR comes from bootstrap so the two cannot drift apart, and so
 # SCRIPT_BUILDER_DATA moves both.
@@ -81,6 +82,134 @@ def started_elsewhere(slot: dict) -> bool:
     setup cannot start someone else's ComfyUI, and the address can.
     """
     return slot.get("managed") is False and not slot.get("comfy_dir")
+
+
+def _note(engine: str, msg: str) -> None:
+    """Say it in the engine's own console as well as the activity log.
+
+    What the app does *to* an engine belongs next to what the engine says
+    about itself, in one window and in order — a takeover split across two
+    panels reads as two unrelated stories.
+    """
+    PROCS[engine].note(msg)
+    progress.log(msg)
+
+
+def _refresh_schema_when_up(engine: str) -> None:
+    """Drop the cached schema the moment the engine answers again.
+
+    The cache lasts two minutes (comfy.py), and the reason anyone starts or
+    restarts an engine is that something just changed — so without this the
+    fresh read hides behind the stale one for the two minutes that matter
+    most. `/api/comfy/restart`'s own task already forces a read; this is for
+    the paths that have no task to hang it on.
+    """
+    url = bootstrap.engine_url(cfg, engine)
+
+    def wait() -> None:
+        if bootstrap.wait_for_comfy(url, timeout=900):
+            try:
+                for_engine(engine).schema(force=True)
+            except Exception:  # noqa: BLE001
+                pass            # a warm cache is a nicety, never a precondition
+
+    threading.Thread(target=wait, daemon=True).start()
+
+
+def take_over_port(url: str, port: int, engine: str):
+    """Close whatever ComfyUI is answering on this engine's port.
+
+    Returns ("manager-reboot", None) when ComfyUI-Manager rebooted it in
+    place, ("freed", None) when the port is now empty, or (None, advice) when
+    it cannot be done — and the advice names the obstacle that was actually
+    hit, because "close it yourself" against a windowless python sends someone
+    hunting through Task Manager for one of several identical rows.
+    """
+    _note(engine, "This ComfyUI was not started here — taking it over.")
+    try:
+        r = requests.post(f"{url}/manager/reboot", json={}, timeout=5)
+        accepted = r.status_code in (200, 201, 204)
+    except requests.exceptions.RequestException:
+        accepted = True          # the connection dropping *is* the reboot
+    if accepted:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if not comfy_online(url):
+                _note(engine, "ComfyUI-Manager took the reboot; waiting for "
+                              "the engine to come back.")
+                return "manager-reboot", None
+            time.sleep(0.5)
+        _note(engine, "ComfyUI-Manager did not take the reboot; stopping the "
+                      "process instead.")
+
+    def settled_free() -> bool:
+        # A supervisor — ComfyUI Desktop, a launcher .bat — respawns in well
+        # under a second, so a port that has gone quiet is only free once it
+        # has *stayed* quiet. Without the wait, a respawn lands between the
+        # check and the start and the app reports success over a port it
+        # never took.
+        time.sleep(2.0)
+        return not comfy_online(url) and not bootstrap.port_pids(port)
+
+    first_pids: list[int] = []
+    denied = False
+    for attempt in range(3):
+        pids = bootstrap.port_pids(port)
+        if attempt == 0:
+            first_pids = pids
+        if not pids:
+            if not comfy_online(url) and settled_free():
+                return "freed", None
+            if not comfy_online(url):
+                _note(engine, "It came straight back — something restarted it.")
+                continue
+            return None, (f"Something answers on port {port} but its process "
+                          "could not be found — it may belong to another user "
+                          "account. Close it yourself, then press Start "
+                          "ComfyUI.")
+        for pid in pids:
+            cmd = bootstrap.pid_cmdline(pid)
+            _note(engine, f"Port {port} is held by pid {pid}"
+                  + (f": {cmd[:120]}" if cmd else " (command line unreadable)"))
+            # Never close something that is not a ComfyUI. The port is only
+            # this engine's by convention, and a database or another app's
+            # dev server on it is a settings mistake, not an orphan.
+            if cmd and not any(k in cmd.lower()
+                               for k in ("python", "main.py", "comfy")):
+                return None, (f"Port {port} is held by something that does not "
+                              f"look like ComfyUI ({cmd[:90]}). Close it "
+                              "yourself, or give this engine a different "
+                              "address in Settings.")
+        for pid in pids:
+            said = bootstrap.kill_pid(pid)
+            _note(engine, f"Stopping pid {pid} — {said or 'no reply'}")
+            if "denied" in (said or "").lower() \
+                    or "access" in (said or "").lower():
+                denied = True
+        deadline = time.time() + 8
+        while comfy_online(url) and time.time() < deadline:
+            time.sleep(0.5)
+        if not comfy_online(url):
+            if settled_free():
+                return "freed", None
+            _note(engine, "It came straight back — something restarted it.")
+            continue
+        _note(engine, "Still answering — trying again.")
+
+    now = bootstrap.port_pids(port)
+    if denied:
+        return None, ("The system refused to stop it (access denied) — it was "
+                      "started by another user, or as administrator. Run "
+                      "Script Builder as administrator once, or close that "
+                      "ComfyUI yourself, then press Start ComfyUI.")
+    if now and set(now) != set(first_pids):
+        return None, ("It keeps coming back under a new process id — "
+                      "something is supervising it (ComfyUI Desktop, or a "
+                      "launcher script). Close that application, then press "
+                      "Start ComfyUI.")
+    return None, ("It would not close. The Engine console shows what was "
+                  "tried; close that ComfyUI yourself, then press Start "
+                  "ComfyUI.")
 
 
 def activate(engine: str, prog=None, wait: bool = True) -> str:
@@ -482,6 +611,7 @@ def api_status():
     missing = [m["repo"] for m in bootstrap.engine_missing(cfg, engine)] \
         if models_known else []
     payload["missing_models"] = missing
+    root = ""
     if online:
         try:
             payload["nodes_ready"] = for_engine(engine).engine_ready(engine)
@@ -491,11 +621,23 @@ def api_status():
                 for e in bootstrap.ENGINES}
         except Exception as exc:  # noqa: BLE001
             payload["schema_error"] = str(exc)
+        # The three silent "nothing works" states, named, so the Engine
+        # console can say which one it is instead of showing a healthy-looking
+        # panel over a dead app. One /system_stats read serves both of the
+        # identity answers and the `foreign` sentence below.
+        argv, root = engine_identity(engine)
+        payload["engine_argv"] = argv
+        payload["engine_mismatch"] = bool(
+            root and slot.get("comfy_dir")
+            and not manager.same_install(slot["comfy_dir"], root))
+        payload["engine_managed"] = PROCS[engine].alive()
+        payload["stale_reason"] = stale_engine(
+            engine, bool(models_known and not missing))
+        payload["stale_models"] = bool(payload["stale_reason"])
     # Only when the nodes are not loaded: that is the one symptom another
-    # ComfyUI holding the port produces, and asking costs a request to an
-    # engine the page polls every few seconds. Restarting ours would not fix
-    # it, so the page must not offer that as the way out.
-    payload["foreign"] = (foreign_engine(engine)
+    # ComfyUI holding the port produces. Restarting ours would not fix it, so
+    # the page must not offer that as the way out.
+    payload["foreign"] = (foreign_engine(engine, root)
                           if online and not payload["nodes_ready"] else "")
     payload["ready"] = bool(online and payload["nodes_ready"]
                             and models_known and not missing)
@@ -601,7 +743,58 @@ def api_setup_state():
     return jsonify(snap)
 
 
-def foreign_engine(engine: str) -> str:
+def engine_identity(engine: str) -> tuple[str, str]:
+    """(argv[0], the folder it runs from) for whatever is answering, or ("","").
+
+    One read of /system_stats, shared by the three callers that used to ask
+    separately — the page polls status every few seconds and each of those was
+    a request of its own.
+    """
+    stats = bootstrap.comfy_stats(bootstrap.engine_url(cfg, engine)) or {}
+    argv = stats.get("argv") or []
+    return ((argv[0] if argv else ""), root_from_argv(argv))
+
+
+def stale_engine(engine: str, weights_ready: bool) -> str:
+    """Why the engine answering cannot reach what is already on disk, or "".
+
+    The usual meaning of a flag by that name is a model scan: ComfyUI lists
+    its model folders once, at startup, so weights that landed afterwards are invisible
+    until a restart. Neither of this app's node packs works that way — both
+    resolve a checkpoint folder per call, freshly, so a voice downloaded
+    behind a running engine is found without restarting anything. What does go
+    stale here is the half of the same disease that rule 17 already names:
+    ComfyUI reads `custom_nodes` once, at startup. An engine started before
+    its node pack landed is a complete install with nothing in it — every
+    folder present, every download finished, no classes, and a Create page
+    that fails on "the nodes are not loaded" however many times they are
+    installed.
+
+    MOSS carries the model-list half as well, because its loader publishes the
+    only enum in either pack that names checkpoints. Qwen declares no marker
+    (see ENGINES) and is judged on its nodes alone.
+    """
+    if not weights_ready:
+        return ""
+    slot = bootstrap.engine_cfg(cfg, engine)
+    label = bootstrap.ENGINES[engine]["label"]
+    client = for_engine(engine)
+    try:
+        loaded = client.engine_ready(engine)
+        listed = client.model_list(engine)
+    except Exception:  # noqa: BLE001
+        return ""            # an engine that will not answer is not "stale"
+    if slot.get("comfy_dir") and not loaded and bootstrap.node_installed(
+            Path(slot["comfy_dir"]), engine):
+        return (f"the {label} nodes are on disk but this ComfyUI started "
+                "before they were installed")
+    marker = bootstrap.ENGINES[engine].get("model_marker") or ""
+    if loaded and marker and not any(marker in x.lower() for x in listed):
+        return (f"this ComfyUI lists no {label} checkpoint it could load")
+    return ""
+
+
+def foreign_engine(engine: str, root: str | None = None) -> str:
     """Why the ComfyUI answering this engine's address is not this engine's.
 
     Empty when it is ours, when there is no managed install to compare
@@ -613,10 +806,11 @@ def foreign_engine(engine: str) -> str:
     slot = bootstrap.engine_cfg(cfg, engine)
     if not slot.get("comfy_dir"):
         return ""
-    try:
-        root = for_engine(engine).engine_root()
-    except Exception:  # noqa: BLE001
-        return ""
+    if root is None:
+        try:
+            root = for_engine(engine).engine_root()
+        except Exception:  # noqa: BLE001
+            return ""
     if not root or manager.same_install(slot["comfy_dir"], root):
         return ""
     return (f"{slot['comfy_url']} is answered by the ComfyUI in {root}, not "
@@ -639,6 +833,7 @@ def api_comfy_start():
     why = activate(engine, wait=False)
     if why:
         return jsonify({"error": why}), 400
+    _refresh_schema_when_up(engine)
     return jsonify({"ok": True})
 
 
@@ -650,6 +845,17 @@ def api_comfy_restart():
     into an engine that is already running leaves it running without them, and
     "Installed but ComfyUI has not loaded them" is not something anyone can act
     on from a launcher with no console. This is the act.
+
+    An engine this app did not start — an orphan from an earlier launch, a
+    ComfyUI Desktop, one started by hand on the same port — used to be a dead
+    end here: Start said "already running", Restart said "not started by this
+    app", and the only advice left was to go and find a windowless python in
+    Task Manager. It is taken over instead, through ComfyUI-Manager's own
+    reboot where that is installed and by closing the process where it is not,
+    and every refusal is a 409 that names the obstacle it actually hit.
+
+    `how` says which of the four routes ran: managed, started, takeover or
+    manager-reboot.
     """
     engine = request.args.get("engine") or current_engine()
     if engine not in bootstrap.ENGINES:
@@ -658,17 +864,33 @@ def api_comfy_restart():
     comfy_proc = PROCS[engine]
     py = bootstrap.comfy_python(cfg, engine)
     if started_elsewhere(slot):
+        # External mode is a deliberate choice: there is no install here to
+        # put back, so closing that ComfyUI would leave nothing at all.
         return jsonify({"error": "Script Builder did not start that ComfyUI, "
                                  "so it cannot restart it. Start it again at "
                                  f"{slot['comfy_url']} so it loads the "
                                  "nodes."}), 400
     if not slot.get("comfy_dir") or not py:
+        # Same reason, one step earlier: taking a port from someone and having
+        # no engine to start in its place is not a restart, it is a hole.
         return jsonify({"error": "Run setup first."}), 400
     url = slot["comfy_url"]
-    if comfy_online(url) and not comfy_proc.alive():
-        return jsonify({"error": "Something else started that ComfyUI, so "
-                                 "Script Builder cannot restart it. Restart it "
-                                 "yourself so it loads the nodes."}), 400
+    port = comfy_port(url)
+
+    how = "managed"
+    if not comfy_proc.alive():
+        if not comfy_online(url):
+            how = "started"
+        else:
+            kind, advice = take_over_port(url, port, engine)
+            if advice:
+                return jsonify({"error": advice}), 409
+            if kind == "manager-reboot":
+                # It is restarting itself, in place, with our models folder
+                # and our custom_nodes — there is nothing left to start.
+                _refresh_schema_when_up(engine)
+                return jsonify({"ok": True, "how": "manager-reboot"})
+            how = "takeover"
 
     def run(task: manager.Task) -> None:
         if comfy_proc.alive():
@@ -709,11 +931,36 @@ def api_comfy_restart():
                                      "in custom_nodes is failing first"))
         raise RuntimeError("; ".join(reasons))
 
-    return jsonify({"ok": True,
+    return jsonify({"ok": True, "how": how,
                     "task": manager.spawn(
                         "engine",
                         f"Restart {bootstrap.ENGINES[engine]['label']}",
                                           run).view()})
+
+
+@app.get("/api/comfy/log")
+def api_comfy_log():
+    """One engine's own console — the visible cue that it is starting, up, or
+    saying exactly which import failed.
+
+    `/api/setup/state` carries a tail too, but that one belongs to a setup run
+    and stops when the run does. This is the engine panel's live feed, and it
+    is also where `note()` puts what the app did to the engine.
+    """
+    engine = request.args.get("engine") or current_engine()
+    if engine not in bootstrap.ENGINES:
+        return jsonify({"error": f"There is no '{engine}' engine."}), 400
+    # Clamped, and never int() on raw input: a value typed into a URL is not a
+    # reason for a 500 (rule 9, in a smaller place).
+    try:
+        n = int(request.args.get("n", 80))
+    except (TypeError, ValueError):
+        n = 80
+    n = min(max(n, 1), 400)
+    return jsonify({"engine": engine,
+                    "lines": PROCS[engine].tail(n),
+                    "running": PROCS[engine].alive(),
+                    "online": comfy_online(bootstrap.engine_url(cfg, engine))})
 
 
 @app.post("/api/selftest/<engine>")
@@ -1078,6 +1325,94 @@ def sweep_orphan_takes() -> int:
     return gone
 
 
+def ensure_engine_at_boot() -> None:
+    """A launch ends with a working engine, without a button pressed.
+
+    Four outcomes, and each one is said out loud in the engine console:
+
+      offline            start the engine this library opens on;
+      online and healthy adopt it, and say so — a ComfyUI somebody left
+                         running is not a problem to be solved;
+      online and useless replace it, through the same looks-like-ComfyUI
+                         guard the Restart button uses;
+      external mode      never touched. That engine is the person's own; the
+                         app says what is wrong with it and leaves it alone.
+
+    Only the engine a launch opens on (rule 18g), and only ever one at a time
+    (rule 31) — bringing the other up costs the card for nothing.
+    """
+    if not cfg.get("setup_complete"):
+        return
+    engine = current_engine()
+    slot = bootstrap.engine_cfg(cfg, engine)
+    url = slot["comfy_url"]
+    port = comfy_port(url)
+    if not slot.get("auto_start", True):
+        return
+
+    if not comfy_online(url):
+        _note(engine, "Starting the engine this library was last set to…")
+        why = activate(engine, wait=False)
+        if why:
+            # An engine that cannot start is an engine the Engine panel
+            # reports as offline, never a reason the app fails to boot.
+            _note(engine, f"Could not start it: {why}")
+        else:
+            _refresh_schema_when_up(engine)
+        return
+
+    # Something already answers. Adopt it, or replace it — but decide on
+    # evidence, not on who started it.
+    if started_elsewhere(slot):
+        _note(engine, f"Adopting the ComfyUI already running at {url} — it is "
+                      "yours, not this app's.")
+        return
+    try:
+        for_engine(engine).schema(force=True)
+    except Exception as exc:  # noqa: BLE001
+        _note(engine, "The engine already running would not describe itself "
+                      f"({exc}) — leaving it alone.")
+        return
+
+    models_dir = bootstrap.engine_models_dir(cfg, engine)
+    weights_ready = bool(models_dir and models_dir.is_dir()
+                         and not bootstrap.engine_missing(cfg, engine))
+    reasons = []
+    why = stale_engine(engine, weights_ready)
+    if why:
+        reasons.append(why)
+    _, root = engine_identity(engine)
+    if root and slot.get("comfy_dir") \
+            and not manager.same_install(slot["comfy_dir"], root):
+        reasons.append(f"a different install is answering the address ({root})")
+
+    if not reasons:
+        _note(engine, f"Adopting the ComfyUI already running at {url}.")
+        return
+    py = bootstrap.comfy_python(cfg, engine)
+    if not slot.get("managed", True) or not slot.get("comfy_dir") or not py:
+        _note(engine, "The engine already running has problems ("
+                      + "; ".join(reasons) + ") but this app has no ComfyUI of "
+                      "its own to put in its place — restart it yourself, or "
+                      "press Restart ComfyUI.")
+        return
+    _note(engine, "The engine already running is no use as it stands — "
+                  + "; ".join(reasons) + ". Replacing it.")
+    kind, advice = take_over_port(url, port, engine)
+    if advice:
+        _note(engine, advice)
+        return
+    if kind == "manager-reboot":
+        _refresh_schema_when_up(engine)
+        return
+    _note(engine, "Starting a managed engine in its place…")
+    problem = activate(engine, wait=False)
+    if problem:
+        _note(engine, f"Could not start it: {problem}")
+    else:
+        _refresh_schema_when_up(engine)
+
+
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     TAKES_DIR.mkdir(parents=True, exist_ok=True)
@@ -1098,17 +1433,10 @@ def main() -> None:
             progress.log(f"Opening on {bootstrap.ENGINES[primary]['label']}, "
                          f"the primary engine — the last session ended on "
                          f"{bootstrap.ENGINES.get(was, {}).get('label', was)}.")
-    if cfg.get("setup_complete") and cfg.get("auto_start_comfy", True) \
-            and not engine_online():
-        # Only the engine that is selected. The other would sit on the card
-        # for nothing, and on 8 GB that is the difference between a take and
-        # an out-of-memory. An engine that cannot start is an engine the
-        # Engine panel reports as offline, never a reason the app fails to
-        # boot.
-        progress.log("Starting the engine this library was last set to…")
-        why = activate(current_engine(), wait=False)
-        if why:
-            progress.log(f"Could not start it: {why}")
+    # On its own thread: taking a port off an orphan can take half a minute,
+    # and the page has to be openable while it happens — the console it
+    # narrates into is on that page.
+    threading.Thread(target=ensure_engine_at_boot, daemon=True).start()
     url = f"http://127.0.0.1:{PORT}"
     print(f"\n  Script Builder  →  {url}\n")
     if os.environ.get("SCRIPT_BUILDER_NO_BROWSER") != "1":
