@@ -1604,6 +1604,26 @@ def drop_mismatched_torch(python: str, index: str, log) -> bool:
     return True
 
 
+def install_requested_torch(python: str, cfg: dict, log, on_detail=None) -> None:
+    """Install the selected PyTorch build *after* every requirements file.
+
+    Requirements belonging to ComfyUI or a custom node may name ``torch``.
+    On Windows, resolving those files from PyPI can replace a CUDA wheel with
+    the CPU wheel.  Installing CUDA first therefore does not guarantee that it
+    is still installed when ComfyUI starts.  This final pass is intentionally
+    shared by setup and the repair buttons so every installation route leaves
+    the requested build in place.
+    """
+    index = torch_index(cfg)
+    gpu = nvidia_gpu()
+    log(f"Graphics: {gpu['name'] or 'no NVIDIA GPU found'}")
+    drop_mismatched_torch(python, index, log)
+    args = ["torch", "torchaudio"]
+    if index:
+        args += ["--index-url", index]
+    pip_install(python, args, log, on_detail)
+
+
 # Loaded exactly the way ComfyUI loads a custom node pack: under the folder's
 # own name, and registered in sys.modules *before* it is executed. Both halves
 # matter. A node pack's __init__.py is full of relative imports ("from .nodes
@@ -1836,18 +1856,8 @@ def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
                     raise RuntimeError("venv creation failed: " +
                                        (res.stderr or res.stdout)[-600:])
             target = vpy
-            prog.detail("deps", f"Installing PyTorch for {label} — the long "
-                                "one…")
             pip_install(str(target), ["--upgrade", "pip", "wheel"],
                         prog.log, say)
-            idx = torch_index(cfg)
-            gpu = nvidia_gpu()
-            prog.log(f"Graphics: {gpu['name'] or 'no NVIDIA GPU found'}")
-            drop_mismatched_torch(str(target), idx, prog.log)
-            args = ["torch", "torchaudio"]
-            if idx:
-                args += ["--index-url", idx]
-            pip_install(str(target), args, prog.log, say)
             prog.detail("deps", f"Installing {label}'s ComfyUI requirements…")
             pip_install(str(target), ["-r", str(comfy_dir / "requirements.txt")],
                         prog.log, say)
@@ -1858,6 +1868,10 @@ def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
             pip_install(str(target), ["-r", str(reqs)], prog.log, say)
         else:
             prog.log(f"No requirements.txt in {eng['node_dir']} — skipping.")
+        if slot.get("managed") and not portable_python(comfy_dir):
+            prog.detail("deps", f"Installing PyTorch for {label} — the long "
+                                "one…")
+            install_requested_torch(str(target), cfg, prog.log, say)
         return
 
     if step == "launch":

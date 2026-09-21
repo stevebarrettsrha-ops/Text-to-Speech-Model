@@ -537,7 +537,7 @@ def _install_torch(task: Task, cfg: dict, opts: dict) -> None:
     # there, beside the ComfyUI that will import it — never into a second
     # environment ComfyUI never loads. Probed once: each call runs the
     # candidates to see which of them is real.
-    own = "" if (target or cfg.get("managed")) \
+    own = "" if (target or slot.get("managed")) \
         else bootstrap.existing_python(comfy_dir)
     if target:
         task.log(f"Portable ComfyUI — installing into {target}")
@@ -549,28 +549,22 @@ def _install_torch(task: Task, cfg: dict, opts: dict) -> None:
         if not vpy.exists():
             task.set(detail="Creating the Python environment…")
             base = bootstrap.find_python()
-            if stream([base, "-m", "venv",
-                       str(comfy_dir.parent / "comfy-venv")], task) != 0:
+            if stream([base, "-m", "venv", str(vpy.parents[1])], task) != 0:
                 raise RuntimeError("Could not create the environment.")
         target = vpy
-    cfg["python"] = str(target)
-    bootstrap.save_config(cfg)
+    slot["python"] = str(target)
     if opts.get("torch_index") is not None:
         cfg["torch_index"] = opts["torch_index"]
-    index = bootstrap.torch_index(cfg)
+    bootstrap.save_config(cfg)
     say = _reporter(task)
-    task.set(detail="Installing PyTorch — this is the long one…")
     bootstrap.pip_install(str(target), ["--upgrade", "pip", "wheel"],
                           task.log, say)
-    bootstrap.drop_mismatched_torch(str(target), index, task.log)
-    args = ["torch", "torchaudio"]
-    if index:
-        args += ["--index-url", index]
-    bootstrap.pip_install(str(target), args, task.log, say)
     task.set(detail="Installing ComfyUI requirements…")
     bootstrap.pip_install(str(target),
                           ["-r", str(comfy_dir / "requirements.txt")],
                           task.log, say)
+    task.set(detail="Installing the selected PyTorch build — the long one…")
+    bootstrap.install_requested_torch(str(target), cfg, task.log, say)
     task.set(detail="PyTorch installed.")
 
 
@@ -594,6 +588,11 @@ def _install_node_reqs(task: Task, cfg: dict, engine: str = "") -> None:
             raise RuntimeError(f"The {eng['label']} nodes are not installed yet.")
         task.set(detail=f"Installing the {eng['label']} requirements…")
         bootstrap.pip_install(py, ["-r", str(reqs)], task.log, _reporter(task))
+    # A node requirements file is allowed to name torch.  On Windows that can
+    # silently swap a CUDA wheel for PyPI's CPU wheel, so restore the build the
+    # GPU picker selected before calling the engine repaired.
+    task.set(detail="Verifying the selected PyTorch build…")
+    bootstrap.install_requested_torch(py, cfg, task.log, _reporter(task))
     task.set(detail="Packages installed. Restart ComfyUI.")
 
 

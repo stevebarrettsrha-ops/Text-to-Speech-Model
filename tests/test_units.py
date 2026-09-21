@@ -988,6 +988,21 @@ class TorchReinstall(unittest.TestCase):
         self.assertFalse(dropped)
         self.assertEqual(calls, [])
 
+    def test_the_selected_build_is_the_last_dependency_installed(self):
+        calls = []
+        with mock.patch.object(bootstrap, "torch_index",
+                               return_value=bootstrap.CUDA_INDEX), \
+             mock.patch.object(bootstrap, "nvidia_gpu", return_value={
+                 "name": "NVIDIA GeForce RTX 4060", "driver": True}), \
+             mock.patch.object(bootstrap, "drop_mismatched_torch",
+                               side_effect=lambda *a: calls.append("drop")), \
+             mock.patch.object(bootstrap, "pip_install",
+                               side_effect=lambda _py, args, *_a:
+                               calls.append(args)):
+            bootstrap.install_requested_torch("py", {}, lambda _m: None)
+        self.assertEqual(calls, ["drop", [
+            "torch", "torchaudio", "--index-url", bootstrap.CUDA_INDEX]])
+
 
 class PipReadiness(unittest.TestCase):
     """`--progress-bar raw` arrived in pip 24.1 and a fresh venv ships 24.0,
