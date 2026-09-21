@@ -575,8 +575,14 @@
           <button class="btn" id="btnTestQwen" title="Generate one line with Qwen3-TTS and report what happens">Test Qwen3-TTS</button>
           <button class="btn" id="btnTestMoss" title="Generate one line with MOSS-TTS and report what happens">Test MOSS-TTS</button>
           <button class="btn" id="btnStartEngine">Start ComfyUI</button>
+          <button class="btn" id="btnRestartEngine" title="Stop this engine's ComfyUI and start it again, so it loads newly installed nodes">Restart ComfyUI</button>
           <button class="btn" id="btnReRun">Run setup again</button>
         </div>
+      </div>
+      <div class="panel">
+        <h2>Engine console</h2>
+        <p class="sub" id="engine-state">Checking…</p>
+        <div class="log" id="engine-log">Nothing yet — start ComfyUI and its own output appears here.</div>
       </div>
       <div class="panel">
         <h2>PyTorch build</h2>
@@ -843,7 +849,7 @@ function show(view) {
   document.body.classList.toggle("solo", view === "models" || view === "engine");
   $("mainCol").scrollTop = 0;
   if (view === "models") { loadHf(); loadLocal(); pollTasks(); }
-  if (view === "engine") { loadDeps(); pollTasks(); }
+  if (view === "engine") { loadDeps(); pollTasks(); pollEngineLog(); }
   if (view === "library") renderLib();
   if (view === "home") renderHome();
   if (view === "create") requestAnimationFrame(resizeAll);
@@ -1726,15 +1732,84 @@ function renderSelfTest(engine, t) {
   }
 }
 async function restartEngine() {
+  var b = busy($("btnRestartEngine"), "Restarting…");
   try {
     var r = await api("/api/comfy/restart?engine=" +
       encodeURIComponent(S.engine), { method: "POST" });
+    // Four routes, four different things to say. "Restarting ComfyUI" over a
+    // takeover hides the part that matters: something else was on that port
+    // and has just been closed.
+    if (r.how === "manager-reboot") {
+      toast("ComfyUI-Manager is rebooting that engine in place — it loads the "
+            + "nodes on the way back up.");
+      show("engine");
+      loadDeps();
+      return;
+    }
+    if (r.how === "takeover") {
+      toast("That ComfyUI was not started here, so it was closed and one of "
+            + "this app's own is starting in its place. Watch the console "
+            + "below.");
+    } else if (r.how === "started") {
+      toast("Nothing was running on that address — starting ComfyUI. The "
+            + "first start is slow.");
+    } else {
+      toast("Restarting ComfyUI so it loads the nodes. The first start is "
+            + "slow.");
+    }
+    show("engine");
     S.taskId = r.task.id; S.taskCursor = 0; $("task-log").textContent = "";
     pollTasks();
-    toast("Restarting ComfyUI so it loads the nodes. The first start is slow.");
     if (await waitForTask(r.task.id)) toast("Nodes loaded.");
     loadDeps();
   } catch (e) { toast(e.message, true); }
+  finally { b.done(); }
+}
+
+/* The engine's own console, polled while the Engine page is open and nowhere
+   else. It is the only visible cue that an engine is starting rather than
+   hung, and the one place the app's own actions on it are written down. */
+var engineLogTimer = null;
+async function pollEngineLog() {
+  clearTimeout(engineLogTimer);
+  if (S.view !== "engine") return;
+  var d;
+  try {
+    d = await api("/api/comfy/log?n=120&engine=" + encodeURIComponent(S.engine));
+  } catch (e) { engineLogTimer = setTimeout(pollEngineLog, 4000); return; }
+  var log = $("engine-log");
+  var text = (d.lines || []).join("\n");
+  if (text && log.textContent !== text) {
+    // Only follow the tail when it was already at the tail: yanking the view
+    // down while someone is reading an IMPORT FAILED higher up is worse than
+    // no scrolling at all.
+    var bottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+    log.textContent = text;
+    if (bottom) log.scrollTop = log.scrollHeight;
+  }
+  var st = S.status || {};
+  var state;
+  if (st.stale_models && d.online) {
+    state = "⚠ " + (st.stale_reason
+      ? st.stale_reason.charAt(0).toUpperCase() + st.stale_reason.slice(1)
+      : "Everything is on disk, but this ComfyUI started before it landed")
+      + ". Press Restart ComfyUI.";
+  } else if (st.engine_mismatch && d.online) {
+    state = "⚠ A different ComfyUI is answering at "
+      + ((st.config || {}).comfy_url || "this address")
+      + (st.engine_argv ? " (" + st.engine_argv + ")" : "")
+      + ". Close it, or give this engine another address in Settings.";
+  } else if (d.running) {
+    state = d.online ? "Running — started by Script Builder."
+                     : "Starting… the first start is slow.";
+  } else if (d.online) {
+    state = "Online, but started outside Script Builder — Restart ComfyUI "
+          + "will take it over.";
+  } else {
+    state = "Offline. Press Start ComfyUI.";
+  }
+  $("engine-state").textContent = state;
+  engineLogTimer = setTimeout(pollEngineLog, 2500);
 }
 var engineStarting = false;
 async function startEngine(ev) {
@@ -2216,6 +2291,7 @@ function wire() {
     runSelfTest("moss", e.currentTarget); });
   $("btnInstallAll").addEventListener("click", installAllMissing);
   $("btnStartEngine").addEventListener("click", startEngine);
+  $("btnRestartEngine").addEventListener("click", restartEngine);
   $("btnReRun").addEventListener("click", openSetup);
   $("btnCancelTask").addEventListener("click", function () {
     if (S.taskId) api("/api/tasks/" + S.taskId + "/cancel", { method: "POST" }); });

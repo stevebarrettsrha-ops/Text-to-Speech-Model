@@ -339,6 +339,72 @@
    the suffix, and a bare id means the default engine, which is what a page
    written before the split would send.
 
+33. **A ComfyUI this app did not start is taken over, not declared
+   unreachable.** Start said "already running", Restart said "not started by
+   this app", and the only advice left was to find a windowless python in Task
+   Manager — an orphan from a previous launch, a ComfyUI Desktop or a
+   hand-started one was a dead end. `take_over_port` tries ComfyUI-Manager's
+   own `POST /manager/reboot` first (a dropped connection *is* the reboot),
+   then finds the process on the port and closes it. `/api/comfy/restart`
+   returns a distinct `how` — `managed`, `started`, `takeover`,
+   `manager-reboot` — because "Restarting ComfyUI" over a takeover hides the
+   part that matters.
+33a. **Nothing is closed unless it looks like a ComfyUI, and no port is taken
+   that cannot be filled.** The port belongs to an engine only by convention:
+   `pid_cmdline` is read and anything without `python`, `main.py` or `comfy` in
+   it is named in the refusal and left running. And an engine with no install
+   of its own is refused *before* the takeover — taking a port from someone and
+   having nothing to start in its place is a hole, not a restart. External mode
+   (`managed` False with no `comfy_dir`) is never touched at all.
+33b. **A refusal names the obstacle it actually hit.** "It would not close"
+   covers a process owned by an administrator, a supervisor respawning it and a
+   database that was never ComfyUI, and all three need different sentences.
+   `kill_pid` therefore returns what the system *said* — "stopped", "already
+   gone", "access denied", "sent SIGKILL" — rather than a guess, and a refusal
+   reaches the page as **409 with the advice as `error`**.
+33c. **`settled_free()` sleeps 2 seconds, and that is the whole point of it.**
+   A supervisor — ComfyUI Desktop, a launcher `.bat` — respawns in well under a
+   second, so a port that has gone quiet is only free once it has *stayed*
+   quiet. Without the wait the respawn lands between the check and the start,
+   and the app reports success over a port it never took. Three rounds, and
+   pids that differ from the first round's are how "something is supervising
+   it" is told apart from "it would not close".
+33d. **`_refresh_schema_when_up` exists because the schema cache lasts two
+   minutes.** The reason anyone starts or restarts an engine is that something
+   just changed, so without it the fresh read hides behind the stale one for
+   exactly the two minutes that matter. Restart's own task already forces a
+   read; this is for the paths with no task to hang it on — Start, the
+   manager-reboot route, and the boot path.
+33e. **`stale_models` here is about the nodes, not a model scan.** The usual
+   meaning of a flag by that name is a startup model scan: ComfyUI lists its
+   model folders once, at launch, so weights that land afterwards are invisible
+   until a restart. Neither of this app's node packs works that way — both
+   resolve a checkpoint folder per call (`load_qwen_model` walks
+   `models/qwen-tts` on every generate; MOSS is handed a path by `moss_dirs()`)
+   — so a voice downloaded behind a running engine is found with no restart,
+   and a literal port of that flag would be a lie. What does go stale is rule
+   17's half of the same disease: `stale_engine()` is true when every wanted
+   model is on disk and whole, the node pack's marker file is on disk, and the
+   engine answering has none of its classes. Complete install, nothing that can
+   speak, and Restart is the cure. MOSS carries the model-list half as well,
+   because `MossTTSModelLoader.model_variant` is the one enum either pack
+   publishes that names checkpoints; Qwen's name sizes ("0.6B") and preset
+   speakers ("Ryan") and never a model, which is why `ENGINES["qwen"]` declares
+   an empty `model_marker` and is judged on its nodes alone.
+33f. **A launch ends with a working engine, and says which of the four things
+   it did.** `ensure_engine_at_boot` runs on a daemon thread from `main()` —
+   the page has to open while a takeover is happening, because the console it
+   narrates into is on that page. Offline: start it. Online and healthy:
+   **adopt** it, and say so — a ComfyUI somebody left running is not a problem
+   to be solved. Online and useless: replace it, through the same guard Restart
+   uses. Somebody else's: leave it, and say what is wrong with it. Only the
+   engine a launch opens on (rule 18g), and only ever one at a time (rule 31).
+33g. **`note()` puts the app's own half of the story in the engine's console.**
+   What the app did *to* an engine belongs next to what the engine said about
+   itself, in one window and in order; split across two panels it reads as two
+   unrelated stories. `/api/comfy/log` is that window — `n` clamped to 1..400,
+   and never `int()` on raw input, which is rule 9 in a smaller place.
+
 ## Why line-by-line, not DialogueInferenceNode
 
 `DialogueInferenceNode` takes a `RoleBankNode`, which takes prompts from
@@ -352,8 +418,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 155 unit tests, standard library only
-npm test                 # 90 checks driving the real page in headless Chromium
+npm run test:units       # 176 unit tests, standard library only
+npm test                 # 93 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script
@@ -369,6 +435,16 @@ because that is the shape the app installs — and a MOSS graph arriving at
 Qwen's ComfyUI is a failure the single-stand-in version could not have seen.
 `tests/mock_hf.py` answers for HuggingFace, with
 `Range` support and switches to cut a transfer off mid-file or ignore a resume.
+
+The engine-kit tests run **real processes on real ports**, because mocking a
+takeover only proves the mock returns what it was told to. `fake_install()`
+writes a pretend ComfyUI checkout whose `main.py` serves `mock_comfy.py`, so
+the engine the app ends up managing is a genuine child of it; the supervision
+test wraps a stand-in in a parent that respawns it, which is the only way
+"something is supervising it" is proved rather than asserted; and the
+not-a-ComfyUI test launches an HTTP server through a symlink named something
+else, so the command-line guard is read the way it is in the wild. They are
+the slow part of `test:units` (about thirty seconds) and worth it.
 
 `SCRIPT_BUILDER_DATA` moves `data/`, and the suite points it at a temporary
 directory. Without that, running the tests would overwrite a real library.

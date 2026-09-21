@@ -1848,5 +1848,534 @@ class SeparateInstalls(unittest.TestCase):
         self.assertFalse(bootstrap.DEFAULT_CONFIG["run_both_engines"])
 
 
+# --------------------------------------------------------------------------- #
+# the engine kit: real processes, real ports
+# --------------------------------------------------------------------------- #
+# Everything below runs actual processes on actual ports. Mocking the takeover
+# would only prove that the mock returns what it was told to: the whole point
+# is that a port is really held, a pid is really found, and a process really
+# does or does not close.
+import requests  # noqa: E402  (in requirements.txt; the app itself uses it)
+
+MOCK_COMFY = Path(__file__).resolve().parent / "mock_comfy.py"
+# The suite talks to servers on this machine, and a proxy in the environment
+# would swallow every one of those requests.
+os.environ.setdefault("NO_PROXY", "*")
+os.environ.setdefault("no_proxy", "*")
+
+
+def free_port() -> int:
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def online(url: str, timeout: float = 20) -> bool:
+    import time as _t
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        if bootstrap.comfy_online(url):
+            return True
+        _t.sleep(0.2)
+    return False
+
+
+def offline(url: str, timeout: float = 20) -> bool:
+    import time as _t
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        if not bootstrap.comfy_online(url):
+            return True
+        _t.sleep(0.2)
+    return False
+
+
+def spawn_mock(port: int, root: Path) -> subprocess.Popen:
+    """A stand-in ComfyUI on a port of its own, as its own process — which is
+    what makes it something the app has to find and close rather than drop."""
+    root.mkdir(parents=True, exist_ok=True)
+    return subprocess.Popen(
+        [sys.executable, str(MOCK_COMFY), str(root)],
+        env={**os.environ, "MOCK_COMFY_PORT": str(port)},
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
+
+
+def fake_install(root: Path, engine: str = "qwen",
+                 with_nodes: bool = False) -> Path:
+    """A pretend ComfyUI checkout whose main.py serves the stand-in engine.
+
+    This is what lets the app truly own, stop and restart a process in a test:
+    ComfyProcess.start runs `<python> main.py --port N` in this folder, so the
+    engine it ends up managing is a real child of the app.
+
+    `with_nodes` puts the node pack's marker file on disk without putting its
+    classes in the engine — an install that is complete and an engine that
+    started before it was, which is the state Restart exists for.
+    """
+    install = root / bootstrap.ENGINES[engine]["dir_name"]
+    (install / "models").mkdir(parents=True, exist_ok=True)
+    (install / "main.py").write_text(
+        "import argparse, os, pathlib, runpy, sys\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('--listen'); p.add_argument('--port')\n"
+        "p.add_argument('--disable-auto-launch', action='store_true')\n"
+        "a = p.parse_args()\n"
+        "os.environ['MOCK_COMFY_PORT'] = a.port\n"
+        "print('Starting server', flush=True)\n"
+        "here = pathlib.Path(__file__).parent\n"
+        "sys.argv = ['mock_comfy.py', str(here / 'mockroot')]\n"
+        f"runpy.run_path({str(MOCK_COMFY)!r}, run_name='__main__')\n")
+    if with_nodes:
+        eng = bootstrap.ENGINES[engine]
+        pack = install / "custom_nodes" / eng["node_dir"]
+        pack.mkdir(parents=True, exist_ok=True)
+        (pack / eng["node_marker"]).write_text("# pretend node pack\n")
+    return install
+
+
+def drop_weights(cfg: dict, engine: str) -> None:
+    """Every model this config asks of that engine, on disk and whole."""
+    models = bootstrap.engine_models_dir(cfg, engine)
+    for m in bootstrap.wanted_models(cfg, engine):
+        folder = bootstrap.model_dir(models, m["repo"], engine)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "config.json").write_text("{}")
+        (folder / "model.safetensors").write_bytes(b"\x00" * 16)
+
+
+class EngineFixture(unittest.TestCase):
+    """Shared setup: a throwaway config, and nothing left running after."""
+
+    engine = "qwen"
+
+    def setUp(self):
+        self.saved = copy.deepcopy(server.cfg)
+        self.root = Path(tempfile.mkdtemp(prefix="sb-engine-"))
+        self.strays: list[subprocess.Popen] = []
+        server.cfg["setup_complete"] = True
+
+    def tearDown(self):
+        for proc in server.PROCS.values():
+            proc.stop()
+            proc.lines.clear()
+        for p in self.strays:
+            try:
+                p.kill()
+                p.wait(timeout=5)
+            except Exception:
+                pass
+        server.cfg.clear()
+        server.cfg.update(self.saved)
+        for client in server.CLIENTS.values():
+            client._schema = None
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def stray(self, proc: subprocess.Popen) -> subprocess.Popen:
+        self.strays.append(proc)
+        return proc
+
+    def slot(self, **kw) -> dict:
+        slot = bootstrap.engine_cfg(server.cfg, self.engine)
+        slot.update(kw)
+        return slot
+
+    def finish_task(self, view: dict, timeout: float = 60) -> str:
+        import time as _t
+        deadline = _t.time() + timeout
+        task = manager.TASKS.get(view["id"])
+        while _t.time() < deadline and task and task.state == "running":
+            _t.sleep(0.25)
+        return task.state if task else "gone"
+
+
+class TheEngineConsole(EngineFixture):
+    """The engine's own output, and what the app did to it, in one window.
+
+    "Check the ComfyUI console" is not an instruction anyone running from a
+    launcher can follow — there is no console. This endpoint is the console,
+    and note() is how the app's own half of the story gets into it.
+    """
+
+    def test_the_tail_reports_shape_and_state(self):
+        self.slot(comfy_url=f"http://127.0.0.1:{free_port()}")
+        with server.app.test_client() as web:
+            body = web.get("/api/comfy/log?engine=qwen").get_json()
+        self.assertEqual(body["engine"], "qwen")
+        self.assertEqual(body["lines"], [])
+        self.assertFalse(body["running"])
+        self.assertFalse(body["online"])
+
+    def test_what_the_app_did_to_the_engine_is_in_it(self):
+        server.PROCS["qwen"].note("Stopping pid 1234 — stopped")
+        with server.app.test_client() as web:
+            lines = web.get("/api/comfy/log?engine=qwen").get_json()["lines"]
+        self.assertIn("[Script Builder] Stopping pid 1234 — stopped", lines)
+
+    def test_the_count_is_clamped_and_never_a_500(self):
+        for i in range(500):
+            server.PROCS["qwen"].note(f"line {i}")
+        with server.app.test_client() as web:
+            self.assertEqual(
+                len(web.get("/api/comfy/log?n=9999").get_json()["lines"]), 400)
+            self.assertEqual(
+                len(web.get("/api/comfy/log?n=0").get_json()["lines"]), 1)
+            # A value typed into a URL is not a reason for a stack trace.
+            junk = web.get("/api/comfy/log?n=lots")
+            self.assertEqual(junk.status_code, 200)
+            self.assertEqual(len(junk.get_json()["lines"]), 80)
+
+    def test_an_engine_that_does_not_exist_is_a_sentence(self):
+        with server.app.test_client() as web:
+            r = web.get("/api/comfy/log?engine=nope")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("nope", r.get_json()["error"])
+
+
+class RestartTakesTheFourRoutes(EngineFixture):
+    """Start said "already running", Restart said "not started by this app",
+    and the only advice left was to hunt a windowless python in Task Manager.
+
+    Each route now says which one it took, because "Restarting ComfyUI" over a
+    takeover hides the part that matters — something else was on that port and
+    has just been closed.
+    """
+
+    def test_nothing_running_is_a_plain_start(self):
+        port = free_port()
+        install = fake_install(self.root)
+        self.slot(comfy_url=f"http://127.0.0.1:{port}",
+                  comfy_dir=str(install), python=sys.executable)
+        with server.app.test_client() as web:
+            body = web.post("/api/comfy/restart?engine=qwen").get_json()
+        self.assertEqual(body["how"], "started")
+        self.assertEqual(self.finish_task(body["task"]), "done")
+        self.assertTrue(online(f"http://127.0.0.1:{port}"))
+
+    def test_one_we_own_is_stopped_and_started_under_a_new_pid(self):
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        install = fake_install(self.root)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  python=sys.executable)
+        server.PROCS["qwen"].start(sys.executable, install, port,
+                                   server.progress)
+        self.assertTrue(online(url))
+        before = server.PROCS["qwen"].proc.pid
+        with server.app.test_client() as web:
+            body = web.post("/api/comfy/restart?engine=qwen").get_json()
+        self.assertEqual(body["how"], "managed")
+        self.assertEqual(self.finish_task(body["task"]), "done")
+        self.assertNotEqual(server.PROCS["qwen"].proc.pid, before)
+        self.assertTrue(online(url))
+
+    def test_somebody_elses_is_closed_and_replaced(self):
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        orphan = self.stray(spawn_mock(port, self.root / "orphan"))
+        self.assertTrue(online(url))
+        install = fake_install(self.root)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  python=sys.executable)
+        with server.app.test_client() as web:
+            body = web.post("/api/comfy/restart?engine=qwen").get_json()
+        self.assertEqual(body["how"], "takeover")
+        self.assertIsNotNone(orphan.poll(), "the orphan was left running")
+        self.assertEqual(self.finish_task(body["task"]), "done")
+        self.assertTrue(server.PROCS["qwen"].alive())
+        # And the console says what was done to it, not just that it happened.
+        said = "\n".join(server.PROCS["qwen"].tail(200))
+        self.assertIn("was not started here", said)
+        self.assertIn("Stopping pid", said)
+
+    def test_an_engine_with_no_install_is_refused_before_anything_is_killed(self):
+        # Taking a port from someone and having nothing to start in its place
+        # is not a restart, it is a hole — so this one is answered before the
+        # takeover, and the ComfyUI on the port is left alone.
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        theirs = self.stray(spawn_mock(port, self.root / "theirs"))
+        self.assertTrue(online(url))
+        self.slot(comfy_url=url, comfy_dir="", python="", managed=True)
+        with server.app.test_client() as web:
+            r = web.post("/api/comfy/restart?engine=qwen")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("setup", r.get_json()["error"].lower())
+        self.assertIsNone(theirs.poll(), "it closed a ComfyUI it could not replace")
+
+
+class WhenThePortWillNotBeGivenUp(EngineFixture):
+    """A refusal has to name the obstacle it actually hit.
+
+    "It would not close" covers a process owned by an administrator, a
+    supervisor respawning it, and a database that was never ComfyUI — and all
+    three need a different sentence from the person reading it.
+    """
+
+    def test_something_supervising_it_is_diagnosed_not_shrugged_at(self):
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        supervisor = self.root / "supervisor.py"
+        # ComfyUI Desktop and every launcher script behave exactly like this:
+        # kill the engine and a second one is up before the port stops
+        # answering. Quiet is only free once it stays quiet.
+        supervisor.write_text(
+            "import os, subprocess, sys, time\n"
+            "while True:\n"
+            f"    p = subprocess.Popen([sys.executable, {str(MOCK_COMFY)!r},\n"
+            f"                          {str(self.root / 'sup')!r}],\n"
+            "                         env=dict(os.environ,\n"
+            f"                                  MOCK_COMFY_PORT='{port}'),\n"
+            "                         stdout=subprocess.DEVNULL,\n"
+            "                         stderr=subprocess.DEVNULL)\n"
+            "    p.wait()\n"
+            "    time.sleep(0.2)\n")
+        self.stray(subprocess.Popen(
+            [sys.executable, str(supervisor)], start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        self.assertTrue(online(url, 30))
+        install = fake_install(self.root)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  python=sys.executable)
+        with server.app.test_client() as web:
+            r = web.post("/api/comfy/restart?engine=qwen")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("supervising", r.get_json()["error"])
+
+    def test_a_process_that_is_not_comfyui_is_named_and_left_alone(self):
+        # The port is this engine's only by convention. Another app's dev
+        # server on it answers every health check exactly like a ComfyUI, and
+        # closing it would be this app doing real damage on a guess.
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        # Launched through a link whose name says nothing about python, so the
+        # command line is the one the guard has to read in the wild.
+        pretender = self.root / "acme-ledger-daemon"
+        os.symlink(sys.executable, pretender)
+        squatter = self.stray(subprocess.Popen(
+            [str(pretender), "-c",
+             "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+             "class H(BaseHTTPRequestHandler):\n"
+             "    def do_GET(self):\n"
+             "        self.send_response(200)\n"
+             "        self.send_header('Content-Type', 'application/json')\n"
+             "        self.end_headers()\n"
+             "        self.wfile.write(b'{\"system\": {}}')\n"
+             "    def log_message(self, *a): pass\n"
+             f"HTTPServer(('127.0.0.1', {port}), H).serve_forever()\n"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        self.assertTrue(online(url))
+        install = fake_install(self.root)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  python=sys.executable)
+        with server.app.test_client() as web:
+            r = web.post("/api/comfy/restart?engine=qwen")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("acme-ledger-daemon", r.get_json()["error"])
+        self.assertIsNone(squatter.poll(), "it killed something it should not")
+
+    def test_kill_pid_reports_what_the_system_said(self):
+        # A refusal that is guessed at reads the same as a process that was
+        # never there, and those need different sentences.
+        victim = self.stray(subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(600)"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        self.assertIn("time.sleep", bootstrap.pid_cmdline(victim.pid))
+        # Reaped on another thread: a killed child nobody waits on stays in
+        # the process table as a zombie, kill(pid, 0) keeps succeeding on it,
+        # and a polite stop then reads as one that had to be forced. Nothing
+        # the app closes is a child of its own, so that is a shape of this
+        # test rather than of the function.
+        threading.Thread(target=victim.wait, daemon=True).start()
+        self.assertEqual(bootstrap.kill_pid(victim.pid), "stopped")
+        self.assertEqual(bootstrap.kill_pid(victim.pid), "already gone")
+
+
+class WeightsTheEngineCannotReach(EngineFixture):
+    """Script Builder's version of the stale-model-scan warning.
+
+    Both node packs resolve their checkpoints per call, so weights that land
+    behind a running engine are found without a restart — that half does not
+    apply here. The half that does is rule 17: ComfyUI reads custom_nodes
+    once, at startup, so an engine started before the pack landed is a
+    complete install with no classes in it. Every folder present, every
+    download finished, and nothing that can speak.
+    """
+
+    def _status(self) -> dict:
+        with server.app.test_client() as web:
+            return web.get("/api/status?engine=qwen").get_json()
+
+    def test_a_complete_install_the_engine_cannot_use_is_named(self):
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        install = fake_install(self.root, with_nodes=True)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  models_dir=str(install / "models"), python=sys.executable)
+        drop_weights(server.cfg, "qwen")
+        self.stray(spawn_mock(port, self.root / "orphan"))
+        self.assertTrue(online(url))
+        requests.post(f"{url}/mock/hide/qwen", timeout=5)
+        server.for_engine("qwen").schema(force=True)
+
+        st = self._status()
+        self.assertTrue(st["comfy_online"])
+        self.assertEqual(st["missing_models"], [])
+        self.assertTrue(st["stale_models"])
+        self.assertIn("started before", st["stale_reason"])
+
+        # And it stops being stale the moment the classes are there — the
+        # flag is about this engine, not about the download.
+        requests.post(f"{url}/mock/hide/none", timeout=5)
+        server.for_engine("qwen").schema(force=True)
+        st = self._status()
+        self.assertFalse(st["stale_models"])
+        self.assertEqual(st["stale_reason"], "")
+
+    def test_models_still_arriving_are_not_called_stale(self):
+        # Nothing is on disk yet, so "the weights are here and unreachable" is
+        # simply untrue — and a warning that fires during a first download is
+        # one nobody reads the second time.
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        install = fake_install(self.root, with_nodes=True)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  models_dir=str(install / "models"), python=sys.executable)
+        self.stray(spawn_mock(port, self.root / "orphan"))
+        self.assertTrue(online(url))
+        requests.post(f"{url}/mock/hide/qwen", timeout=5)
+        server.for_engine("qwen").schema(force=True)
+        st = self._status()
+        self.assertTrue(st["missing_models"])
+        self.assertFalse(st["stale_models"])
+
+    def test_moss_is_judged_on_the_one_list_that_names_checkpoints(self):
+        # MossTTSModelLoader.model_variant is the only enum either pack
+        # publishes that names models. Qwen's name sizes and speakers, which
+        # is why it declares no marker at all.
+        self.assertEqual(bootstrap.ENGINES["moss"]["model_marker"], "moss")
+        self.assertEqual(bootstrap.ENGINES["qwen"]["model_marker"], "")
+        loaded = client_for({
+            "MossTTSModelLoader": {"input": {"required": {
+                "model_variant": [["MOSS-TTS (Local 1.7B)"], {}]}}},
+            "MossTTSGenerate": {"input": {"required": {}}}})
+        self.assertEqual(loaded.model_list("moss"), ["MOSS-TTS (Local 1.7B)"])
+        self.assertEqual(loaded.model_list("qwen"), [])
+
+
+class WhichComfyUIIsAnswering(EngineFixture):
+    """8188 is the port every ComfyUI picks, so the one holding it is often
+    somebody else's — and status has to say so in a flag the console can read,
+    not only in a sentence buried in the dependency report."""
+
+    def test_a_different_install_on_the_address_is_a_mismatch(self):
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        self.stray(spawn_mock(port, self.root / "theirs"))
+        self.assertTrue(online(url))
+        requests.post(f"{url}/mock/argv", json={"root": "/somebody/elses/ComfyUI"},
+                timeout=5)
+        self.slot(comfy_url=url, comfy_dir="/opt/mine/ComfyUI")
+        with server.app.test_client() as web:
+            st = web.get("/api/status?engine=qwen").get_json()
+        self.assertTrue(st["engine_mismatch"])
+        self.assertIn("somebody/elses", st["engine_argv"])
+        self.assertFalse(st["engine_managed"])
+
+        requests.post(f"{url}/mock/argv", json={"root": "/opt/mine/ComfyUI"},
+                timeout=5)
+        with server.app.test_client() as web:
+            st = web.get("/api/status?engine=qwen").get_json()
+        self.assertFalse(st["engine_mismatch"])
+
+    def test_a_build_that_will_not_say_is_not_accused(self):
+        # Older ComfyUI reports no argv. Crying wolf about the usual case
+        # teaches people to ignore the warning that matters.
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        self.stray(spawn_mock(port, self.root / "quiet"))
+        self.assertTrue(online(url))
+        self.slot(comfy_url=url, comfy_dir="/opt/mine/ComfyUI")
+        with server.app.test_client() as web:
+            st = web.get("/api/status?engine=qwen").get_json()
+        self.assertFalse(st["engine_mismatch"])
+        self.assertEqual(st["engine_argv"], "")
+
+
+class ALaunchEndsWithAWorkingEngine(EngineFixture):
+    """No button pressed. Offline: start it. Healthy: adopt it, and say so — a
+    ComfyUI somebody left running is not a problem to be solved. Useless:
+    replace it, through the same guard Restart uses."""
+
+    def test_a_quiet_port_gets_an_engine_of_our_own(self):
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        install = fake_install(self.root)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  models_dir=str(install / "models"), python=sys.executable)
+        server.ensure_engine_at_boot()
+        self.assertTrue(online(url, 30))
+        self.assertTrue(server.PROCS["qwen"].alive())
+
+    def test_a_healthy_engine_is_adopted_rather_than_killed(self):
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        install = fake_install(self.root, with_nodes=True)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  models_dir=str(install / "models"), python=sys.executable)
+        drop_weights(server.cfg, "qwen")
+        healthy = self.stray(spawn_mock(port, self.root / "healthy"))
+        self.assertTrue(online(url))
+        server.ensure_engine_at_boot()
+        self.assertIsNone(healthy.poll(), "it killed a working engine")
+        self.assertFalse(server.PROCS["qwen"].alive())
+        self.assertIn("Adopting", "\n".join(server.PROCS["qwen"].tail(50)))
+
+    def test_an_engine_that_cannot_reach_the_weights_is_replaced(self):
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        install = fake_install(self.root, with_nodes=True)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  models_dir=str(install / "models"), python=sys.executable)
+        drop_weights(server.cfg, "qwen")
+        orphan = self.stray(spawn_mock(port, self.root / "orphan"))
+        self.assertTrue(online(url))
+        requests.post(f"{url}/mock/hide/qwen", timeout=5)
+
+        server.ensure_engine_at_boot()
+        self.assertIsNotNone(orphan.poll(), "the useless engine was left up")
+        self.assertTrue(server.PROCS["qwen"].alive())
+        said = "\n".join(server.PROCS["qwen"].tail(200))
+        self.assertIn("Replacing it", said)
+        self.assertIn("Stopping pid", said)
+
+    def test_an_engine_somebody_else_runs_is_never_touched(self):
+        # External mode: managed False with no folder of its own. There is
+        # nothing here to put back, so closing it would leave them with
+        # nothing at all.
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        theirs = self.stray(spawn_mock(port, self.root / "theirs"))
+        self.assertTrue(online(url))
+        self.slot(comfy_url=url, comfy_dir="", python="", managed=False)
+        server.ensure_engine_at_boot()
+        self.assertIsNone(theirs.poll())
+        self.assertIn("yours, not this app's",
+                      "\n".join(server.PROCS["qwen"].tail(50)))
+
+    def test_an_engine_set_not_to_start_is_left_alone(self):
+        port = free_port()
+        install = fake_install(self.root)
+        self.slot(comfy_url=f"http://127.0.0.1:{port}",
+                  comfy_dir=str(install), python=sys.executable,
+                  auto_start=False)
+        server.ensure_engine_at_boot()
+        self.assertFalse(server.PROCS["qwen"].alive())
+        self.assertFalse(bootstrap.comfy_online(f"http://127.0.0.1:{port}"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

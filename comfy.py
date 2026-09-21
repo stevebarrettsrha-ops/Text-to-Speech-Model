@@ -75,6 +75,21 @@ OFFLINE = ("ComfyUI stopped answering at {url}. It may have crashed or been "
            "panel.")
 
 
+def root_from_argv(argv) -> str:
+    """The ComfyUI folder an argv list was launched from, or "".
+
+    /system_stats reports the process's own argv, which starts with the
+    main.py it was started from. Empty when it cannot be told: older builds do
+    not report argv at all, and that must never read as "someone else's".
+    """
+    for arg in argv or []:
+        if isinstance(arg, str) and arg.lower().endswith("main.py"):
+            # Both separators appear: a Windows path read on any platform.
+            cut = max(arg.rfind("/"), arg.rfind("\\"))
+            return arg[:cut] if cut > 0 else ""
+    return ""
+
+
 def _reach(fn, url: str):
     """Run a request, and turn a dead engine into a sentence.
 
@@ -153,12 +168,7 @@ class ComfyClient:
             argv = ((r.json() or {}).get("system") or {}).get("argv") or []
         except Exception:  # noqa: BLE001
             return ""
-        for arg in argv:
-            if isinstance(arg, str) and arg.lower().endswith("main.py"):
-                # Both separators appear: a Windows path read on any platform.
-                cut = max(arg.rfind("/"), arg.rfind("\\"))
-                return arg[:cut] if cut > 0 else ""
-        return ""
+        return root_from_argv(argv)
 
     def node_inputs(self, class_type: str) -> dict:
         info = self.schema().get(class_type)
@@ -240,6 +250,19 @@ class ComfyClient:
 
     def moss_variants(self) -> list[str]:
         return self._enum(MOSS_LOADER, "model_variant")
+
+    def model_list(self, engine: str) -> list[str]:
+        """The engine's own account of which checkpoints it can load.
+
+        MOSS names them: MossTTSModelLoader.model_variant is a list of MOSS
+        checkpoint display names, so "moss" being absent from it means the
+        engine answering cannot load a MOSS model at all. Qwen's enums name
+        sizes ("0.6B") and preset speakers ("Ryan") and never a model, which
+        is why ENGINES["qwen"] declares no model_marker and this is empty for
+        it — an empty list with no marker to match is not evidence of
+        anything, and `stale_engine` treats it as none.
+        """
+        return self.moss_variants() if engine == "moss" else []
 
     def moss_variant_for(self, repo: str) -> str:
         """The loader enum entry that means `repo`, read off the node.

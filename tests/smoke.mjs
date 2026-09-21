@@ -404,6 +404,27 @@ try {
   await sleep(2500);
   const deps = (await page.$$('#dep-list .fitem')).length;
   is(deps >= 6, 'the dependency list renders', `${deps} rows`);
+
+  /* ------------------------------------------------------ engine console */
+  // "Check the ComfyUI console" is not an instruction anyone running from a
+  // launcher can follow — there is no console. This panel is the console, and
+  // the line above it names which of the silent states the engine is in.
+  const logShape = await app.api('/api/comfy/log?n=9999&engine=qwen');
+  is(Array.isArray(logShape.lines) && logShape.lines.length <= 400
+       && logShape.online === true && logShape.running === false
+       && logShape.engine === 'qwen',
+     'the engine console endpoint reports the tail, clamped, and the state',
+     JSON.stringify({ lines: logShape.lines.length, online: logShape.online,
+                      running: logShape.running }));
+  // The stand-ins are ComfyUIs this app did not start — exactly the state the
+  // old build called "not started by this app" and then left there.
+  const engineState = (await page.textContent('#engine-state')).trim();
+  is(/started outside Script Builder/.test(engineState),
+     'the console says who started the engine that is answering', engineState);
+  is(await page.$eval('#btnRestartEngine', e => !e.disabled
+       && e.textContent.trim() === 'Restart ComfyUI'),
+     'and Restart ComfyUI sits next to Start');
+
   const depIds = (await app.api('/api/deps')).items.map(i => i.id);
   // Nothing below ComfyUI is shared any more, so nothing below ComfyUI gets
   // one row for both engines.

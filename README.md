@@ -282,6 +282,39 @@ the four recommended folders with a button each, browsing any repo to see its
 files and sizes before downloading, live progress with a Stop button, and
 deleting a folder from disk. Downloads resume where they stopped.
 
+### The engine console, Restart, and starting itself
+
+**Engine console** is the panel under the buttons: the engine's own output,
+live, with a line of app-side narration mixed into it for everything Script
+Builder does *to* that engine — which process was holding the port, what the
+system said when it was asked to stop, what started in its place. There is no
+terminal behind a launcher, so this panel is the ComfyUI console.
+
+The sentence above it names the state, including the two that otherwise look
+like a healthy app that simply does not work:
+
+- *a different ComfyUI is answering this address* — 8188 is the port every
+  ComfyUI picks, so the one holding it is often somebody else's, and its
+  missing nodes cannot be installed away;
+- *everything is on disk and this engine cannot reach it* — ComfyUI reads
+  `custom_nodes` once, at startup, so a node pack installed behind a running
+  engine leaves a complete install with no classes in it.
+
+**Restart ComfyUI** is the cure for both. It stops the engine it started and
+starts it again — and where the one answering is not ours, it takes the
+address over rather than giving up: ComfyUI-Manager's own reboot first, and
+failing that the process holding the port is found, confirmed to look like a
+ComfyUI, and closed, with one of this app's own started in its place. Anything
+that is not a ComfyUI is named and left alone. A refusal says which obstacle
+it hit — access denied, something supervising it, a process it could not
+identify — instead of sending you to hunt a windowless python in Task Manager.
+
+Launching the app does all of this by itself, with no button pressed: it
+starts the engine if the address is quiet, adopts the one already running if
+it is healthy, and replaces it through the same guard if it is not. A ComfyUI
+you run yourself (external mode in Settings) is never touched — the app says
+what is wrong with it and leaves it to you.
+
 ---
 
 ## Troubleshooting

@@ -22,6 +22,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -207,6 +208,13 @@ ENGINES = {
         "subdir": QWEN_SUBDIR,
         "layout": "org",
         "models": MODEL_REPOS,
+        # A substring every entry of a healthy model list carries, for
+        # `stale_engine`. Qwen has none on purpose: its node publishes
+        # model_choice as ["0.6B", "1.7B"] and speaker as preset names, so
+        # nothing it reports names a checkpoint and there is nothing to match.
+        # An engine that cannot see Qwen's weights is caught by its nodes
+        # being absent instead.
+        "model_marker": "",
         "role": "primary",
         "blurb": "Preset speakers, cloning and voice design. Small and fast.",
     },
@@ -221,6 +229,10 @@ ENGINES = {
         "subdir": MOSS_SUBDIR,
         "layout": "flat",
         "models": MOSS_MODEL_REPOS,
+        # MossTTSModelLoader.model_variant is the one enum either node pack
+        # publishes that names checkpoints, and every entry of it is a MOSS
+        # one.
+        "model_marker": "moss",
         "role": "secondary",
         "blurb": "Zero-shot cloning and voice design, no preset speakers.",
     },
@@ -849,6 +861,19 @@ class ComfyProcess:
         self.lines: list[str] = []
         self._lock = threading.Lock()
 
+    def note(self, msg: str) -> None:
+        """An app-side line in the engine console.
+
+        What Script Builder does *to* an engine — stopping it, taking a port
+        off someone else, starting one in its place — belongs next to what the
+        engine itself says, in one window, in order. Split across two places it
+        reads as two unrelated stories.
+        """
+        with self._lock:
+            self.lines.append(f"[Script Builder] {msg}")
+            if len(self.lines) > 2000:
+                del self.lines[:1000]
+
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
@@ -915,13 +940,173 @@ def comfy_online(url: str) -> bool:
         return False
 
 
-def wait_for_comfy(url: str, timeout: int = 900) -> bool:
-    deadline = time.time() + timeout
+def comfy_stats(url: str) -> dict | None:
+    """What is actually answering on the address — argv says which install.
+
+    `ComfyClient.engine_root()` reads the same field and returns the folder;
+    this returns the whole `system` dict, for the callers that want to print
+    the command line itself rather than compare two paths.
+    """
+    try:
+        r = requests.get(f"{url}/system_stats", timeout=3)
+        if r.status_code == 200:
+            return r.json().get("system") or {}
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def wait_for_comfy(url: str, timeout: int = 900, on_wait=None) -> bool:
+    """Poll until ComfyUI answers.
+
+    `on_wait(elapsed, timeout)` runs on each pass. There is no honest
+    percentage for a model load, so how long it has been waiting is the only
+    number a caller can narrate with — and a start with no narration at all is
+    the one that reads as a hang.
+    """
+    started = time.time()
+    deadline = started + timeout
     while time.time() < deadline:
         if comfy_online(url):
             return True
+        if on_wait:
+            on_wait(time.time() - started, timeout)
         time.sleep(2)
     return False
+
+
+# --------------------------------------------------------------------------- #
+# whoever is holding the port
+# --------------------------------------------------------------------------- #
+# "Close it yourself" is not an instruction anyone can follow against a
+# windowless python: it sends them hunting through Task Manager for one of
+# several identical rows. Everything below exists so the app can find that
+# process, say what it is, and close it — or say exactly why it could not.
+def _pids_from_proc_net(port: int) -> list[int]:
+    """Linux, with no external tools: the socket inode from /proc/net/tcp*,
+    then the process whose fd table holds it.
+
+    lsof is the obvious way and is missing from most minimal images, which is
+    where an orphan ComfyUI is likeliest to be the only thing on the port.
+    """
+    inodes = set()
+    for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(name).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 10:
+                continue
+            local, state, inode = parts[1], parts[3], parts[9]
+            # 0A is TCP_LISTEN, and the local port is four uppercase hex
+            # digits — 8188 is "1FFC", never "1ffc" and never "8188".
+            if state == "0A" and local.rsplit(":", 1)[-1] == f"{port:04X}":
+                inodes.add(inode)
+    if not inodes:
+        return []
+    pids = set()
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            for fd in (proc / "fd").iterdir():
+                try:
+                    target = os.readlink(fd)
+                except OSError:
+                    continue
+                if any(f"socket:[{i}]" == target for i in inodes):
+                    pids.add(int(proc.name))
+                    break
+        except OSError:
+            continue        # someone else's process, or one that just exited
+    return sorted(pids)
+
+
+def port_pids(port: int) -> list[int]:
+    """Whoever is listening on the port."""
+    if platform.system() == "Windows":
+        pids = set()
+        try:
+            out = _run(["netstat", "-ano", "-p", "TCP"], timeout=25).stdout
+        except Exception:  # noqa: BLE001
+            return []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0] == "TCP" \
+                    and parts[3] == "LISTENING" \
+                    and parts[1].rsplit(":", 1)[-1] == str(port):
+                try:
+                    pids.add(int(parts[4]))
+                except ValueError:
+                    pass
+        return sorted(pids)
+    found = _pids_from_proc_net(port)
+    if found:
+        return found
+    if shutil.which("lsof"):
+        try:
+            out = _run(["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+                       timeout=25).stdout
+            return sorted({int(t) for t in out.split() if t.strip().isdigit()})
+        except Exception:  # noqa: BLE001
+            pass
+    return []
+
+
+def pid_cmdline(pid: int) -> str:
+    """The command line of a process, or "" when it cannot be read."""
+    try:
+        if platform.system() == "Windows":
+            out = _run(["wmic", "process", "where", f"processid={pid}",
+                        "get", "commandline"], timeout=25).stdout
+            lines = [ln.strip() for ln in out.splitlines()
+                     if ln.strip() and "CommandLine" not in ln]
+            return lines[0] if lines else ""
+        cmd = Path(f"/proc/{pid}/cmdline")
+        if cmd.exists():
+            return cmd.read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", "replace").strip()
+        return _run(["ps", "-p", str(pid), "-o", "command="],
+                    timeout=25).stdout.strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def kill_pid(pid: int) -> str:
+    """Stop a process: politely first, firmly if it lingers.
+
+    Returns what the system said — "stopped", "already gone", "access denied",
+    "sent SIGKILL" — because a refusal has to be *shown*. Guessing produces
+    "it would not close" for a process that was never there and for one owned
+    by an administrator, and those need different sentences.
+    """
+    if platform.system() == "Windows":
+        try:
+            out = _run(["taskkill", "/PID", str(pid), "/T", "/F"], timeout=30)
+            return (out.stdout or out.stderr or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            return str(exc)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "already gone"
+    except PermissionError:
+        return "access denied"
+    for _ in range(25):
+        time.sleep(0.2)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "stopped"
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return "stopped"
+    except PermissionError:
+        return "access denied"
+    return "sent SIGKILL"
 
 
 # --------------------------------------------------------------------------- #
