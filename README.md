@@ -42,7 +42,7 @@ Setup does, in order, what the instructions you were given do by hand:
 1. `git clone https://github.com/flybirdxx/ComfyUI-Qwen-TTS.git` into
    `ComfyUI/custom_nodes/`
 2. `pip install -r ComfyUI/custom_nodes/ComfyUI-Qwen-TTS/requirements.txt`
-3. downloads the Qwen3-TTS weights into `ComfyUI/models/qwen-tts/Qwen/`
+3. downloads the Qwen3-TTS weights into `ComfyUI/models/qwen-tts/`
 
 Step 2 picks the interpreter ComfyUI actually runs on. On a portable install
 that is `python_embeded\python.exe` — the same one your instructions name — and
@@ -61,16 +61,19 @@ Nothing goes into your system Python.
 ### Model folders
 
 **The two engines do not share a folder shape**, and neither shape is a
-preference — each is where that node looks. Qwen nests by organisation,
-`models/qwen-tts/<Org>/<Name>`; MOSS flattens the slash,
-`models/moss-tts/<Org>--<Name>`, because its loader builds that path from
-`repo_id.replace("/", "--")`. Move a MOSS folder into the Qwen tree and the node
-cannot see it — it quietly downloads a second copy.
+preference — each is where that node looks. Qwen drops the organisation,
+`models/qwen-tts/<Name>`, because its node lists `models/qwen-tts` one level
+deep and downloads to `<Name>` (its README draws a `Qwen/` folder the code has
+never looked in); MOSS flattens the slash, `models/moss-tts/<Org>--<Name>`,
+because its loader builds that path from `repo_id.replace("/", "--")`. Put a
+folder anywhere else and that node cannot see it — it quietly downloads a
+second copy, or offline, fails the line. Folders an earlier version of Script
+Builder left in `models/qwen-tts/Qwen/` are moved into place at launch.
 
 #### Qwen3-TTS
 
 All six repos in the [Qwen3-TTS collection](https://huggingface.co/collections/Qwen/qwen3-tts),
-pulled into `ComfyUI/models/qwen-tts/Qwen/`:
+pulled into `ComfyUI/models/qwen-tts/`:
 
 | Folder | Size | What it does |
 |---|---|---|
@@ -252,7 +255,9 @@ sources change, since the two engines do not offer the same ones.
 ### More options
 
 - **Pause between lines** — silence inserted when the lines are joined.
-- **Expressiveness** — sampling temperature. Higher wanders more.
+- **Expressiveness** — sampling temperature. Higher wanders more. On MOSS it
+  scales each model's own tuned temperature, so the resting value of 0.90 runs
+  every MOSS checkpoint exactly as OpenMOSS tuned it.
 - **Attention** — leave on `auto`. Installing `sageattention` or `flash_attn`
   makes generation two to three times faster.
 - **Free GPU memory after each run** — for cards under 8 GB. Slower, because the

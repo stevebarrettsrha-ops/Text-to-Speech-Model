@@ -150,8 +150,10 @@ class ModelDeletes(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.models = self.root / "models"
-        (self.models / "qwen-tts" / "Qwen" / "Real").mkdir(parents=True)
-        (self.models / "qwen-tts" / "Qwen" / "Real" / "w.safetensors").write_text("x")
+        (self.models / "qwen-tts" / "Real").mkdir(parents=True)
+        (self.models / "qwen-tts" / "Real" / "w.safetensors").write_text("x")
+        (self.models / "qwen-tts" / "voices").mkdir()
+        (self.models / "qwen-tts" / "voices" / "mine.wav").write_text("x")
         (self.models / "checkpoints").mkdir(parents=True)
         self.precious = self.models / "checkpoints" / "keep.safetensors"
         self.precious.write_text("do not delete")
@@ -177,7 +179,7 @@ class ModelDeletes(unittest.TestCase):
         self.assertTrue((self.outside / "f.txt").exists())
 
     def test_a_symlink_out_of_the_tree_is_refused(self):
-        link = self.models / "qwen-tts" / "Qwen" / "Escape"
+        link = self.models / "qwen-tts" / "Escape"
         link.symlink_to(self.outside, target_is_directory=True)
         with self.assertRaises(Exception):
             manager.delete_model(self.cfg, "Qwen/Escape")
@@ -185,8 +187,20 @@ class ModelDeletes(unittest.TestCase):
 
     def test_a_real_delete_still_works(self):
         manager.delete_model(self.cfg, "Qwen/Real")
-        self.assertFalse((self.models / "qwen-tts" / "Qwen" / "Real").exists())
+        self.assertFalse((self.models / "qwen-tts" / "Real").exists())
         self.assertTrue(self.precious.exists())
+
+    def test_the_root_and_the_nodes_saved_voices_are_not_models(self):
+        # With no org folder in between, "Qwen/" names models/qwen-tts itself
+        # and "Qwen/voices" the node's saved voices. Neither is a model, and
+        # a delete of either would take every model or every voice with it.
+        for repo in ("Qwen/", "Qwen/voices", "Anyone/voices"):
+            with self.subTest(repo=repo):
+                with self.assertRaises(Exception):
+                    manager.delete_model(self.cfg, repo)
+        self.assertTrue((self.models / "qwen-tts" / "voices" / "mine.wav")
+                        .exists())
+        self.assertTrue((self.models / "qwen-tts" / "Real").exists())
 
 
 class ModelInstalled(unittest.TestCase):
@@ -553,6 +567,36 @@ class GraphBuilding(unittest.TestCase):
         self.assertEqual(g["1"]["class_type"], "LoadAudio")
         self.assertEqual(g["2"]["inputs"]["ref_audio"], ["1", 0])
         self.assertEqual(g["2"]["inputs"]["target_text"], "hi")
+
+    CLONE_SCHEMA = {"VoiceCloneNode": {"input": {
+        "required": {"target_text": ["STRING", {"default": ""}],
+                     "model_choice": [["0.6B", "1.7B"], {"default": "0.6B"}]},
+        "optional": {"ref_audio": ["AUDIO"],
+                     "ref_text": ["STRING", {"default": ""}],
+                     "x_vector_only": ["BOOLEAN", {"default": False}]}}},
+        "LoadAudio": {"input": {"required": {
+            "audio": [["ref.wav"], {"audio_upload": True}]}}}, **SAVE}
+
+    def test_a_clone_with_no_transcript_clones_from_the_sound_alone(self):
+        # The node's default mode refuses a line outright without the words
+        # spoken in the clip — "ref_text is required when
+        # x_vector_only_mode=False" — and the page never said the box was
+        # required, so every clone left blank failed.
+        for blank in ("", "   ", None):
+            with self.subTest(ref_text=blank):
+                ins = client_for(self.CLONE_SCHEMA).build_line(
+                    {"text": "hi"},
+                    {"kind": "clone", "ref_audio": "ref.wav",
+                     "ref_text": blank}, OPTS)["prompt"]["2"]["inputs"]
+                self.assertIs(ins["x_vector_only"], True)
+
+    def test_a_clone_with_a_transcript_keeps_the_closer_copy(self):
+        ins = client_for(self.CLONE_SCHEMA).build_line(
+            {"text": "hi"},
+            {"kind": "clone", "ref_audio": "ref.wav", "ref_text": " spoken "},
+            OPTS)["prompt"]["2"]["inputs"]
+        self.assertIs(ins["x_vector_only"], False)
+        self.assertEqual(ins["ref_text"], "spoken")
 
     def test_a_clone_with_no_reference_audio_says_so(self):
         schema = {"VoiceCloneNode": {"input": {"required": {
@@ -1264,15 +1308,22 @@ MOSS_SCHEMA = {
                      "language": [["auto", "zh", "en"], {"default": "auto"}],
                      "text": ["STRING", {"default": ""}],
                      "seed": ["INT", {"default": 0}],
+                     # The Delay 8B's numbers, whatever the loader holds.
                      "temperature": ["FLOAT", {"default": 1.7}],
-                     "top_p": ["FLOAT", {"default": 0.8}]},
+                     "top_p": ["FLOAT", {"default": 0.8}],
+                     "top_k": ["INT", {"default": 25}],
+                     "repetition_penalty": ["FLOAT", {"default": 1.0}]},
         "optional": {"reference_audio": ["AUDIO"]}}},
     "MossTTSVoiceDesign": {"input": {"required": {
         "moss_pipe": ["MOSS_TTS_PIPE"],
         "language": [["auto", "zh", "en"], {"default": "auto"}],
         "text": ["STRING", {"default": ""}],
         "instruction": ["STRING", {"default": ""}],
-        "seed": ["INT", {"default": 0}]}}},
+        "seed": ["INT", {"default": 0}],
+        "temperature": ["FLOAT", {"default": 1.5}],
+        "top_p": ["FLOAT", {"default": 0.6}],
+        "top_k": ["INT", {"default": 50}],
+        "repetition_penalty": ["FLOAT", {"default": 1.1}]}}},
     "LoadAudio": {"input": {"required": {"audio": [["ref.wav"], {}]}}},
     **SAVE,
 }
@@ -1282,8 +1333,8 @@ MOSS_DIRS = {
     "OpenMOSS-Team/MOSS-Audio-Tokenizer": "/m/moss-tts/Codec",
     "OpenMOSS-Team/MOSS-VoiceGenerator": "/m/moss-tts/VG",
 }
-MOSS_OPTS = {"engine": "moss", "moss_dirs": MOSS_DIRS, "temperature": 1.0,
-             "top_p": 0.9, "prefer_wav": True}
+MOSS_OPTS = {"engine": "moss", "moss_dirs": MOSS_DIRS, "temperature": 0.9,
+             "prefer_wav": True}
 
 
 class ModelFolderLayout(unittest.TestCase):
@@ -1292,10 +1343,13 @@ class ModelFolderLayout(unittest.TestCase):
 
     ROOT = Path("/models")
 
-    def test_qwen_nests_by_org(self):
+    def test_qwen_drops_the_org(self):
+        # The node's README draws models/qwen-tts/Qwen/<Name>; its code lists
+        # models/qwen-tts one level deep and downloads to <Name>. Following
+        # the README put every folder where the node never looked.
         self.assertEqual(
             bootstrap.model_dir(self.ROOT, "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
-            self.ROOT / "qwen-tts" / "Qwen" / "Qwen3-TTS-12Hz-0.6B-Base")
+            self.ROOT / "qwen-tts" / "Qwen3-TTS-12Hz-0.6B-Base")
 
     def test_moss_flattens_the_slash(self):
         # The MOSS loader builds its cache path as repo_id.replace("/", "--").
@@ -1328,6 +1382,173 @@ class ModelFolderLayout(unittest.TestCase):
             self.assertTrue(bootstrap.node_installed(root, "moss"))
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+
+def qwen_node_finds(models_dir: Path, model_type: str, choice: str):
+    """Where ComfyUI-Qwen-TTS loads a model from, or None where it would go
+    to HuggingFace for a second copy — transcribed from its nodes.py.
+
+    load_qwen_model lists models/qwen-tts one level deep for a folder whose
+    name holds both the size and the kind; failing that,
+    download_model_if_needed looks at <qwen_root>/<repo.split("/")[-1]> and
+    downloads there when it is absent.
+    """
+    hf = {("Base", "0.6B"): "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+          ("Base", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+          ("VoiceDesign", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+          ("CustomVoice", "0.6B"): "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+          ("CustomVoice", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"}
+    base = models_dir / "qwen-tts"
+    for d in os.listdir(base):
+        cand = base / d
+        if cand.is_dir() and choice in d and model_type.lower() in d.lower():
+            return cand
+    target = base / hf[(model_type, choice)].split("/")[-1]
+    return target if target.is_dir() else None
+
+
+class TheQwenNodeFindsWhatWeDownload(unittest.TestCase):
+    """Every folder setup fetches has to be the one the node loads. The app
+    followed the node's README, which draws models/qwen-tts/Qwen/<Name>; the
+    node's code has only ever looked one level down. Nothing failed that the
+    app could see — the node quietly fetched every model a second time on the
+    first take, and offline the take failed."""
+
+    def setUp(self):
+        self.models = Path(tempfile.mkdtemp(prefix="sb-qwen-"))
+        self.addCleanup(shutil.rmtree, self.models, ignore_errors=True)
+        for m in bootstrap.MODEL_REPOS:
+            d = bootstrap.model_dir(self.models, m["repo"], "qwen")
+            d.mkdir(parents=True)
+            (d / "model.safetensors").write_text("w")
+        (self.models / "qwen-tts" / "voices").mkdir()
+
+    def test_every_model_a_line_can_ask_for_is_found_on_disk(self):
+        for m in bootstrap.MODEL_REPOS:
+            name = m["repo"].split("/")[-1]
+            if "Tokenizer" in name:
+                continue
+            kind = next(k for k in ("CustomVoice", "VoiceDesign", "Base")
+                        if k in name)
+            size = "0.6B" if "0.6B" in name else "1.7B"
+            with self.subTest(repo=m["repo"]):
+                self.assertEqual(
+                    qwen_node_finds(self.models, kind, size),
+                    bootstrap.model_dir(self.models, m["repo"], "qwen"))
+
+    def test_the_tokenizer_is_where_the_node_checks_for_it(self):
+        # check_and_download_tokenizer runs before every first load and
+        # downloads to <qwen_root>/Qwen3-TTS-Tokenizer-12Hz when that is absent.
+        self.assertEqual(
+            bootstrap.model_dir(self.models, "Qwen/Qwen3-TTS-Tokenizer-12Hz"),
+            self.models / "qwen-tts" / "Qwen3-TTS-Tokenizer-12Hz")
+
+    def test_the_old_shape_is_invisible_to_the_node(self):
+        # Proof the transcription is honest: the folders this app used to
+        # write are not found, which is the fault being fixed.
+        old = Path(tempfile.mkdtemp(prefix="sb-qwen-old-"))
+        self.addCleanup(shutil.rmtree, old, ignore_errors=True)
+        d = old / "qwen-tts" / "Qwen" / "Qwen3-TTS-12Hz-0.6B-CustomVoice"
+        d.mkdir(parents=True)
+        (d / "model.safetensors").write_text("w")
+        self.assertIsNone(qwen_node_finds(old, "CustomVoice", "0.6B"))
+
+    def test_the_models_page_lists_them_under_their_own_repo_ids(self):
+        cfg = dict(bootstrap.DEFAULT_CONFIG, want_moss=False)
+        cfg["engines"] = {eid: dict(bootstrap.engine_defaults(eid),
+                                    models_dir=str(self.models))
+                          for eid in bootstrap.ENGINES}
+        rows = {r["repo"] for r in manager.local_models(cfg)
+                if r["engine"] == "qwen"}
+        # voices/ is the node's saved voices, not a model.
+        self.assertEqual(rows, {m["repo"] for m in bootstrap.MODEL_REPOS})
+
+
+class OldQwenFoldersMoveIntoPlace(unittest.TestCase):
+    """Folders an earlier version left in models/qwen-tts/Qwen/<Name> are
+    moved to where the node looks, rather than downloaded a third time."""
+
+    NAME = "Qwen3-TTS-12Hz-0.6B-CustomVoice"
+
+    def setUp(self):
+        self.models = Path(tempfile.mkdtemp(prefix="sb-migrate-"))
+        self.addCleanup(shutil.rmtree, self.models, ignore_errors=True)
+        self.root = self.models / "qwen-tts"
+        self.old = self.root / "Qwen" / self.NAME
+        self.new = self.root / self.NAME
+        self.said = []
+
+    def _whole(self, d, tag):
+        (d / "speech_tokenizer").mkdir(parents=True)
+        (d / "config.json").write_text("{}")
+        (d / "model.safetensors").write_text(tag)
+        (d / "speech_tokenizer" / "model.safetensors").write_text(tag)
+
+    def _half(self, d):
+        # What huggingface_hub leaves when the node's own download is cut
+        # off: config first, weights still arriving under .cache.
+        (d / ".cache" / "huggingface" / "download").mkdir(parents=True)
+        (d / "config.json").write_text("{}")
+        (d / ".cache" / "huggingface" / "download"
+         / "model.safetensors.incomplete").write_text("half")
+
+    def _migrate(self):
+        return bootstrap.migrate_qwen_layout(self.models, self.said.append)
+
+    def test_a_folder_in_the_old_shape_is_moved(self):
+        self._whole(self.old, "ours")
+        self.assertEqual(self._migrate(), 1)
+        self.assertEqual((self.new / "model.safetensors").read_text(), "ours")
+        self.assertFalse((self.root / "Qwen").exists())
+        self.assertTrue(bootstrap.model_installed(
+            self.models, "Qwen/" + self.NAME))
+        self.assertTrue(self.said)
+
+    def test_a_second_copy_behind_a_whole_one_is_removed(self):
+        # The node already fetched its own; ours is gigabytes nobody can
+        # reach, and the Models page no longer lists it to delete.
+        self._whole(self.old, "ours")
+        self._whole(self.new, "node's")
+        self._migrate()
+        self.assertFalse(self.old.exists())
+        self.assertEqual((self.new / "model.safetensors").read_text(),
+                         "node's")
+
+    def test_an_unfinished_node_download_is_replaced_by_a_whole_copy(self):
+        # The node loads from any folder that exists, whole or not — so a
+        # download it was cut off in the middle of fails every line after.
+        self._whole(self.old, "ours")
+        self._half(self.new)
+        self.assertFalse(bootstrap.model_installed(
+            self.models, "Qwen/" + self.NAME))
+        self._migrate()
+        self.assertEqual((self.new / "model.safetensors").read_text(), "ours")
+        self.assertFalse((self.new / ".cache").exists())
+        self.assertTrue(bootstrap.model_installed(
+            self.models, "Qwen/" + self.NAME))
+
+    def test_two_unfinished_copies_are_both_left_for_a_download(self):
+        (self.old).mkdir(parents=True)
+        (self.old / "model.safetensors.part").write_text("half")
+        self._half(self.new)
+        self.assertEqual(self._migrate(), 0)
+        self.assertTrue(self.old.exists())
+        self.assertTrue(self.new.exists())
+
+    def test_nothing_but_our_own_org_folders_is_touched(self):
+        self._whole(self.root / "voices" / "x", "voice")
+        self._whole(self.root / "SomeoneElse" / "Model", "theirs")
+        self._migrate()
+        self.assertTrue((self.root / "voices" / "x").exists())
+        self.assertTrue((self.root / "SomeoneElse" / "Model").exists())
+
+    def test_it_runs_on_a_missing_or_unset_folder(self):
+        self.assertEqual(bootstrap.migrate_qwen_layout(None), 0)
+        self.assertEqual(bootstrap.migrate_qwen_layout(
+            self.models / "nowhere"), 0)
+        self._whole(self.old, "ours")
+        self._migrate()
+        self.assertEqual(self._migrate(), 0)  # a second run changes nothing
 
 
 class WhichModelsAreWanted(unittest.TestCase):
@@ -1474,6 +1695,51 @@ class MossGraphs(unittest.TestCase):
         with self.assertRaises(comfy.ComfyError) as caught:
             c.build_line({"text": "Hi."}, {"kind": "preset"}, MOSS_OPTS)
         self.assertIn("MOSS-TTS", str(caught.exception))
+
+    def _sampling(self, voice, **opts):
+        ins = self.c.build_line({"text": "Hi."}, voice,
+                                dict(MOSS_OPTS, **opts))["prompt"]["4"]["inputs"]
+        return {k: ins[k] for k in ("temperature", "top_p", "top_k",
+                                    "repetition_penalty")}
+
+    def test_each_checkpoint_samples_the_way_openmoss_tuned_it(self):
+        # MossTTSGenerate's defaults are the Delay 8B's whatever the loader
+        # holds. Left to them, the Local 1.7B — the default model — ran with
+        # no repetition penalty and half its top_k.
+        self.assertEqual(self._sampling({"kind": "preset"}), {
+            "temperature": 1.0, "top_p": 0.95, "top_k": 50,
+            "repetition_penalty": 1.1})
+        self.assertEqual(
+            self._sampling({"kind": "preset"},
+                           moss_model="OpenMOSS-Team/MOSS-TTS"),
+            {"temperature": 1.7, "top_p": 0.8, "top_k": 25,
+             "repetition_penalty": 1.0})
+
+    def test_a_designed_voice_samples_as_voicegenerator_whatever_is_picked(self):
+        self.assertEqual(
+            self._sampling({"kind": "design", "instruct": "A low narrator"},
+                           moss_model="OpenMOSS-Team/MOSS-TTS"),
+            {"temperature": 1.5, "top_p": 0.6, "top_k": 50,
+             "repetition_penalty": 1.1})
+
+    def test_expressiveness_scales_the_models_temperature(self):
+        # The slider rests at 0.9, Qwen's own temperature. Passed through as
+        # it was, it cooled the 8B from 1.7 and VoiceGenerator from 1.5.
+        hot = self._sampling({"kind": "preset"}, temperature=1.8)
+        self.assertAlmostEqual(hot["temperature"], 2.0)
+        cool = self._sampling({"kind": "design", "instruct": "x"},
+                              temperature=0.45)
+        self.assertAlmostEqual(cool["temperature"], 0.75)
+        # Only the temperature moves; the rest is the checkpoint's own.
+        self.assertEqual(hot["top_k"], 50)
+        self.assertEqual(hot["repetition_penalty"], 1.1)
+
+    def test_the_tuning_table_names_every_model_a_line_can_load(self):
+        for m in bootstrap.MOSS_MODEL_REPOS:
+            if "Tokenizer" in m["repo"]:
+                continue
+            with self.subTest(repo=m["repo"]):
+                self.assertIn(m["repo"], comfy.MOSS_SAMPLING)
 
     def test_moss_reports_no_preset_speakers_rather_than_an_empty_list(self):
         caps = self.c.capabilities("moss")
@@ -2534,6 +2800,30 @@ class ProductionLaunch(unittest.TestCase):
                 time.sleep(0.1)
             self.assertIsNotNone(clone_job, "clone job disappeared")
             self.assertEqual(clone_job["status"], "done", clone_job)
+
+            # The page calls the transcript optional, and the node refuses a
+            # clone without one unless it is told to copy the sound alone.
+            bare = requests.post(f"{app_url}/api/speak", json={
+                "mode": "single", "title": "Clone with no transcript",
+                "lines": [{"speaker": 1, "text": "Nobody typed the words."}],
+                "speakers": {"1": {"name": "Clone", "kind": "clone",
+                                    "ref_audio": upload.json()["name"],
+                                    "ref_text": ""}},
+                "model": "0.6B", "attention": "auto",
+            }, timeout=5)
+            self.assertEqual(bare.status_code, 200, bare.text)
+            bare_id = bare.json()["job"]
+            deadline = time.time() + 30
+            bare_job = None
+            while time.time() < deadline:
+                jobs = requests.get(f"{app_url}/api/jobs", timeout=5).json()
+                bare_job = next((item for item in jobs
+                                 if item["id"] == bare_id), None)
+                if bare_job and bare_job["status"] != "running":
+                    break
+                time.sleep(0.1)
+            self.assertIsNotNone(bare_job, "clone job disappeared")
+            self.assertEqual(bare_job["status"], "done", bare_job)
 
             # Launch always returns to the primary engine, rather than
             # silently restoring the secondary engine from the last session.

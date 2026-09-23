@@ -1419,6 +1419,11 @@ def main() -> None:
     swept = sweep_orphan_takes()
     if swept:
         progress.log(f"Cleared {swept} unfinished take folder(s).")
+    # Before the engine starts, so its first line finds the folders where it
+    # looks rather than downloading them a second time.
+    bootstrap.migrate_qwen_layout(
+        bootstrap.engine_models_dir(cfg, "qwen"),
+        lambda msg: _note("qwen", msg))
     # Every launch opens on the primary engine, whichever one the last session
     # ended on. MOSS is a deliberate switch made on the Create page, and it
     # lasts that session: an app that quietly came back up holding the

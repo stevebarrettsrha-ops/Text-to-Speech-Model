@@ -90,14 +90,22 @@ OBJECT_INFO = {
         dict(GEN, instruct=["STRING", {"multiline": True, "default": ""}],
              custom_model_path=["STRING", {"default": ""}],
              custom_speaker_name=["STRING", {"default": ""}])),
+    # ref_audio and ref_text are optional upstream, beside a reusable
+    # voice_clone_prompt — and an empty ref_text with x_vector_only off is
+    # refused at generation time, which run_prompt reproduces below.
     "VoiceCloneNode": _node(
-        {"ref_audio": ["AUDIO"], "ref_text": ["STRING", {"default": ""}],
-         "target_text": ["STRING", {"multiline": True, "default": ""}],
+        {"target_text": ["STRING", {"multiline": True, "default": ""}],
          "model_choice": [["0.6B", "1.7B"], {"default": "0.6B"}],
          "device": [["auto", "cuda", "xpu", "mps", "cpu"], {"default": "auto"}],
          "precision": [["bf16", "fp32"], {"default": "bf16"}],
          "language": [LANG, {"default": "Auto"}]},
-        dict(GEN)),
+        dict({"ref_audio": ["AUDIO"],
+              "ref_text": ["STRING", {"multiline": True, "default": ""}],
+              "voice_clone_prompt": ["VOICE_CLONE_PROMPT"]},
+             **GEN,
+             x_vector_only=["BOOLEAN", {"default": False}],
+             instruct=["STRING", {"multiline": True, "default": ""}],
+             custom_model_path=["STRING", {"default": ""}])),
     "VoiceDesignNode": _node(
         {"text": ["STRING", {"multiline": True, "default": "Hello world"}],
          "instruct": ["STRING", {"multiline": True, "default": ""}],
@@ -359,12 +367,41 @@ def prompt():
             # and whether it was pointed at a local folder or left to fetch.
             local = "local" if ins.get("local_model_path") else "hub"
             bits += f"[{ins['model_variant']}|{local}]"
+        if node["class_type"].startswith("Moss") and "top_k" in ins:
+            # …and which sampling it was run with, since the node's schema
+            # defaults are the 8B's whatever the loader holds.
+            bits += (f"(t={ins.get('temperature')},p={ins.get('top_p')},"
+                     f"k={ins.get('top_k')},"
+                     f"rp={ins.get('repetition_penalty')})")
+        if node["class_type"] == "VoiceCloneNode":
+            bits += f"(xvec={ins.get('x_vector_only')})"
         shape.append(bits)
     LOG.append(f"QUEUE {' -> '.join(shape)} fmt={save_fmt} text={text[:34]!r}")
     threading.Thread(target=run_prompt, args=(pid, graph, text, save_fmt),
                      daemon=True).start()
     return jsonify({"prompt_id": pid, "number": len(HISTORY),
                     "node_errors": {}})
+
+
+def refusal(graph):
+    """What the real node raises for a graph that validates but cannot run.
+
+    Validation only checks names and types; VoiceCloneNode checks what it was
+    given once it runs, and those messages are copied from the node and the
+    qwen_tts library it vendors.
+    """
+    for node in graph.values():
+        ins = node.get("inputs", {})
+        if node.get("class_type") == "VoiceCloneNode":
+            if "ref_audio" not in ins and "voice_clone_prompt" not in ins:
+                return ("VoiceCloneNode", "Either reference audio or voice "
+                                          "clone prompt is required")
+            if "ref_audio" in ins and not (ins.get("ref_text") or "").strip() \
+                    and not ins.get("x_vector_only"):
+                return ("VoiceCloneNode",
+                        "Generation failed: ref_text is required when "
+                        "x_vector_only_mode=False (ICL mode). Bad index=0")
+    return None
 
 
 def run_prompt(pid, graph, text, fmt):
@@ -376,6 +413,14 @@ def run_prompt(pid, graph, text, fmt):
                                                 {"node_type": "CustomVoiceNode",
                                                  "exception_message":
                                                      "Processing interrupted"}]]}
+        return
+    refused = refusal(graph)
+    if refused:
+        HISTORY[pid]["status"] = {
+            "status_str": "error", "completed": False,
+            "messages": [["execution_error", {"node_type": refused[0],
+                                              "exception_message":
+                                                  refused[1]}]]}
         return
     if MODE.get("fail_on") and MODE["fail_on"] in text:
         HISTORY[pid]["status"] = {
