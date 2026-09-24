@@ -47,12 +47,37 @@
    driver puts it, and falls back to the display-adapter list, which tells a
    missing driver apart from a missing card. The two get different sentences.
 5c. **A build already installed satisfies pip, so Reinstall must uninstall
-   first.** pip counts torch 2.14.0+cpu as satisfying `torch`; pointing it at
-   the CUDA index and asking again changes nothing, which is why pressing
-   Reinstall on the CPU build left the CPU build in place.
-   `drop_mismatched_torch` compares the `+tag` against the index and removes
-   the old one — and does nothing when they agree, or when the wheel carries
-   no tag and there is nothing to compare.
+   first — and the build is read from the wheel, not its tag.** pip counts
+   torch 2.14.0+cpu as satisfying `torch`; pointing it at the CUDA index and
+   asking again changes nothing, which is why pressing Reinstall on the CPU
+   build left the CPU build in place. `drop_mismatched_torch` compares the
+   build against the index and removes the old one. A tagged wheel is
+   compared tag for tag. PyPI's wheels carry no tag, and on Windows the
+   untagged one is the CPU build: "no tag, nothing to compare" is how an RTX
+   4060 kept it through every Reinstall. `installed_torch` reads
+   `torch/version.py` through the environment's own interpreter — never
+   `import torch`, which costs seconds — and an untagged wheel is compared by
+   what it was built for: kind, not CUDA minor version, so PyPI's Linux CUDA
+   wheel is not 3 GB reinstalled over cu126. An uninstall that fails raises
+   rather than carrying on, and `install_requested_torch` reads the build back
+   afterwards: "PyTorch installed" over the build pip left alone is not a
+   report. torchvision rides along from the same index, because the drop takes
+   it out and ComfyUI's requirements name it.
+5d. **ComfyUI is never launched on a torch it will die on.** It asks CUDA for
+   a device while it imports, so a CPU-only torch without `--cpu` stops as it
+   starts — "AssertionError: Torch not compiled with CUDA enabled", a stack
+   trace for every Start and every Restart. `torch_launch` reads the build
+   before `ComfyProcess.start` runs anything. No NVIDIA card, or the CPU build
+   picked on purpose: `--cpu`, and it runs. A card with the CUDA build
+   selected: refused in a sentence that names Reinstall, because running it on
+   the CPU would hide the fault behind takes many times slower. Restart and the
+   boot takeover ask *before* touching a port (rule 33a). The PyTorch row marks
+   that state `repair`, which raises the Engine badge and puts it in Install
+   everything missing — as a plain "warn" that button said nothing was
+   missing. Never `--cpu` for a CUDA build: nvidia-smi not answering is not a
+   missing GPU (rule 5b). And an install that runs pip in an engine's
+   environment stops that engine first — Windows will not replace a DLL a
+   running ComfyUI holds, and torch is nothing but DLLs.
 6. **Downloads are resumable, and nothing is renamed until it is whole.** Stream
    to `<name>.part`, `Range` on retry, atomic `replace()` — but only once what
    arrived accounts for the size the listing gave. A dropped connection ends the
@@ -454,8 +479,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 196 unit tests, standard library only
-npm test                 # 93 checks driving the real page in headless Chromium
+npm run test:units       # 218 unit tests, standard library only
+npm test                 # 96 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script

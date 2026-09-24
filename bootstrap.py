@@ -980,18 +980,33 @@ class ComfyProcess:
         return self.proc is not None and self.proc.poll() is None
 
     def start(self, python: str, comfy_dir: Path, port: int,
-              prog: Progress) -> None:
+              prog: Progress, cfg: dict | None = None,
+              engine: str = "") -> None:
         """Raises RuntimeError with a sentence a person can act on. A ComfyUI
         folder that has moved, or an interpreter that is gone, is an engine
-        that cannot start — never a reason the whole app fails to boot."""
+        that cannot start — never a reason the whole app fails to boot.
+
+        With `cfg`, the torch it would run on is read first (`torch_launch`):
+        a CPU-only build is started with --cpu where that is the machine, and
+        refused where it is the fault, rather than launched to die on
+        "Torch not compiled with CUDA enabled"."""
         if self.alive():
             return
         if not (comfy_dir / "main.py").exists():
             raise RuntimeError(
                 f"There is no ComfyUI at {comfy_dir} any more — the folder has "
                 "moved or been deleted. Run setup again from Settings.")
+        extra: list[str] = []
+        if cfg is not None:
+            extra, refusal = torch_launch(python, cfg, engine)
+            if refusal:
+                raise RuntimeError(refusal)
+            if extra:
+                self.note("This environment's PyTorch has no GPU support in "
+                          "it — starting ComfyUI on the CPU (--cpu). Speech "
+                          "will be slow.")
         cmd = [python, "main.py", "--listen", "127.0.0.1", "--port", str(port),
-               "--disable-auto-launch"]
+               "--disable-auto-launch"] + extra
         prog.log("Launching ComfyUI: " + " ".join(cmd))
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) \
             if platform.system() == "Windows" else 0
@@ -1661,16 +1676,89 @@ def torch_build(index: str) -> str:
     return match.group(1) if match else ""
 
 
-def installed_torch(python: str) -> str:
-    """The torch already in this environment, "" if there is none."""
+# What a torch was built for, read out of torch/version.py rather than by
+# `import torch`. The import costs seconds on Windows and this is asked before
+# every engine start; the build facts are all in that one file, written when
+# the wheel was built. find_spec has the environment's own interpreter locate
+# the package, so this is still that interpreter's answer (rule 5), never a
+# guess from a path.
+TORCH_PROBE = """
+import importlib.util, json, os, runpy
+spec = importlib.util.find_spec("torch")
+if spec is None or not spec.submodule_search_locations:
+    raise SystemExit(3)
+v = runpy.run_path(os.path.join(list(spec.submodule_search_locations)[0],
+                                "version.py"))
+print(json.dumps({k: (None if v.get(k) is None else str(v.get(k)))
+                  for k in ("__version__", "cuda", "hip", "xpu")}))
+"""
+
+
+def installed_torch(python: str) -> dict:
+    """The torch in this environment and what it was built for, {} if none.
+
+    {"version": "2.14.0+cpu", "cuda": None, "hip": None, "xpu": None}. The
+    version string alone cannot answer the question that matters: a wheel from
+    PyPI carries no local tag at all, so on Windows "2.14.0" is the CPU build
+    and nothing in the string says so. `cuda` is what the wheel was compiled
+    against, and None there means no CUDA in it at all.
+    """
     try:
-        out = _run([str(python), "-c", "import torch;print(torch.__version__)"],
-                   timeout=180)
+        out = _run([str(python), "-c", TORCH_PROBE], timeout=60)
     except Exception:  # noqa: BLE001
+        return {}
+    if out.returncode != 0:
+        return {}
+    try:
+        raw = json.loads((out.stdout or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {}
+    if not isinstance(raw, dict) or not raw.get("__version__"):
+        return {}
+    return {"version": raw["__version__"], "cuda": raw.get("cuda"),
+            "hip": raw.get("hip"), "xpu": raw.get("xpu")}
+
+
+def torch_kind(info: dict) -> str:
+    """What an installed torch can drive: cuda, rocm, xpu or cpu ("" if none)."""
+    if not info:
         return ""
-    if out.returncode != 0 or not (out.stdout or "").strip():
-        return ""
-    return out.stdout.strip().splitlines()[-1].strip()
+    if info.get("cuda"):
+        return "cuda"
+    if info.get("hip"):
+        return "rocm"
+    if info.get("xpu"):
+        return "xpu"
+    return "cpu"
+
+
+def build_kind(build: str) -> str:
+    """The same question asked of an index's tag: cu128 is cuda."""
+    if build.startswith("cu"):
+        return "cuda"
+    if build.startswith("rocm"):
+        return "rocm"
+    return build
+
+
+def torch_mismatch(info: dict, wanted: str) -> bool:
+    """Is this installed torch a different build from the `wanted` tag?
+
+    A tagged wheel is compared tag for tag, so cu126 is not cu128. An untagged
+    one — what PyPI serves — is compared by what the wheel says it was built
+    for. Treating "no tag" as "nothing to compare" is how a Windows machine
+    with an RTX 4060 kept PyPI's CPU build through every Reinstall: ComfyUI's
+    own requirements put it there, the check saw no tag and stood aside, and
+    pip called the CUDA request satisfied. Kind rather than exact version for
+    these, though: an untagged CUDA build is left alone rather than 3 GB
+    reinstalled over a CUDA minor version.
+    """
+    if not wanted or not info:
+        return False
+    version = info.get("version", "")
+    if "+" in version:
+        return version.split("+", 1)[1] != wanted
+    return torch_kind(info) != build_kind(wanted)
 
 
 def drop_mismatched_torch(python: str, index: str, log) -> bool:
@@ -1682,27 +1770,34 @@ def drop_mismatched_torch(python: str, index: str, log) -> bool:
     The old build has to go first. Nothing is removed when the builds already
     agree, so a Reinstall that only wants to repair a broken install is still
     the cheap operation it looks like.
+
+    An uninstall that fails raises. Carrying on used to be silent: pip then
+    found the old build still there, called the request satisfied, and the
+    task reported PyTorch installed over the build it had failed to replace.
     """
     wanted = torch_build(index)
     if not wanted:
         return False
     have = installed_torch(python)
-    if not have:
+    if not torch_mismatch(have, wanted):
         return False
-    current = have.split("+")[1] if "+" in have else ""
-    # A wheel from the default PyPI index carries no local tag and is the CUDA
-    # build on Linux, the CPU build on Windows — it cannot be matched against
-    # a tag, so it is left alone rather than reinstalled on a guess.
-    if not current or current == wanted:
-        return False
-    log(f"Installed torch is {have}, but the {wanted} build was asked for — "
-        "removing it first, because pip counts the old one as good enough.")
+    log(f"Installed torch is {have['version']} (the {torch_kind(have)} "
+        f"build), but the {wanted} build was asked for — removing it first, "
+        "because pip counts the old one as good enough.")
+    why = ""
     try:
-        _run([str(python), "-m", "pip", "uninstall", "-y",
-              "torch", "torchaudio", "torchvision"], timeout=900)
+        res = _run([str(python), "-m", "pip", "uninstall", "-y",
+                    "torch", "torchaudio", "torchvision"], timeout=900)
+        if res.returncode != 0:
+            why = ((res.stderr or "") + (res.stdout or "")).strip()[-300:]
     except Exception as exc:  # noqa: BLE001
-        log(f"Could not remove the old torch ({exc}) — carrying on.")
-        return False
+        why = str(exc)
+    if why:
+        raise RuntimeError(
+            f"Could not remove torch {have['version']} to make room for the "
+            f"{wanted} build ({why}). On Windows that is almost always a "
+            "program still using this environment — a ComfyUI started from it. "
+            "Close it, then try again.")
     return True
 
 
@@ -1715,15 +1810,68 @@ def install_requested_torch(python: str, cfg: dict, log, on_detail=None) -> None
     is still installed when ComfyUI starts.  This final pass is intentionally
     shared by setup and the repair buttons so every installation route leaves
     the requested build in place.
+
+    And it checks that it did. "PyTorch installed" over a build pip left
+    alone is the report that sent someone to restart an engine that could
+    only ever stop as it started.
     """
     index = torch_index(cfg)
     gpu = nvidia_gpu()
     log(f"Graphics: {gpu['name'] or 'no NVIDIA GPU found'}")
     drop_mismatched_torch(python, index, log)
-    args = ["torch", "torchaudio"]
+    # torchvision rides along: ComfyUI's requirements name it, the drop above
+    # takes it out with the other two, and it has to come back from the same
+    # index as the torch it is built against.
+    args = ["torch", "torchvision", "torchaudio"]
     if index:
         args += ["--index-url", index]
     pip_install(python, args, log, on_detail)
+    wanted = torch_build(index)
+    have = installed_torch(python)
+    if wanted and torch_mismatch(have, wanted):
+        raise RuntimeError(
+            f"torch {have['version']} (the {torch_kind(have)} build) is still "
+            f"the one installed after asking for the {wanted} build — see the "
+            "log for what pip said.")
+    if have:
+        log(f"PyTorch is torch {have['version']} (the {torch_kind(have)} "
+            "build).")
+
+
+def torch_launch(python: str, cfg: dict, engine: str = "") \
+        -> tuple[list[str], str]:
+    """Extra ComfyUI flags for the torch it will run on, or why it cannot start.
+
+    ComfyUI asks CUDA for a device while it is still importing
+    (`get_torch_device` → `torch.cuda.current_device()`), so anywhere but a
+    Mac a torch with no GPU support in it stops as it starts — "AssertionError:
+    Torch not compiled with CUDA enabled", every time — unless it was told
+    `--cpu`. Two different machines produce that trace:
+
+      no NVIDIA card, or the CPU build chosen on purpose: `--cpu`, and it runs;
+      an NVIDIA card and the CUDA build selected: the CPU build is the fault.
+        Running it on the CPU would hide that behind takes many times slower,
+        so it is refused, in a sentence that names the button that swaps it.
+
+    A torch that cannot be read is left to ComfyUI: its own error says more
+    than a guess from here would.
+    """
+    if platform.system() == "Darwin":
+        return [], ""
+    info = installed_torch(python)
+    if torch_kind(info) != "cpu":
+        return [], ""
+    gpu = nvidia_gpu()
+    if gpu["name"] and build_kind(torch_build(torch_index(cfg))) == "cuda":
+        label = ENGINES[engine]["label"] if engine in ENGINES \
+            else "This engine"
+        return [], (f"{label}'s PyTorch is the CPU-only build (torch "
+                    f"{info['version']}), and ComfyUI stops as it starts on "
+                    f"it — that build cannot use the {gpu['name']}. Press "
+                    f"Reinstall on PyTorch · {label} on the Engine page, or "
+                    "Install everything missing: it swaps in the CUDA build, "
+                    "about 3 GB.")
+    return ["--cpu"], ""
 
 
 # Loaded exactly the way ComfyUI loads a custom node pack: under the folder's
@@ -2001,7 +2149,7 @@ def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
         prog.detail("launch", f"Starting {label}'s ComfyUI — the first start "
                               "is slow…")
         proc.start(slot["python"], Path(slot["comfy_dir"]), comfy_port(url),
-                   prog)
+                   prog, cfg=cfg, engine=engine)
         if not wait_for_comfy(url, timeout=900):
             raise RuntimeError(f"{label}'s ComfyUI did not start within 15 "
                                "minutes.\n" + "\n".join(proc.tail(25)))

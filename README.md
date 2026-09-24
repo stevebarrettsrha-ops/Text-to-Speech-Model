@@ -336,6 +336,12 @@ node's own requirements file.
 **PyTorch will not install** — pick a build by hand in the Engine panel: CUDA
 12.8 for recent NVIDIA drivers, 12.1 for older ones, ROCm for AMD, or CPU.
 
+**"Torch not compiled with CUDA enabled"** — that engine's environment has the
+CPU-only PyTorch on a machine with an NVIDIA card, and ComfyUI stops as it
+starts on it. Script Builder now refuses to launch it and says so; press
+Reinstall on **PyTorch** for that engine (or Install everything missing) to
+swap in the CUDA build. Machines with no NVIDIA card run on the CPU instead.
+
 **Out of memory** — switch to the 0.6B model and turn on Free GPU memory after
 each run.
 

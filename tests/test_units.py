@@ -996,56 +996,244 @@ class GpuDetection(unittest.TestCase):
         self.assertIn("Pick the NVIDIA build above", text)
 
 
+def torch_info(version: str, cuda: str | None = None) -> dict:
+    """What bootstrap.installed_torch reports for a wheel."""
+    return {"version": version, "cuda": cuda, "hip": None, "xpu": None}
+
+
+RTX_4060 = {"name": "NVIDIA GeForce RTX 4060", "driver": True, "vram_mb": 8188}
+NO_GPU = {"name": "", "driver": False, "vram_mb": 0}
+
+
 class TorchReinstall(unittest.TestCase):
     """pip counts torch 2.14.0+cpu as satisfying `torch`, so Reinstall against
     the CUDA index changed nothing at all."""
 
-    def _attempt(self, installed, index):
+    def _attempt(self, installed, index, code=0, said=""):
         calls = []
         with mock.patch.object(bootstrap, "installed_torch",
                                return_value=installed), \
              mock.patch.object(bootstrap, "_run",
                                side_effect=lambda cmd, **kw: calls.append(cmd)
-                               or subprocess.CompletedProcess(cmd, 0, "", "")):
+                               or subprocess.CompletedProcess(cmd, code, "",
+                                                              said)):
             dropped = bootstrap.drop_mismatched_torch("py", index, lambda _m: None)
         return dropped, calls
 
     def test_a_cpu_build_is_removed_before_the_cuda_one_lands(self):
-        dropped, calls = self._attempt("2.14.0+cpu", bootstrap.CUDA_INDEX)
+        dropped, calls = self._attempt(torch_info("2.14.0+cpu"),
+                                       bootstrap.CUDA_INDEX)
         self.assertTrue(dropped)
         self.assertTrue(any("uninstall" in c for c in calls[0]))
 
     def test_a_matching_build_is_left_alone(self):
-        dropped, calls = self._attempt("2.14.0+cu128", bootstrap.CUDA_INDEX)
+        dropped, calls = self._attempt(torch_info("2.14.0+cu128", "12.8"),
+                                       bootstrap.CUDA_INDEX)
         self.assertFalse(dropped)
         self.assertEqual(calls, [])
 
-    def test_an_untagged_wheel_is_not_reinstalled_on_a_guess(self):
-        # Plain PyPI wheels carry no +tag; which build they are depends on the
-        # platform, so there is nothing to compare and nothing to do.
-        dropped, calls = self._attempt("2.14.0", bootstrap.CUDA_INDEX)
+    def test_pypis_untagged_cpu_wheel_is_removed_too(self):
+        # The Windows wheel from PyPI is the CPU build and says so nowhere in
+        # its version. "No tag, nothing to compare" left it in place through
+        # every Reinstall on a machine with an RTX 4060, and ComfyUI died on
+        # "Torch not compiled with CUDA enabled" at every start.
+        dropped, calls = self._attempt(torch_info("2.14.0"),
+                                       bootstrap.CUDA_INDEX)
+        self.assertTrue(dropped)
+        self.assertTrue(any("uninstall" in c for c in calls[0]))
+
+    def test_an_untagged_cuda_wheel_is_not_reinstalled_over_a_minor_version(self):
+        # PyPI's Linux wheel is a CUDA build with no tag. It drives the card;
+        # 3 GB is not worth trading cu126 for cu128.
+        dropped, calls = self._attempt(torch_info("2.14.0", "12.6"),
+                                       bootstrap.CUDA_INDEX)
         self.assertFalse(dropped)
         self.assertEqual(calls, [])
+
+    def test_a_cuda_build_is_removed_when_the_cpu_one_is_asked_for(self):
+        dropped, _ = self._attempt(torch_info("2.14.0", "12.8"),
+                                   bootstrap.CPU_INDEX)
+        self.assertTrue(dropped)
 
     def test_nothing_is_removed_when_no_torch_is_there(self):
-        dropped, calls = self._attempt("", bootstrap.CUDA_INDEX)
+        dropped, calls = self._attempt({}, bootstrap.CUDA_INDEX)
         self.assertFalse(dropped)
         self.assertEqual(calls, [])
 
-    def test_the_selected_build_is_the_last_dependency_installed(self):
+    def test_an_uninstall_that_fails_stops_there_and_says_why(self):
+        # It used to log and carry on: pip then found the old build still in
+        # place, called the request satisfied, and the task said "PyTorch
+        # installed" over the build it had failed to remove.
+        with self.assertRaises(RuntimeError) as caught:
+            self._attempt(torch_info("2.14.0+cpu"), bootstrap.CUDA_INDEX,
+                          code=1, said="ERROR: [WinError 5] Access is denied: "
+                                       "'torch\\lib\\c10.dll'")
+        self.assertIn("Access is denied", str(caught.exception))
+        self.assertIn("Close it", str(caught.exception))
+
+    def _install(self, after, index=bootstrap.CUDA_INDEX):
         calls = []
-        with mock.patch.object(bootstrap, "torch_index",
-                               return_value=bootstrap.CUDA_INDEX), \
-             mock.patch.object(bootstrap, "nvidia_gpu", return_value={
-                 "name": "NVIDIA GeForce RTX 4060", "driver": True}), \
+        seen = iter([after])
+        with mock.patch.object(bootstrap, "torch_index", return_value=index), \
+             mock.patch.object(bootstrap, "nvidia_gpu", return_value=RTX_4060), \
              mock.patch.object(bootstrap, "drop_mismatched_torch",
                                side_effect=lambda *a: calls.append("drop")), \
+             mock.patch.object(bootstrap, "installed_torch",
+                               side_effect=lambda _py: next(seen)), \
              mock.patch.object(bootstrap, "pip_install",
                                side_effect=lambda _py, args, *_a:
                                calls.append(args)):
             bootstrap.install_requested_torch("py", {}, lambda _m: None)
+        return calls
+
+    def test_the_selected_build_is_the_last_dependency_installed(self):
+        calls = self._install(torch_info("2.10.0+cu128", "12.8"))
+        # torchvision rides along: the drop takes it out, ComfyUI needs it,
+        # and it has to match the torch it was built against.
         self.assertEqual(calls, ["drop", [
-            "torch", "torchaudio", "--index-url", bootstrap.CUDA_INDEX]])
+            "torch", "torchvision", "torchaudio",
+            "--index-url", bootstrap.CUDA_INDEX]])
+
+    def test_a_build_pip_left_in_place_fails_the_install(self):
+        # "PyTorch installed" over a CPU build is the report that sent someone
+        # to restart an engine that could only ever stop as it started.
+        with self.assertRaises(RuntimeError) as caught:
+            self._install(torch_info("2.14.0"))
+        self.assertIn("still", str(caught.exception))
+        self.assertIn("cu128", str(caught.exception))
+
+
+class ReadingTheTorchBuild(unittest.TestCase):
+    """What a torch was built for comes out of the wheel, through the
+    environment's own interpreter, and without importing torch — that costs
+    seconds on Windows and is asked before every engine start."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="sb-torch-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+    def _wheel(self, version: str, cuda) -> None:
+        pkg = self.root / "torch"
+        pkg.mkdir()
+        # Importing it would fail the test: the probe must not.
+        (pkg / "__init__.py").write_text("raise RuntimeError('imported')\n")
+        (pkg / "version.py").write_text(
+            "from typing import Optional\n"
+            f"__version__ = {version!r}\n"
+            f"cuda: Optional[str] = {cuda!r}\n"
+            "hip: Optional[str] = None\n")
+
+    def _read(self) -> dict:
+        with mock.patch.dict(os.environ, {"PYTHONPATH": str(self.root)}):
+            return bootstrap.installed_torch(sys.executable)
+
+    def test_pypis_windows_wheel_reads_as_the_cpu_build(self):
+        self._wheel("2.14.0", None)
+        info = self._read()
+        self.assertEqual(info["version"], "2.14.0")
+        self.assertEqual(bootstrap.torch_kind(info), "cpu")
+
+    def test_a_cuda_wheel_reads_as_cuda(self):
+        self._wheel("2.10.0+cu128", "12.8")
+        info = self._read()
+        self.assertEqual(info["cuda"], "12.8")
+        self.assertEqual(bootstrap.torch_kind(info), "cuda")
+
+    def test_no_torch_is_an_empty_answer(self):
+        self.assertEqual(self._read(), {})
+        self.assertEqual(bootstrap.torch_kind({}), "")
+
+
+class ACpuOnlyTorch(unittest.TestCase):
+    """ComfyUI asks CUDA for a device while it imports, so a torch with no GPU
+    support in it stops as it starts unless it was told --cpu. Which of the
+    two that means depends on the machine."""
+
+    def _launch(self, installed, gpu=RTX_4060, cfg=None):
+        with mock.patch.object(bootstrap.platform, "system",
+                               return_value="Windows"), \
+             mock.patch.object(bootstrap, "installed_torch",
+                               return_value=installed), \
+             mock.patch.object(bootstrap, "nvidia_gpu", return_value=gpu):
+            return bootstrap.torch_launch("py", cfg or {}, "qwen")
+
+    def test_beside_an_nvidia_card_it_is_refused_and_the_fix_named(self):
+        flags, refusal = self._launch(torch_info("2.14.0"))
+        self.assertEqual(flags, [])
+        self.assertIn("CPU-only build", refusal)
+        self.assertIn("RTX 4060", refusal)
+        self.assertIn("Reinstall on PyTorch · Qwen3-TTS", refusal)
+
+    def test_with_no_nvidia_card_it_runs_on_the_cpu(self):
+        self.assertEqual(self._launch(torch_info("2.14.0+cpu"), NO_GPU),
+                         (["--cpu"], ""))
+
+    def test_the_cpu_build_chosen_on_purpose_runs_on_the_cpu(self):
+        # A card too old for cu128 is a reason to pick the CPU build, and
+        # refusing to run it would leave that machine nothing at all.
+        self.assertEqual(
+            self._launch(torch_info("2.14.0+cpu"),
+                         cfg={"torch_index": bootstrap.CPU_INDEX}),
+            (["--cpu"], ""))
+
+    def test_a_cuda_build_is_started_as_it_is(self):
+        # Never --cpu for a CUDA build, even when nvidia-smi cannot be found:
+        # a portable ComfyUI carries its own CUDA, and silently running it on
+        # the CPU would be rule 5b in a new coat.
+        for gpu in (RTX_4060, NO_GPU):
+            with self.subTest(gpu=gpu["name"]):
+                self.assertEqual(
+                    self._launch(torch_info("2.10.0+cu128", "12.8"), gpu),
+                    ([], ""))
+
+    def test_a_torch_that_cannot_be_read_is_left_to_comfyui(self):
+        self.assertEqual(self._launch({}), ([], ""))
+
+    def test_a_mac_is_never_given_the_flag(self):
+        with mock.patch.object(bootstrap.platform, "system",
+                               return_value="Darwin"), \
+             mock.patch.object(bootstrap, "installed_torch",
+                               return_value=torch_info("2.14.0")):
+            self.assertEqual(bootstrap.torch_launch("py", {}, "qwen"), ([], ""))
+
+
+class TheTorchRow(unittest.TestCase):
+    """The row has to see a CPU build as CPU when the tag does not say so, and
+    mark it as the repair it is when it is what stops the engine starting."""
+
+    def _row(self, probe: dict, gpu=RTX_4060, cfg=None) -> dict:
+        with mock.patch.object(manager, "_probe",
+                               return_value=(0, json.dumps(probe))), \
+             mock.patch.object(bootstrap, "nvidia_gpu", return_value=gpu):
+            return manager._torch_row("py", "_qwen", "Qwen3-TTS", cfg or {})
+
+    def test_an_untagged_cpu_build_beside_a_card_is_a_repair(self):
+        row = self._row({"v": "2.14.0", "cuda": False, "built": None,
+                         "hip": None, "dev": ""})
+        self.assertTrue(row.get("repair"))
+        self.assertIn("CPU-only build", row["detail"])
+        self.assertIn("RTX 4060", row["detail"])
+
+    def test_a_cpu_build_chosen_on_purpose_is_not_a_repair(self):
+        row = self._row({"v": "2.14.0+cpu", "cuda": False, "built": None,
+                         "hip": None, "dev": ""},
+                        cfg={"torch_index": bootstrap.CPU_INDEX})
+        self.assertFalse(row.get("repair"))
+
+    def test_a_cuda_build_waiting_on_a_driver_is_not_a_repair(self):
+        # Reinstalling torch cannot install a driver.
+        row = self._row({"v": "2.10.0+cu128", "cuda": False, "built": "12.8",
+                         "hip": None, "dev": ""},
+                        gpu={"name": "NVIDIA GeForce RTX 4060",
+                             "driver": False, "vram_mb": 0})
+        self.assertFalse(row.get("repair"))
+        self.assertIn("driver", row["detail"])
+
+    def test_a_working_gpu_is_ok(self):
+        row = self._row({"v": "2.10.0+cu128", "cuda": True, "built": "12.8",
+                         "hip": None, "dev": "NVIDIA GeForce RTX 4060"})
+        self.assertEqual(row["state"], "ok")
+        self.assertFalse(row.get("repair"))
 
 
 class PipReadiness(unittest.TestCase):
@@ -2204,8 +2392,10 @@ def fake_install(root: Path, engine: str = "qwen",
         "p = argparse.ArgumentParser()\n"
         "p.add_argument('--listen'); p.add_argument('--port')\n"
         "p.add_argument('--disable-auto-launch', action='store_true')\n"
+        "p.add_argument('--cpu', action='store_true')\n"
         "a = p.parse_args()\n"
         "os.environ['MOCK_COMFY_PORT'] = a.port\n"
+        "print('Device: cpu' if a.cpu else 'Device: cuda:0', flush=True)\n"
         "print('Starting server', flush=True)\n"
         "here = pathlib.Path(__file__).parent\n"
         "sys.argv = ['mock_comfy.py', str(here / 'mockroot')]\n"
@@ -2386,6 +2576,99 @@ class RestartTakesTheFourRoutes(EngineFixture):
         self.assertEqual(r.status_code, 400)
         self.assertIn("setup", r.get_json()["error"].lower())
         self.assertIsNone(theirs.poll(), "it closed a ComfyUI it could not replace")
+
+
+class StartingOnACpuOnlyTorch(EngineFixture):
+    """What this is for: an RTX 4060, PyPI's CPU torch in Qwen's environment,
+    and every Start and Restart ending in a stack trace that closed with
+    "AssertionError: Torch not compiled with CUDA enabled"."""
+
+    def setUp(self):
+        super().setUp()
+        server.cfg["torch_index"] = ""          # Automatic
+        self.port = free_port()
+        self.url = f"http://127.0.0.1:{self.port}"
+        self.install = fake_install(self.root)
+        self.slot(comfy_url=self.url, comfy_dir=str(self.install),
+                  python=sys.executable)
+
+    def cpu_torch(self, gpu: dict) -> None:
+        for patch in (mock.patch.object(bootstrap, "installed_torch",
+                                        return_value=torch_info("2.14.0")),
+                      mock.patch.object(bootstrap, "nvidia_gpu",
+                                        return_value=gpu)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def said(self) -> str:
+        return "\n".join(server.PROCS["qwen"].tail(200))
+
+    @unittest.skipIf(sys.platform == "darwin", "a Mac never gets --cpu")
+    def test_start_beside_a_card_is_a_sentence_and_nothing_is_launched(self):
+        self.cpu_torch(RTX_4060)
+        with server.app.test_client() as web:
+            r = web.post("/api/comfy/start?engine=qwen")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("Reinstall on PyTorch · Qwen3-TTS", r.get_json()["error"])
+        self.assertIsNone(server.PROCS["qwen"].proc,
+                          "it launched an engine that could only die")
+        # And the engine console says it, not just the toast.
+        self.assertIn("CPU-only build", self.said())
+
+    @unittest.skipIf(sys.platform == "darwin", "a Mac never gets --cpu")
+    def test_start_with_no_card_runs_it_on_the_cpu(self):
+        self.cpu_torch(NO_GPU)
+        with server.app.test_client() as web:
+            r = web.post("/api/comfy/start?engine=qwen")
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertTrue(online(self.url))
+        self.assertIn("--cpu", server.PROCS["qwen"].proc.args)
+        deadline = time.time() + 10
+        while "Device: cpu" not in self.said() and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertIn("Device: cpu", self.said(),
+                      "the flag never reached ComfyUI's own command line")
+        self.assertIn("--cpu", self.said())
+
+    @unittest.skipIf(sys.platform == "darwin", "a Mac never gets --cpu")
+    def test_restart_refuses_before_it_takes_anyone_elses_port(self):
+        # Rule 33a: no port is taken that cannot be filled.
+        theirs = self.stray(spawn_mock(self.port, self.root / "theirs"))
+        self.assertTrue(online(self.url))
+        self.cpu_torch(RTX_4060)
+        with server.app.test_client() as web:
+            r = web.post("/api/comfy/restart?engine=qwen")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("CPU-only build", r.get_json()["error"])
+        self.assertIsNone(theirs.poll(),
+                          "it closed a ComfyUI it could not replace")
+
+    def test_a_torch_reinstall_stops_the_engine_it_is_about_to_replace(self):
+        # Windows will not let pip replace a DLL a running ComfyUI has loaded,
+        # and torch is nothing but DLLs.
+        server.PROCS["qwen"].start(sys.executable, self.install, self.port,
+                                   server.progress)
+        self.assertTrue(online(self.url))
+        running = []
+        with mock.patch.object(manager, "_install_torch",
+                               side_effect=lambda *_a: running.append(
+                                   server.PROCS["qwen"].alive())):
+            with server.app.test_client() as web:
+                body = web.post("/api/deps/torch_qwen/install",
+                                json={}).get_json()
+            self.assertEqual(self.finish_task(body["task"]), "done")
+        self.assertEqual(running, [False])
+        self.assertIn("Stopping this engine while its packages change",
+                      self.said())
+
+    def test_installing_git_leaves_the_engine_alone(self):
+        stops = []
+        with mock.patch.object(manager, "_install_git"):
+            view = manager.install_dependency(
+                "git", server.cfg, {},
+                stop_engine=lambda e: stops.append(e) or True).view()
+            self.assertEqual(self.finish_task(view), "done")
+        self.assertEqual(stops, [])
 
 
 class WhenThePortWillNotBeGivenUp(EngineFixture):
