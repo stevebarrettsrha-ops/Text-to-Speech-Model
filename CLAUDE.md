@@ -69,6 +69,22 @@
    And a requirement of ComfyUI's that will not install is reported after the
    swap, never instead of it: stopping there left the row reading exactly as
    it had before Reinstall was pressed.
+5e. **A torch can be the right build and still be broken, so its files are
+   checked against pip's own record.** An install cut off partway — the app
+   closed mid-install, two installs at once — leaves a torch folder holding
+   two versions: version.py reads as the build asked for, so the row said ok,
+   Start launched it, and ComfyUI died inside torch itself ("cannot import
+   name 'is_fake_tensor'"). Reinstall did nothing, because builds agreeing is
+   what pip calls satisfied. `torch_damage` reads each torch dist's RECORD in
+   the environment's own interpreter and reports `.py` files that belong to
+   no installed version, recorded ones missing or changed, two versions
+   installed over each other, and a torch folder pip has no record of. A dist
+   with no RECORD (conda) is not judged: calling a working torch damaged is
+   the worse error. Damage is a `repair` row, a refused start, and on
+   Reinstall `remove_torch` — pip uninstall until no torch dist is left, then
+   the torch folders it left behind, in the one directory the interpreter
+   loads torch from — never before `index_lacks_torch` says a replacement
+   exists.
 5d. **ComfyUI is never launched on a torch it will die on.** It asks CUDA for
    a device while it imports, so a CPU-only torch without `--cpu` stops as it
    starts — "AssertionError: Torch not compiled with CUDA enabled", a stack
@@ -212,6 +228,14 @@
    environment: `install_dependency` refuses a second with `InstallBusy`
    (409) naming the one running, because two pips writing one site-packages —
    one of them uninstalling torch — break each other.
+18i. **An engine that dies while starting is noticed at once and said in a
+   sentence.** `wait_for_comfy` takes the process's `alive`, because Restart
+   sat on "Restarting…" for fifteen minutes over an engine that had died in
+   two seconds. `crash_reason` reads the console for the shapes worth naming —
+   the CPU build, no torch, an import error raised inside torch (damage, rule
+   5e), no driver, a taken port, out of memory — each with the control that
+   clears it, and anything else is its own last exception line, never
+   nothing. `/api/status` and `/api/comfy/log` carry it as `stopped`.
 18d. **`already` is not `started`.** `/api/comfy/start` returns `already` when
    something answers the address, and the page used to toast "Starting…"
    regardless: pressed, claims to work, changes nothing. It now says what is
@@ -410,6 +434,10 @@
    `/api/speak` and the self-test both go through it before a single line is
    queued, under `engine_lock` so two takes started together cannot leave both
    resident. `run_both_engines` turns it off where there is memory to spare.
+   Choosing an engine on the Create page starts it, and `activate` asks
+   everything that can refuse — `torch_launch` included — *before* it stops
+   the other: switching to an engine that could not start used to take the
+   working one down with it and leave nothing running.
 31b. **`wait_for_prompt` is told which engine queued the line.** There are two
    clients now, and reading the selected one inside the wait loop polls the
    wrong ComfyUI the moment someone switches engines mid-take.
@@ -498,8 +526,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 224 unit tests, standard library only
-npm test                 # 101 checks driving the real page in headless Chromium
+npm run test:units       # 247 unit tests, standard library only
+npm test                 # 104 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script

@@ -205,7 +205,25 @@ def _torch_row(py_comfy: str, suffix: str, label: str,
                        "'hip':getattr(torch.version,'hip',None),"
                        "'dev':(torch.cuda.get_device_name(0) "
                        "if torch.cuda.is_available() else '')}))")
+    # Read before anything else: a damaged torch imports fine here and still
+    # dies inside ComfyUI, and its version reads as exactly the right build —
+    # which is how this row said "ok" over an engine that could not start.
+    damage = bootstrap.torch_damage_summary(bootstrap.torch_damage(py_comfy))
+    if damage:
+        have = bootstrap.installed_torch(py_comfy)
+        return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
+                "state": "warn", "repair": True, "action": "reinstall",
+                "detail": (f"torch {have.get('version', '')} is damaged — "
+                           f"{damage}. ComfyUI will not start on it. Press "
+                           "Reinstall.")}
     if code != 0:
+        have = bootstrap.installed_torch(py_comfy)
+        if have:
+            last = (out or "").strip().splitlines()[-1:] or [""]
+            return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
+                    "state": "warn", "repair": True, "action": "reinstall",
+                    "detail": (f"torch {have['version']} is installed but will "
+                               f"not import: {last[0][:160]} Press Reinstall.")}
         return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
                 "state": "missing", "detail": f"Not installed in the {kind}.",
                 "action": "install"}

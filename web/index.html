@@ -1191,6 +1191,13 @@ async function setEngine(id) {
   } catch (e) { /* the picker still works for this run */ }
   await refreshStatus();
   await loadVoices();
+  // Chosen to be used, so it is brought up now rather than at the first
+  // Read — and bringing it up stops the other one, which is what keeps one
+  // engine on the card (rule 31). An engine that cannot start says why, and
+  // the one that was running is left running.
+  var st = S.status || {};
+  if (st.setup_complete && !st.setup_running && !st.comfy_online
+      && !engineStarting) startEngine();
 }
 /* Values may be plain strings (Qwen's model_choice enum) or {value,label}
    pairs (MOSS repo ids, which want a readable name beside them). */
@@ -1243,6 +1250,9 @@ function blocker(st) {
   if (st.ready) return { label: "Read the script", go: null };
   if (st.setup_running) return { label: "Setting up…", go: openSetup };
   if (!st.setup_complete) return { label: "Set up the engine", go: openSetup };
+  if (!st.comfy_online && engineStarting) return {
+    label: "Starting " + (S.engineLabel || "the engine") + "…",
+    go: function () { show("engine"); } };
   if (!st.comfy_online) return { label: "Start the engine",
     go: function () { show("engine"); startEngine(); } };
   // A different ComfyUI on that port has every symptom of nodes that failed
@@ -1851,6 +1861,8 @@ async function pollEngineLog() {
       + ((st.config || {}).comfy_url || "this address")
       + (st.engine_argv ? " (" + st.engine_argv + ")" : "")
       + ". Close it, or give this engine another address in Settings.";
+  } else if (d.stopped && !d.online) {
+    state = "⚠ " + d.stopped;
   } else if (d.running) {
     state = d.online ? "Running — started by Script Builder."
                      : "Starting… the first start is slow.";
@@ -1879,6 +1891,7 @@ async function startEngine(ev) {
     ? ev.currentTarget : $("btnStartEngine");
   var b = busy(btn, "Starting…");
   engineStarting = true;
+  $("runLabel").textContent = blocker(S.status).label;
   try {
     var r = await api("/api/comfy/start?engine=" + encodeURIComponent(engine),
       { method: "POST" });
@@ -1922,9 +1935,12 @@ async function startEngine(ev) {
       }
       var slot = (st.installs || {})[engine] || {};
       if (slot.running === false) {
-        $("task-title").textContent = label + " stopped while starting — its "
-          + "last words are below.";
-        toast(label + " stopped while starting — see the Activity log.", true);
+        // The server reads the crash and says it in a sentence; the console
+        // below still has every line of it.
+        var why = slot.stopped
+          || label + " stopped while starting — its last words are below.";
+        $("task-title").textContent = why;
+        toast(why, true);
         offerRepair(engine);
         return;
       }
@@ -1938,7 +1954,7 @@ async function startEngine(ev) {
     toast(e.message, true);
     offerRepair(engine);
   }
-  finally { engineStarting = false; b.done(); loadDeps(); }
+  finally { engineStarting = false; b.done(); loadDeps(); refreshStatus(); }
 }
 /* A start refused over a CPU-only PyTorch names the Reinstall button; this
    offers to press it. The dependency report decides — not the wording of the

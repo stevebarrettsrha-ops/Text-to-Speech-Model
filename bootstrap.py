@@ -979,9 +979,13 @@ class ComfyProcess:
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
+    def crashed(self) -> bool:
+        """It was started here and has exited without being told to stop."""
+        return self.proc is not None and self.proc.poll() is not None
+
     def start(self, python: str, comfy_dir: Path, port: int,
               prog: Progress, cfg: dict | None = None,
-              engine: str = "") -> None:
+              engine: str = "", extra: list[str] | None = None) -> None:
         """Raises RuntimeError with a sentence a person can act on. A ComfyUI
         folder that has moved, or an interpreter that is gone, is an engine
         that cannot start — never a reason the whole app fails to boot.
@@ -989,24 +993,25 @@ class ComfyProcess:
         With `cfg`, the torch it would run on is read first (`torch_launch`):
         a CPU-only build is started with --cpu where that is the machine, and
         refused where it is the fault, rather than launched to die on
-        "Torch not compiled with CUDA enabled"."""
+        "Torch not compiled with CUDA enabled". A caller that has already
+        asked passes the flags it got as `extra`, and the question is not put
+        twice."""
         if self.alive():
             return
         if not (comfy_dir / "main.py").exists():
             raise RuntimeError(
                 f"There is no ComfyUI at {comfy_dir} any more — the folder has "
                 "moved or been deleted. Run setup again from Settings.")
-        extra: list[str] = []
-        if cfg is not None:
+        if extra is None and cfg is not None:
             extra, refusal = torch_launch(python, cfg, engine)
             if refusal:
                 raise RuntimeError(refusal)
-            if extra:
-                self.note("This environment's PyTorch has no GPU support in "
-                          "it — starting ComfyUI on the CPU (--cpu). Speech "
-                          "will be slow.")
+        if extra and "--cpu" in extra:
+            self.note("This environment's PyTorch has no GPU support in it — "
+                      "starting ComfyUI on the CPU (--cpu). Speech will be "
+                      "slow.")
         cmd = [python, "main.py", "--listen", "127.0.0.1", "--port", str(port),
-               "--disable-auto-launch"] + extra
+               "--disable-auto-launch"] + (extra or [])
         prog.log("Launching ComfyUI: " + " ".join(cmd))
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) \
             if platform.system() == "Windows" else 0
@@ -1085,23 +1090,83 @@ def comfy_stats(url: str) -> dict | None:
     return None
 
 
-def wait_for_comfy(url: str, timeout: int = 900, on_wait=None) -> bool:
+def wait_for_comfy(url: str, timeout: int = 900, on_wait=None,
+                   alive=None) -> bool:
     """Poll until ComfyUI answers.
 
     `on_wait(elapsed, timeout)` runs on each pass. There is no honest
     percentage for a model load, so how long it has been waiting is the only
     number a caller can narrate with — and a start with no narration at all is
     the one that reads as a hang.
+
+    `alive()` is the process being waited on. Once it has exited nothing is
+    going to answer, and Restart sat on "Restarting…" for fifteen minutes
+    over an engine that had died in its first two seconds.
     """
     started = time.time()
     deadline = started + timeout
     while time.time() < deadline:
         if comfy_online(url):
             return True
+        if alive is not None and not alive():
+            return comfy_online(url)
         if on_wait:
             on_wait(time.time() - started, timeout)
         time.sleep(2)
     return False
+
+
+_TORCH_PATH = re.compile(
+    r"[\\/]site-packages[\\/](torch|torchvision|torchaudio|torchgen|functorch)"
+    r"[\\/]", re.I)
+
+
+def crash_reason(lines: list[str], engine: str = "") -> str:
+    """A ComfyUI that died while starting, in one sentence a person can act on.
+
+    Its console ends in a traceback, and the traceback is the truth — but
+    "ImportError: cannot import name 'is_fake_tensor'" three hundred
+    characters into site-packages is not something anyone can act on (rule
+    15). The shapes worth naming each get their own sentence and the control
+    that clears them; anything else is its own last line, never nothing.
+    """
+    label = ENGINES[engine]["label"] if engine in ENGINES else "The engine"
+    text = "\n".join(lines)
+    last, where, frame = "", "", ""
+    for line in lines:
+        hit = re.search(r'File "([^"]+)"', line)
+        if hit:
+            frame = hit.group(1)
+        elif re.match(r"\s*[\w.]*(Error|Exception)(:|$)", line):
+            # The exception, and the frame it was raised in.
+            last, where = line.strip(), frame
+    fix = f"Press Reinstall on PyTorch · {label} on the Engine page"
+    if "Torch not compiled with CUDA enabled" in text:
+        return (f"{label}'s PyTorch is the CPU-only build, and ComfyUI stops "
+                f"as it starts on it. {fix}.")
+    if "No module named 'torch'" in text:
+        return (f"{label}'s environment has no PyTorch at all. Press Install "
+                f"on PyTorch · {label} on the Engine page.")
+    if re.match(r"(ModuleNotFound|Import|Attribute)Error", last) \
+            and _TORCH_PATH.search(where):
+        return (f"{label}'s PyTorch is damaged — ComfyUI failed inside torch "
+                f"itself ({last[:160]}). That is what an install cut off "
+                f"partway leaves behind. {fix}: it takes torch out completely "
+                "and puts it back.")
+    if "Found no NVIDIA driver" in text:
+        return (f"{label} cannot reach the NVIDIA driver. Install or update "
+                "the driver, then start the engine again.")
+    if re.search(r"10048|address already in use|only one usage of each "
+                 r"socket address", text, re.I):
+        return (f"{label}'s port is taken by something else. Press Restart "
+                "ComfyUI to take it over, or give the engine another port in "
+                "Settings.")
+    if re.search(r"out of memory|OutOfMemoryError", text, re.I):
+        return (f"{label} ran out of GPU memory while starting. Close other "
+                "programs using the card, then start it again.")
+    if last:
+        return f"{label} stopped while starting: {last[:200]}"
+    return f"{label} stopped while starting — its console says why."
 
 
 # --------------------------------------------------------------------------- #
@@ -1791,6 +1856,208 @@ def index_lacks_torch(python: str, index: str) -> str:
     return said.splitlines()[-1][:200]
 
 
+# Whether the torch in an environment is the one pip installed, file for file.
+# An install cut off partway — the app closed mid-download, two installs at
+# once — leaves a tree that is neither version: its version.py reads fine, so
+# every check that asks "which torch is this" says all is well, and ComfyUI
+# then dies inside torch itself ("cannot import name 'is_fake_tensor'"). pip's
+# own RECORD is the truth about what belongs there. Only .py files are hashed
+# and walked: they are what an import can trip over, and they are small.
+# A dist with no RECORD (conda, some system packages) cannot be judged and is
+# left out rather than called damaged.
+TORCH_HEALTH_PROBE = r"""
+import base64, csv, hashlib, importlib.util, io, json, os
+from importlib import metadata
+NAMES = ("torch", "torchvision", "torchaudio")
+dists, recorded, tops, missing, changed = {}, set(), set(), [], []
+root = ""
+spec = importlib.util.find_spec("torch")
+if spec is not None and spec.submodule_search_locations:
+    root = os.path.dirname(os.path.normpath(
+        list(spec.submodule_search_locations)[0]))
+for dist in metadata.distributions():
+    name = (dist.metadata["Name"] or "").lower()
+    if name not in NAMES:
+        continue
+    dists.setdefault(name, []).append(dist.version)
+    # RECORD itself, not dist.files: from Python 3.12 dist.files quietly
+    # leaves out files that are not on disk, which is the very thing asked.
+    record = dist.read_text("RECORD")
+    if not record:
+        continue
+    base = str(dist.locate_file(""))
+    for row in csv.reader(io.StringIO(record)):
+        if not row:
+            continue
+        rel, digest = row[0].replace("\\", "/"), (row[1:2] or [""])[0]
+        if rel.startswith("..") or ".dist-info/" in rel or "/" not in rel:
+            continue
+        full = os.path.join(base, rel)
+        recorded.add(os.path.normcase(os.path.normpath(full)))
+        top = rel.split("/", 1)[0]
+        if top == "functorch" or top.startswith("torch"):
+            tops.add(os.path.join(base, top))
+        if not rel.endswith(".py"):
+            continue
+        if not os.path.exists(full):
+            missing.append(rel)
+        elif digest.startswith("sha256="):
+            with open(full, "rb") as fh:
+                got = base64.urlsafe_b64encode(
+                    hashlib.sha256(fh.read()).digest()).rstrip(b"=").decode()
+            if got != digest[len("sha256="):]:
+                changed.append(rel)
+stray = []
+for top in sorted(tops):
+    for here, subdirs, names in os.walk(top):
+        subdirs[:] = [d for d in subdirs if d != "__pycache__"]
+        for n in names:
+            full = os.path.join(here, n)
+            if n.endswith(".py") and os.path.normcase(
+                    os.path.normpath(full)) not in recorded:
+                stray.append(os.path.relpath(
+                    full, os.path.dirname(top)).replace(os.sep, "/"))
+print(json.dumps({"root": root, "dists": dists,
+                  "tops": sorted(os.path.basename(t) for t in tops),
+                  "orphan": bool(root) and "torch" not in dists,
+                  "stray": stray[:3], "stray_count": len(stray),
+                  "missing": missing[:3], "missing_count": len(missing),
+                  "changed": changed[:3], "changed_count": len(changed)}))
+"""
+
+
+def torch_damage(python: str) -> dict:
+    """What the probe above found, or {} when it could not ask.
+
+    A question that cannot be put is not an answer: an interpreter that will
+    not run, or a probe that times out, reads as healthy here and is left to
+    the checks that can speak to it.
+    """
+    try:
+        out = _run([str(python), "-c", TORCH_HEALTH_PROBE], timeout=180)
+    except Exception:  # noqa: BLE001
+        return {}
+    if out.returncode != 0:
+        return {}
+    try:
+        found = json.loads((out.stdout or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {}
+    return found if isinstance(found, dict) else {}
+
+
+def torch_damage_summary(found: dict) -> str:
+    """The damage in words, or "" when there is none."""
+    if not found:
+        return ""
+
+    def some(key: str) -> str:
+        names = found.get(key) or []
+        more = found.get(f"{key}_count", 0) > len(names)
+        return ", ".join(names) + (", …" if more else "")
+
+    parts = []
+    for name, versions in (found.get("dists") or {}).items():
+        if len(versions) > 1:
+            parts.append(f"two versions of {name} are installed over each "
+                         f"other ({' and '.join(versions)})")
+    if found.get("orphan"):
+        parts.append("its files are there but pip has no record of "
+                     "installing them")
+    n = found.get("stray_count", 0)
+    if n:
+        parts.append(f"{n} file{'s' if n != 1 else ''} from another version "
+                     f"{'are' if n != 1 else 'is'} mixed in ({some('stray')})")
+    n = found.get("missing_count", 0)
+    if n:
+        parts.append(f"{n} of its files {'are' if n != 1 else 'is'} missing "
+                     f"({some('missing')})")
+    n = found.get("changed_count", 0)
+    if n:
+        parts.append(f"{n} of its files {'are' if n != 1 else 'is'} not the "
+                     f"one{'s' if n != 1 else ''} that "
+                     f"{'were' if n != 1 else 'was'} installed "
+                     f"({some('changed')})")
+    return "; ".join(parts)
+
+
+def _torch_dist_count(python: str) -> int:
+    try:
+        out = _run([str(python), "-c",
+                    "from importlib import metadata as m;print(sum(1 for d in "
+                    "m.distributions() if (d.metadata['Name'] or '').lower() "
+                    "in ('torch','torchvision','torchaudio')))"], timeout=60)
+        return int((out.stdout or "0").strip().splitlines()[-1])
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def remove_torch(python: str, what: str, log, on_detail=None) -> None:
+    """Take torch, torchvision and torchaudio out completely, leftovers too.
+
+    `pip uninstall` removes what its RECORD lists, once per install — so two
+    versions installed over each other need it twice, and the files an
+    interrupted install left behind are in no RECORD at all. Those are the
+    ones that break an import, so after pip is done, whatever is still in the
+    torch folders goes as well. Only folders named for torch, in the one
+    directory the interpreter itself loads torch from.
+    """
+    found = torch_damage(python)
+    root = Path(found["root"]) if found.get("root") else None
+    tops = {t for t in (found.get("tops") or [])
+            if t == "functorch" or t.startswith("torch")}
+    tops |= {"torch", "torchgen", "functorch", "torchvision", "torchaudio"}
+    if on_detail:
+        # pip prints nothing while it deletes thousands of files, which on
+        # Windows is a minute or more — say what that silence is.
+        on_detail(f"Removing {what} first…", None)
+    why = ""
+    for _ in range(3):
+        try:
+            res = _run([str(python), "-m", "pip", "uninstall", "-y",
+                        "torch", "torchaudio", "torchvision"], timeout=900)
+            if res.returncode != 0:
+                why = ((res.stderr or "") + (res.stdout or "")).strip()[-300:]
+        except Exception as exc:  # noqa: BLE001
+            why = str(exc)
+        if why or not _torch_dist_count(python):
+            break
+    if not why and root and root.is_dir():
+        for name in sorted(tops):
+            for path in [root / name] + [
+                    p for p in root.glob(f"{name}-*.dist-info")]:
+                if not path.is_dir():
+                    continue
+                log(f"Removing what pip left behind: {path}")
+                try:
+                    shutil.rmtree(path)
+                except OSError as exc:
+                    why = str(exc)
+                    break
+    if why:
+        raise RuntimeError(
+            f"Could not remove {what} ({why}). On Windows that is almost "
+            "always a program still using this environment — a ComfyUI "
+            "started from it. Close it, then try again.")
+
+
+def _refuse_without_replacement(python: str, index: str, what: str,
+                                on_detail=None) -> None:
+    """Raise, removing nothing, when `index` has no torch for this Python."""
+    if not index:
+        return
+    if on_detail:
+        on_detail(f"Checking {index} has PyTorch for this Python…", None)
+    lacking = index_lacks_torch(python, index)
+    if lacking:
+        raise RuntimeError(
+            f"{index} has no PyTorch this environment's Python can install "
+            f"({lacking}), so {what} was left in place rather than removed "
+            "with nothing to replace it. If the machine is offline, try again "
+            "once it is not; otherwise pick another build in the PyTorch "
+            "picker.")
+
+
 def drop_mismatched_torch(python: str, index: str, log,
                           on_detail=None) -> bool:
     """Remove a torch whose build is not the one being asked for.
@@ -1819,36 +2086,10 @@ def drop_mismatched_torch(python: str, index: str, log,
     log(f"Installed torch is {have['version']} (the {torch_kind(have)} "
         f"build), but the {wanted} build was asked for — removing it first, "
         "because pip counts the old one as good enough.")
-    if on_detail:
-        on_detail(f"Checking {index} has a {wanted} build for this Python…",
-                  None)
-    lacking = index_lacks_torch(python, index)
-    if lacking:
-        raise RuntimeError(
-            f"{index} has no PyTorch this environment's Python can install "
-            f"({lacking}), so torch {have['version']} was left in place "
-            "rather than removed with nothing to replace it. If the machine "
-            "is offline, try again once it is not; otherwise pick another "
-            "build in the PyTorch picker.")
-    if on_detail:
-        # pip prints nothing while it deletes thousands of files, which on
-        # Windows is a minute or more — say what that silence is.
-        on_detail(f"Removing torch {have['version']} (the "
-                  f"{torch_kind(have)} build) first…", None)
-    why = ""
-    try:
-        res = _run([str(python), "-m", "pip", "uninstall", "-y",
-                    "torch", "torchaudio", "torchvision"], timeout=900)
-        if res.returncode != 0:
-            why = ((res.stderr or "") + (res.stdout or "")).strip()[-300:]
-    except Exception as exc:  # noqa: BLE001
-        why = str(exc)
-    if why:
-        raise RuntimeError(
-            f"Could not remove torch {have['version']} to make room for the "
-            f"{wanted} build ({why}). On Windows that is almost always a "
-            "program still using this environment — a ComfyUI started from it. "
-            "Close it, then try again.")
+    _refuse_without_replacement(python, index, f"torch {have['version']}",
+                                on_detail)
+    remove_torch(python, f"torch {have['version']} (the "
+                         f"{torch_kind(have)} build)", log, on_detail)
     return True
 
 
@@ -1865,11 +2106,25 @@ def install_requested_torch(python: str, cfg: dict, log, on_detail=None) -> None
     And it checks that it did. "PyTorch installed" over a build pip left
     alone is the report that sent someone to restart an engine that could
     only ever stop as it started.
+
+    A torch of the right build can still be damaged — files of two versions
+    mixed by an install that was cut off — and pip calls that satisfied too,
+    so Reinstall did nothing to it at all. Damage is read first, and a
+    damaged torch goes out completely before it goes back in.
     """
     index = torch_index(cfg)
     gpu = nvidia_gpu()
     log(f"Graphics: {gpu['name'] or 'no NVIDIA GPU found'}")
-    drop_mismatched_torch(python, index, log, on_detail)
+    if not drop_mismatched_torch(python, index, log, on_detail):
+        damage = torch_damage_summary(torch_damage(python))
+        if damage:
+            have = installed_torch(python)
+            what = f"torch {have['version']}" if have else "torch"
+            log(f"{what} is damaged — {damage}. Taking it out completely "
+                "before installing it again.")
+            _refuse_without_replacement(python, index, f"the damaged {what}",
+                                        on_detail)
+            remove_torch(python, f"the damaged {what}", log, on_detail)
     # torchvision rides along: ComfyUI's requirements name it, the drop above
     # takes it out with the other two, and it has to come back from the same
     # index as the torch it is built against.
@@ -1884,6 +2139,10 @@ def install_requested_torch(python: str, cfg: dict, log, on_detail=None) -> None
             f"torch {have['version']} (the {torch_kind(have)} build) is still "
             f"the one installed after asking for the {wanted} build — see the "
             "log for what pip said.")
+    damage = torch_damage_summary(torch_damage(python))
+    if damage:
+        raise RuntimeError(f"PyTorch went in, but it is still damaged — "
+                           f"{damage}. See the log for what pip said.")
     if have:
         log(f"PyTorch is torch {have['version']} (the {torch_kind(have)} "
             "build).")
@@ -1906,7 +2165,19 @@ def torch_launch(python: str, cfg: dict, engine: str = "") \
 
     A torch that cannot be read is left to ComfyUI: its own error says more
     than a guess from here would.
+
+    A damaged torch is refused on every platform: files of two versions mixed
+    together read as the right build to every other check here, and ComfyUI
+    then dies inside torch itself.
     """
+    label = ENGINES[engine]["label"] if engine in ENGINES else "This engine"
+    damage = torch_damage_summary(torch_damage(python))
+    if damage:
+        return [], (f"{label}'s PyTorch is damaged — {damage}. That is what an "
+                    "install cut off partway leaves behind, and ComfyUI stops "
+                    f"as it starts on it. Press Reinstall on PyTorch · {label} "
+                    "on the Engine page: it takes torch out completely and "
+                    "puts it back.")
     if platform.system() == "Darwin":
         return [], ""
     info = installed_torch(python)
@@ -1914,8 +2185,6 @@ def torch_launch(python: str, cfg: dict, engine: str = "") \
         return [], ""
     gpu = nvidia_gpu()
     if gpu["name"] and build_kind(torch_build(torch_index(cfg))) == "cuda":
-        label = ENGINES[engine]["label"] if engine in ENGINES \
-            else "This engine"
         return [], (f"{label}'s PyTorch is the CPU-only build (torch "
                     f"{info['version']}), and ComfyUI stops as it starts on "
                     f"it — that build cannot use the {gpu['name']}. Press "
@@ -2201,7 +2470,9 @@ def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
                               "is slow…")
         proc.start(slot["python"], Path(slot["comfy_dir"]), comfy_port(url),
                    prog, cfg=cfg, engine=engine)
-        if not wait_for_comfy(url, timeout=900):
+        if not wait_for_comfy(url, timeout=900, alive=proc.alive):
+            if proc.crashed():
+                raise RuntimeError(crash_reason(proc.tail(120), engine))
             raise RuntimeError(f"{label}'s ComfyUI did not start within 15 "
                                "minutes.\n" + "\n".join(proc.tail(25)))
 

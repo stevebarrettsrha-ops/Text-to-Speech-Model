@@ -220,20 +220,27 @@ def activate(engine: str, prog=None, wait: bool = True) -> str:
     VRAM until something in *its* process frees it, so two live engines on an
     8 GB card means the second one fails to allocate.
     """
+    def stop_others() -> None:
+        if cfg.get("run_both_engines"):
+            return
+        for other, proc in PROCS.items():
+            if other != engine and proc.alive():
+                (prog or progress).log(
+                    f"Stopping {bootstrap.ENGINES[other]['label']} so "
+                    f"{bootstrap.ENGINES[engine]['label']} has the card "
+                    "to itself.")
+                proc.stop()
+
     with engine_lock:
-        if not cfg.get("run_both_engines"):
-            for other, proc in PROCS.items():
-                if other != engine and proc.alive():
-                    (prog or progress).log(
-                        f"Stopping {bootstrap.ENGINES[other]['label']} so "
-                        f"{bootstrap.ENGINES[engine]['label']} has the card "
-                        "to itself.")
-                    proc.stop()
         url = bootstrap.engine_url(cfg, engine)
         if comfy_online(url):
+            stop_others()
             return ""
         slot = bootstrap.engine_cfg(cfg, engine)
         py = bootstrap.comfy_python(cfg, engine)
+        # Everything that can refuse is asked before the other engine is
+        # stopped: switching to an engine that cannot start used to take the
+        # working one down with it and leave nothing running at all.
         if started_elsewhere(slot):
             return (f"{bootstrap.ENGINES[engine]['label']}'s ComfyUI is not "
                     f"answering at {url}. Start it, or change the address in "
@@ -245,13 +252,20 @@ def activate(engine: str, prog=None, wait: bool = True) -> str:
             return (f"{bootstrap.ENGINES[engine]['label']}'s ComfyUI is not "
                     f"running at {url}, and Script Builder is set not to "
                     "start it.")
+        flags, refusal = bootstrap.torch_launch(py, cfg, engine)
+        if refusal:
+            return refusal
+        stop_others()
         try:
             PROCS[engine].start(py, Path(slot["comfy_dir"]),
                                 comfy_port(url), prog or progress,
-                                cfg=cfg, engine=engine)
+                                cfg=cfg, engine=engine, extra=flags)
         except RuntimeError as exc:
             return str(exc)
-        if wait and not bootstrap.wait_for_comfy(url, timeout=900):
+        if wait and not bootstrap.wait_for_comfy(
+                url, timeout=900, alive=PROCS[engine].alive):
+            if PROCS[engine].crashed():
+                return bootstrap.crash_reason(PROCS[engine].tail(120), engine)
             return (f"{bootstrap.ENGINES[engine]['label']}'s ComfyUI did not "
                     "come up.\n" + "\n".join(PROCS[engine].tail(20)))
         # Warming the schema cache is a nicety, not a precondition. With
@@ -599,8 +613,14 @@ def api_status():
                        models_dir=slot["models_dir"],
                        managed=slot["managed"],
                        auto_start_comfy=slot["auto_start"]),
+        # `stopped` is why an engine started here has exited on its own, in
+        # a sentence — the page shows it instead of "its last words are
+        # below" over a stack trace.
         "installs": {e: dict(bootstrap.engine_cfg(cfg, e),
                              running=PROCS[e].alive(),
+                             stopped=(bootstrap.crash_reason(
+                                 PROCS[e].tail(120), e)
+                                 if PROCS[e].crashed() else ""),
                              online=comfy_online(
                                  bootstrap.engine_cfg(cfg, e)["comfy_url"]))
                      for e in bootstrap.ENGINES},
@@ -880,7 +900,7 @@ def api_comfy_restart():
         return jsonify({"error": "Run setup first."}), 400
     # Asked before anything is stopped or taken over: an engine whose PyTorch
     # cannot start is not one to swap for the one answering now (rule 33a).
-    _, refusal = bootstrap.torch_launch(py, cfg, engine)
+    flags, refusal = bootstrap.torch_launch(py, cfg, engine)
     if refusal:
         return jsonify({"error": refusal}), 409
     url = slot["comfy_url"]
@@ -911,8 +931,12 @@ def api_comfy_restart():
                 time.sleep(1)
         task.set(detail="Starting ComfyUI — the first start is slow…")
         comfy_proc.start(py, Path(slot["comfy_dir"]), comfy_port(url),
-                         progress, cfg=cfg, engine=engine)
-        if not bootstrap.wait_for_comfy(url, timeout=900):
+                         progress, cfg=cfg, engine=engine, extra=flags)
+        if not bootstrap.wait_for_comfy(url, timeout=900,
+                                        alive=comfy_proc.alive):
+            if comfy_proc.crashed():
+                raise RuntimeError(bootstrap.crash_reason(
+                    comfy_proc.tail(120), engine))
             raise RuntimeError("ComfyUI did not come back.\n"
                                + "\n".join(comfy_proc.tail(25)))
         # force=True: the schema is cached for two minutes, and two minutes of
@@ -969,6 +993,9 @@ def api_comfy_log():
     return jsonify({"engine": engine,
                     "lines": PROCS[engine].tail(n),
                     "running": PROCS[engine].alive(),
+                    "stopped": (bootstrap.crash_reason(
+                        PROCS[engine].tail(120), engine)
+                        if PROCS[engine].crashed() else ""),
                     "online": comfy_online(bootstrap.engine_url(cfg, engine))})
 
 

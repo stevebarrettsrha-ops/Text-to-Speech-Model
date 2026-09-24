@@ -481,6 +481,37 @@ try {
        && labels2.models === 'Download the models'
        && labels2.foreign === 'Another ComfyUI is on that port',
      'the primary button names the actual blocker', JSON.stringify(labels2));
+  const whileStarting = await page.evaluate(() => {
+    engineStarting = true;
+    const label = blocker({ ready: false, setup_complete: true,
+                            comfy_online: false }).label;
+    engineStarting = false;
+    return label;
+  });
+  is(/^Starting .+…$/.test(whileStarting),
+     'and says the engine is starting while it is', whileStarting);
+
+  // Choosing an engine starts it. The picker used to change only which engine
+  // a take would ask for, and the chosen one sat offline until Read found it
+  // so. Faked here as offline, because both stand-ins are always up.
+  const asked = [];
+  const mossOffline = { ...(await app.api('/api/status?engine=moss')),
+                        engine: 'moss', comfy_online: false, ready: false,
+                        setup_complete: true, setup_running: false };
+  await page.route(u => u.pathname === '/api/status',
+                   r => r.fulfill({ json: mossOffline }));
+  await page.route(u => u.pathname === '/api/comfy/start', r => {
+    asked.push(new URL(r.request().url()).searchParams.get('engine'));
+    return r.fulfill({ json: { ok: true, already: true } });
+  });
+  await page.evaluate(() => setEngine('moss'));
+  await sleep(800);
+  is(asked.join() === 'moss', 'choosing an engine starts it', asked.join());
+  await page.unrouteAll({ behavior: 'ignoreErrors' });
+  await page.evaluate(() => setEngine('qwen'));
+  await sleep(1200);
+  is(asked.join() === 'moss',
+     'and choosing one that is already up starts nothing', asked.join());
 
   /* ------------------------------------------ a PyTorch that cannot start */
   // A CPU-only PyTorch beside an NVIDIA card read "warn", so Install
