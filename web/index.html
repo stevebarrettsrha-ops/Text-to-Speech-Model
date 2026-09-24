@@ -1567,7 +1567,9 @@ async function loadDeps(fresh) {
       // A warning on the engine row means something is answering that is not
       // ours, which is as blocking as a missing install and has to raise the
       // badge. Optional models warn too, and those are not a problem.
-      if (it.state === "missing"
+      // So does a row the server marks `repair`: a CPU-only PyTorch beside an
+      // NVIDIA card is an engine that stops as it starts, not a slow one.
+      if (it.state === "missing" || it.repair
           || (it.state === "warn" && it.id.indexOf("engine") === 0)) bad++;
       var el = document.createElement("div");
       el.className = "fitem";
@@ -1586,7 +1588,7 @@ async function loadDeps(fresh) {
         var label = it.action === "update" ? "Update"
           : it.action === "reinstall" ? "Reinstall" : "Install";
         var b = mkBtn(label, function () { installDep(it.id, b); });
-        if (it.state === "missing") b.className = "btn thin go";
+        if (it.state === "missing" || it.repair) b.className = "btn thin go";
         right.appendChild(b);
       }
       box.appendChild(el);
@@ -1652,7 +1654,8 @@ async function installAllMissing() {
   try {
     var d = await api("/api/deps");
     var missing = order.filter(function (id) {
-      return d.items.some(function (i) { return i.id === id && i.state === "missing"; });
+      return d.items.some(function (i) {
+        return i.id === id && (i.state === "missing" || i.repair); });
     });
     if (!missing.length) { toast("Nothing missing. Try Start ComfyUI."); return; }
     var labelOf = function (id) {
@@ -1876,6 +1879,7 @@ async function startEngine(ev) {
         $("task-title").textContent = label + " stopped while starting — its "
           + "last words are below.";
         toast(label + " stopped while starting — see the Activity log.", true);
+        offerRepair(engine);
         return;
       }
     }
@@ -1883,8 +1887,26 @@ async function startEngine(ev) {
       + "its console is below.";
     toast(label + " did not come up within five minutes — see the Activity "
           + "log.", true);
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    $("task-title").textContent = e.message;
+    toast(e.message, true);
+    offerRepair(engine);
+  }
   finally { engineStarting = false; b.done(); loadDeps(); }
+}
+/* A start refused over a CPU-only PyTorch names the Reinstall button; this
+   offers to press it. The dependency report decides — not the wording of the
+   error — so an engine that failed for any other reason is offered nothing. */
+async function offerRepair(engine) {
+  var d;
+  try { d = await api("/api/deps"); } catch (e) { return; }
+  var row = (d.items || []).filter(function (i) {
+    return i.id === "torch_" + engine && i.repair; })[0];
+  if (row && confirm(row.detail + "\n\nReinstall PyTorch now? It downloads "
+                     + "about 3 GB, and the engine can start once it is done.")) {
+    show("engine");
+    installDep(row.id);
+  }
 }
 var taskTimer = null;
 async function pollTasks() {

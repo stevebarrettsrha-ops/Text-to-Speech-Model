@@ -149,7 +149,7 @@ def _probe(python: str, code: str, timeout: int = 90) -> tuple[int, str]:
 # --------------------------------------------------------------------------- #
 # dependency report
 # --------------------------------------------------------------------------- #
-def no_cuda_reason(version: str) -> str:
+def no_cuda_reason(version: str, cpu_only: bool | None = None) -> str:
     """Why torch cannot see a GPU, in the words that fit this machine.
 
     "no GPU found" was reported to someone holding an RTX 4060, because all
@@ -157,9 +157,15 @@ def no_cuda_reason(version: str) -> str:
     usual cause is the build: a wheel tagged +cpu has no CUDA in it at all and
     never will, whatever hardware is underneath. Look at the machine before
     blaming it.
+
+    `cpu_only` is what torch itself says (torch.version.cuda is None), and
+    wins over the tag when given: PyPI's wheels carry no tag, so on Windows
+    the CPU build reads as a plain "2.14.0".
     """
     gpu = bootstrap.nvidia_gpu()
     build = version.split("+")[1] if "+" in version else ""
+    if cpu_only is None:
+        cpu_only = build == "cpu"
     # What the picker is set to now. Told to "pick the NVIDIA build above" by a
     # panel whose picker already reads "Automatic — NVIDIA GeForce RTX 4060
     # (CUDA build)", the only honest next move is the one button that is left,
@@ -167,7 +173,7 @@ def no_cuda_reason(version: str) -> str:
     fix = ("Press Reinstall." if bootstrap.torch_build(bootstrap.torch_index({}))
            .startswith("cu") else "Pick the NVIDIA build above and press "
                                   "Reinstall.")
-    if gpu["name"] and build == "cpu":
+    if gpu["name"] and cpu_only:
         return (f"torch {version} — this is the CPU-only build, but {gpu['name']} "
                 f"is here. {fix}")
     if gpu["name"] and not gpu["driver"]:
@@ -176,13 +182,14 @@ def no_cuda_reason(version: str) -> str:
     if gpu["name"]:
         return (f"torch {version} — {gpu['name']} is here but this build cannot "
                 f"use it. {fix}")
-    if build == "cpu":
+    if cpu_only:
         return (f"torch {version} — the CPU-only build, and no NVIDIA GPU was "
                 "found. Speech will be slow.")
     return f"torch {version} — no NVIDIA GPU found, speech will be slow."
 
 
-def _torch_row(py_comfy: str, suffix: str, label: str) -> dict:
+def _torch_row(py_comfy: str, suffix: str, label: str,
+               cfg: dict | None = None) -> dict:
     """PyTorch as this engine's own environment has it."""
     if not py_comfy:
         return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
@@ -194,6 +201,8 @@ def _torch_row(py_comfy: str, suffix: str, label: str) -> dict:
                        "import torch,json;"
                        "print(json.dumps({'v':torch.__version__,"
                        "'cuda':torch.cuda.is_available(),"
+                       "'built':torch.version.cuda,"
+                       "'hip':getattr(torch.version,'hip',None),"
                        "'dev':(torch.cuda.get_device_name(0) "
                        "if torch.cuda.is_available() else '')}))")
     if code != 0:
@@ -210,9 +219,19 @@ def _torch_row(py_comfy: str, suffix: str, label: str) -> dict:
         return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
                 "state": "ok", "detail": f"torch {d['v']} — GPU: {d['dev']}",
                 "action": "reinstall"}
-    return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
-            "state": "warn", "detail": no_cuda_reason(d["v"]),
-            "action": "reinstall"}
+    cpu_only = not d.get("built") and not d.get("hip")
+    row = {"id": "torch" + suffix, "label": f"PyTorch · {label}",
+           "state": "warn", "detail": no_cuda_reason(d["v"], cpu_only),
+           "action": "reinstall"}
+    # A CPU-only build where there is an NVIDIA card and the CUDA build is
+    # what the picker asks for is not a slow engine: it is one that stops as
+    # it starts, and bootstrap.torch_launch refuses to launch it. So it raises
+    # the Engine badge and Install everything missing repairs it, like a
+    # missing row — a "warn" alone left that button saying nothing was wrong.
+    if cpu_only and bootstrap.nvidia_gpu()["name"] and bootstrap.build_kind(
+            bootstrap.torch_build(bootstrap.torch_index(cfg or {}))) == "cuda":
+        row["repair"] = True
+    return row
 
 
 def same_install(comfy_dir: str, engine_root: str) -> bool:
@@ -344,7 +363,7 @@ def dependencies(cfg: dict, clients=None, engine: str = "") -> list[dict]:
 
         # Its own environment ---------------------------------------------- #
         py_comfy = comfy_python(cfg, eid)
-        items.append(_torch_row(py_comfy, suffix, label))
+        items.append(_torch_row(py_comfy, suffix, label, cfg))
 
         if py_comfy:
             code, out = _probe(py_comfy,
@@ -421,12 +440,23 @@ def dependencies(cfg: dict, clients=None, engine: str = "") -> list[dict]:
     return items
 
 
-def install_dependency(dep_id: str, cfg: dict, opts: dict) -> Task:
+# The installs that run pip in an engine's own environment.
+PIP_STEPS = ("node", "torch", "node_reqs")
+
+
+def install_dependency(dep_id: str, cfg: dict, opts: dict,
+                       stop_engine=None) -> Task:
     """Install one thing for one engine.
 
     Ids carry the engine — "torch_moss", "node_qwen" — because nothing below
     ComfyUI is shared any more. A bare id without a suffix is Qwen's, which is
     what a page written before the split would send.
+
+    `stop_engine(engine)` stops that engine's ComfyUI if this app is running
+    it, and says whether it did. Anything in PIP_STEPS calls it first: Windows
+    will not let pip replace a file a running ComfyUI has loaded — torch's
+    DLLs above all, which is exactly what a Reinstall has to replace — and the
+    engine has to restart to use new packages anyway.
     """
     base, _, eid = dep_id.rpartition("_")
     if eid not in ENGINES:
@@ -440,6 +470,9 @@ def install_dependency(dep_id: str, cfg: dict, opts: dict) -> Task:
     opts = dict(opts, engine=eid)
 
     def run(task: Task) -> None:
+        if base in PIP_STEPS and stop_engine and stop_engine(eid):
+            task.log(f"Stopped {label}'s ComfyUI first — its packages are "
+                     "about to change, and a running ComfyUI holds them open.")
         if base == "git":
             _install_git(task)
         elif base == "comfyui":

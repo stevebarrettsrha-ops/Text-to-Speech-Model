@@ -247,7 +247,8 @@ def activate(engine: str, prog=None, wait: bool = True) -> str:
                     "start it.")
         try:
             PROCS[engine].start(py, Path(slot["comfy_dir"]),
-                                comfy_port(url), prog or progress)
+                                comfy_port(url), prog or progress,
+                                cfg=cfg, engine=engine)
         except RuntimeError as exc:
             return str(exc)
         if wait and not bootstrap.wait_for_comfy(url, timeout=900):
@@ -832,6 +833,9 @@ def api_comfy_start():
                         "foreign": foreign_engine(engine)})
     why = activate(engine, wait=False)
     if why:
+        # In the engine's console too, where the page says "Offline" — the
+        # toast is gone in seconds and the reason is the one thing to keep.
+        _note(engine, f"Could not start it: {why}")
         return jsonify({"error": why}), 400
     _refresh_schema_when_up(engine)
     return jsonify({"ok": True})
@@ -874,6 +878,11 @@ def api_comfy_restart():
         # Same reason, one step earlier: taking a port from someone and having
         # no engine to start in its place is not a restart, it is a hole.
         return jsonify({"error": "Run setup first."}), 400
+    # Asked before anything is stopped or taken over: an engine whose PyTorch
+    # cannot start is not one to swap for the one answering now (rule 33a).
+    _, refusal = bootstrap.torch_launch(py, cfg, engine)
+    if refusal:
+        return jsonify({"error": refusal}), 409
     url = slot["comfy_url"]
     port = comfy_port(url)
 
@@ -902,7 +911,7 @@ def api_comfy_restart():
                 time.sleep(1)
         task.set(detail="Starting ComfyUI — the first start is slow…")
         comfy_proc.start(py, Path(slot["comfy_dir"]), comfy_port(url),
-                         progress)
+                         progress, cfg=cfg, engine=engine)
         if not bootstrap.wait_for_comfy(url, timeout=900):
             raise RuntimeError("ComfyUI did not come back.\n"
                                + "\n".join(comfy_proc.tail(25)))
@@ -1080,6 +1089,18 @@ def api_deps():
                     "torch_auto": bootstrap.torch_index({})})
 
 
+def _stop_for_install(engine: str) -> bool:
+    """Stop this engine's ComfyUI before pip changes what it has loaded."""
+    proc = PROCS.get(engine)
+    if not proc or not proc.alive():
+        return False
+    _note(engine, "Stopping this engine while its packages change — a running "
+                  "ComfyUI holds them open. Start it again once the install "
+                  "is done.")
+    proc.stop()
+    return True
+
+
 @app.post("/api/deps/<dep_id>/install")
 def api_dep_install(dep_id: str):
     body = request.get_json(silent=True) or {}
@@ -1088,7 +1109,9 @@ def api_dep_install(dep_id: str):
         save_config(cfg)
     try:
         return jsonify({"ok": True,
-                        "task": manager.install_dependency(dep_id, cfg, body).view()})
+                        "task": manager.install_dependency(
+                            dep_id, cfg, body,
+                            stop_engine=_stop_for_install).view()})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 400
 
@@ -1395,6 +1418,12 @@ def ensure_engine_at_boot() -> None:
                       + "; ".join(reasons) + ") but this app has no ComfyUI of "
                       "its own to put in its place — restart it yourself, or "
                       "press Restart ComfyUI.")
+        return
+    _, refusal = bootstrap.torch_launch(py, cfg, engine)
+    if refusal:
+        _note(engine, "The engine already running has problems ("
+                      + "; ".join(reasons) + "), but this app's own could not "
+                      "start in its place: " + refusal)
         return
     _note(engine, "The engine already running is no use as it stands — "
                   + "; ".join(reasons) + ". Replacing it.")

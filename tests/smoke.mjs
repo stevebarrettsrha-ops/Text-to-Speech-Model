@@ -482,6 +482,54 @@ try {
        && labels2.foreign === 'Another ComfyUI is on that port',
      'the primary button names the actual blocker', JSON.stringify(labels2));
 
+  /* ------------------------------------------ a PyTorch that cannot start */
+  // A CPU-only PyTorch beside an NVIDIA card read "warn", so Install
+  // everything missing said "Nothing missing" over an engine that stopped as
+  // it started, every time. The server marks that row `repair`; the page has
+  // to raise the badge for it and repair it with everything else. No machine
+  // here has the card, so the report is the one thing faked.
+  const realDeps = await app.api('/api/deps');
+  const repairDeps = { ...realDeps, items: realDeps.items.map(i =>
+    i.id === 'torch_qwen'
+      ? { ...i, state: 'warn', repair: true, action: 'reinstall',
+          detail: 'torch 2.14.0 — this is the CPU-only build, but NVIDIA '
+                + 'GeForce RTX 4060 is here. Press Reinstall.' }
+      : { ...i, state: 'ok' }) };
+  const repairsAsked = [];
+  await page.route(u => u.pathname === '/api/deps',
+                   r => r.fulfill({ json: repairDeps }));
+  await page.route(u => /^\/api\/deps\/[^/]+\/install$/.test(u.pathname), r => {
+    repairsAsked.push(new URL(r.request().url()).pathname);
+    return r.fulfill({ json: { ok: true, task: { id: 'fake-repair' } } });
+  });
+  await page.route(u => u.pathname === '/api/tasks'
+                        && u.searchParams.get('id') === 'fake-repair',
+                   r => r.fulfill({ json: {
+                     id: 'fake-repair', title: 'Install PyTorch for Qwen3-TTS',
+                     state: 'done', detail: 'PyTorch installed.', pct: 100,
+                     lines: [], cursor: 0 } }));
+  await page.evaluate(() => loadDeps());
+  await sleep(400);
+  is(await page.$eval('#engineTag', e => !e.hidden),
+     'a PyTorch that cannot start raises the Engine badge');
+  const repairBtn = await page.$$eval('#dep-list .fitem', rows => {
+    const row = rows.find(x => x.textContent.includes('PyTorch · Qwen3-TTS'));
+    const btn = row && row.querySelector('button');
+    return btn ? { label: btn.textContent.trim(),
+                   go: btn.classList.contains('go') } : null;
+  });
+  is(repairBtn && repairBtn.label === 'Reinstall' && repairBtn.go,
+     'and its Reinstall is the button that stands out', JSON.stringify(repairBtn));
+  await page.click('#btnInstallAll');
+  await page.waitForFunction(() => !S.taskId
+    && !document.getElementById('btnInstallAll').disabled, null,
+    { timeout: 15000 });
+  is(repairsAsked.join() === '/api/deps/torch_qwen/install',
+     'and Install everything missing repairs it', repairsAsked.join(', '));
+  await page.unrouteAll({ behavior: 'ignoreErrors' });
+  await page.evaluate(() => loadDeps());
+  await sleep(400);
+
   /* ------------------------------------------------- whose ComfyUI is this */
   // 8188 is the port every ComfyUI picks by default, so the one answering is
   // quite often somebody else's — and that looks exactly like nodes that will
