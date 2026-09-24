@@ -63,6 +63,33 @@ MOSS_DEFAULT_MODEL = "OpenMOSS-Team/MOSS-TTS-Local-Transformer"
 MOSS_VOICE_GENERATOR = "OpenMOSS-Team/MOSS-VoiceGenerator"
 MOSS_CODEC = "OpenMOSS-Team/MOSS-Audio-Tokenizer"
 
+# What OpenMOSS tuned each checkpoint to sample with: the node's own
+# utils/constants.py DEFAULT_PARAMS — keep it in step with that file, as
+# MOSS_MODEL_REPOS is. The node publishes the table and never applies it:
+# every MossTTSGenerate input defaults to the Delay 8B's numbers whatever the
+# loader holds, so leaving them to the schema ran the Local 1.7B — the model
+# this app loads by default — with no repetition penalty and half its top_k,
+# the settings the node's own README says to change for that model. None of
+# this reaches /object_info, which is why it is written down here at all.
+MOSS_SAMPLING = {
+    "OpenMOSS-Team/MOSS-TTS": {
+        "temperature": 1.7, "top_p": 0.8, "top_k": 25,
+        "repetition_penalty": 1.0},
+    "OpenMOSS-Team/MOSS-TTS-Local-Transformer": {
+        "temperature": 1.0, "top_p": 0.95, "top_k": 50,
+        "repetition_penalty": 1.1},
+    "OpenMOSS-Team/MOSS-VoiceGenerator": {
+        "temperature": 1.5, "top_p": 0.6, "top_k": 50,
+        "repetition_penalty": 1.1},
+}
+
+# Where the page's Expressiveness slider rests — Qwen's own default
+# temperature. On MOSS it scales the model's tuned temperature rather than
+# replacing it: 0.9 means "as OpenMOSS tuned it", which for the 8B is 1.7 and
+# for VoiceGenerator 1.5, so passing 0.9 through unchanged cooled every MOSS
+# model below the range it was trained for.
+NEUTRAL_TEMPERATURE = 0.9
+
 FALLBACK_SPEAKERS = ["Aiden", "Eric", "Serena"]
 
 
@@ -416,11 +443,8 @@ class ComfyClient:
             "seed": {"names": ["seed", "noise_seed"],
                      "value": random.randint(0, 2 ** 31 - 1)},
         }
-        if opts.get("temperature") is not None:
-            wanted["temperature"] = {"names": ["temperature"],
-                                     "value": float(opts["temperature"])}
-        if opts.get("top_p") is not None:
-            wanted["top_p"] = {"names": ["top_p"], "value": float(opts["top_p"])}
+        for name, value in moss_sampling(repo, opts).items():
+            wanted[name] = {"names": [name], "value": value}
         if opts.get("language"):
             wanted["language"] = {"names": ["language"],
                                   "value": opts["language"]}
@@ -499,12 +523,22 @@ class ComfyClient:
             g["1"] = self._node("LoadAudio",
                                 {"audio": {"names": ["audio"], "value": ref,
                                            "required": True}})
+            ref_text = (voice.get("ref_text") or "").strip()
             wanted = dict(common)
             wanted.update({
                 "ref_audio": {"names": ["ref_audio", "reference_audio"],
                               "value": ["1", 0], "required": True},
                 "ref_text": {"names": ["ref_text", "reference_text"],
-                             "value": voice.get("ref_text", "")},
+                             "value": ref_text},
+                # Without a transcript the node's default mode refuses the
+                # line outright — "ref_text is required when
+                # x_vector_only_mode=False (ICL mode)" — and the page calls the
+                # transcript optional. The speaker embedding alone still copies
+                # the voice, less closely, so that is what an empty box asks
+                # for.
+                "x_vector_only": {"names": ["x_vector_only",
+                                            "x_vector_only_mode"],
+                                  "value": not ref_text},
                 "text": {"names": ["target_text", "text"], "value": text,
                          "required": True},
             })
@@ -618,6 +652,22 @@ class ComfyClient:
         name = data.get("name") or file_storage.filename
         sub = data.get("subfolder") or ""
         return f"{sub}/{name}" if sub else name
+
+
+def moss_sampling(repo: str, opts: dict) -> dict:
+    """temperature, top_p, top_k and repetition_penalty for one MOSS line.
+
+    The checkpoint's own tuning, with the Expressiveness slider as a scale on
+    its temperature. A repo the table does not know gets the default model's
+    numbers, which are the conservative ones.
+    """
+    tuned = dict(MOSS_SAMPLING.get(repo) or MOSS_SAMPLING[MOSS_DEFAULT_MODEL])
+    if opts.get("temperature") is not None:
+        scale = float(opts["temperature"]) / NEUTRAL_TEMPERATURE
+        tuned["temperature"] = round(tuned["temperature"] * scale, 3)
+    if opts.get("top_p") is not None:
+        tuned["top_p"] = float(opts["top_p"])
+    return tuned
 
 
 def _readable(err: dict) -> str:

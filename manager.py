@@ -6,7 +6,7 @@ ComfyUI's packages, the node's own packages (transformers in particular), the
 model folders and the running engine — and install any of them on request.
 
 HuggingFace: browse a repo, pull a whole model folder into
-ComfyUI/models/qwen-tts/Qwen/, show progress, cancel, delete. Repo, token and
+ComfyUI/models/qwen-tts/<Name>/, show progress, cancel, delete. Repo, token and
 mirror are all set from the page; nothing here needs a terminal.
 """
 
@@ -893,7 +893,7 @@ def hf_download_repo(cfg: dict, repo: str) -> Task:
 def _folder_row(repo: str, engine: str, folder: Path) -> dict:
     size = sum(f.stat().st_size for f in folder.rglob("*") if f.is_file())
     return {"repo": repo, "engine": engine, "size": size,
-            "partial": any(f.suffix == ".part" for f in folder.rglob("*")),
+            "partial": bootstrap.partial_download(folder),
             "path": str(folder)}
 
 
@@ -901,10 +901,10 @@ def local_models(cfg: dict) -> list[dict]:
     """Every model folder on disk, each engine read in its own install.
 
     Two things differ per engine and both matter: where the folder lives —
-    each ComfyUI has its own models directory now — and its shape. Qwen nests
-    <Org>/<Name>, MOSS flattens to <Org>--<Name>. Walking one shape over the
-    other lists nothing, which is how a downloaded MOSS folder would read as
-    never downloaded.
+    each ComfyUI has its own models directory now — and its name. Qwen keeps
+    <Name> alone, MOSS flattens to <Org>--<Name>. Reading one shape as the
+    other gets every repo id wrong, which is how a downloaded model would read
+    as never downloaded.
     """
     out: list[dict] = []
     for eid, eng in ENGINES.items():
@@ -914,15 +914,22 @@ def local_models(cfg: dict) -> list[dict]:
         root = base / eng["subdir"]
         if not root.is_dir():
             continue
-        if eng["layout"] == "flat":
-            for folder in sorted(p for p in root.iterdir() if p.is_dir()):
-                out.append(_folder_row(folder.name.replace("--", "/", 1), eid,
-                                       folder))
-        else:
-            for org in sorted(p for p in root.iterdir() if p.is_dir()):
-                for folder in sorted(p for p in org.iterdir() if p.is_dir()):
-                    out.append(_folder_row(f"{org.name}/{folder.name}", eid,
-                                           folder))
+        # A Qwen folder name has lost its org, so the table puts it back. One
+        # the table does not know is given Qwen's, which is enough for
+        # delete_model to find the same folder again. An org folder left over
+        # from the old <Org>/<Name> shape is not itself a model.
+        known = {m["repo"].split("/", 1)[1]: m["repo"] for m in eng["models"]}
+        orgs = {m["repo"].split("/", 1)[0] for m in eng["models"]}
+        for folder in sorted(p for p in root.iterdir() if p.is_dir()):
+            name = folder.name
+            if name.startswith(".") or name in bootstrap.QWEN_RESERVED \
+                    or name in orgs:
+                continue
+            if eng["layout"] == "org--name":
+                repo = name.replace("--", "/", 1)
+            else:
+                repo = known.get(name) or f"Qwen/{name}"
+            out.append(_folder_row(repo, eid, folder))
     return out
 
 
@@ -937,6 +944,12 @@ def delete_model(cfg: dict, repo: str) -> None:
     target = bootstrap.model_dir(base, repo, engine).resolve()
     if not str(target).startswith(str(root)):
         raise RuntimeError("That path is outside the models folder.")
+    # A model is a folder *inside* the root. With no org folder in the way,
+    # "Qwen/" would name the root itself, and "Qwen/voices" the node's own
+    # saved voices.
+    if target == root or target.parent != root \
+            or target.name in bootstrap.QWEN_RESERVED:
+        raise RuntimeError("That is not a model folder.")
     if not target.is_dir():
         raise RuntimeError("That folder is already gone.")
     shutil.rmtree(target)

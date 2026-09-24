@@ -226,13 +226,29 @@
    themselves, and every model entry `wanted_models` returns carries its own
    `engine` because the caller downloading it has to know which layout to use.
 20. **The two engines do not agree on where a model folder goes, and neither
-   layout is a preference.** Qwen nests `models/qwen-tts/<Org>/<Name>`, which
-   is where its node searches. MOSS flattens to `models/moss-tts/<Org>--<Name>`,
-   because its loader builds that path from `repo_id.replace("/", "--")`. Put a
-   MOSS folder in the Qwen shape and the node does not see it — it downloads a
-   second copy of a model already on disk. Same trap in reverse in
-   `local_models`: walking the nested shape over a flat folder lists nothing,
-   so a downloaded MOSS model reads as never downloaded.
+   layout is a preference.** Qwen keeps `models/qwen-tts/<Name>` with no org
+   folder: `load_qwen_model` lists `models/qwen-tts` one level deep for a
+   folder whose name holds the size and the kind, and
+   `download_model_if_needed` builds `<qwen_root>/<repo.split("/")[-1]>`. MOSS
+   flattens to `models/moss-tts/<Org>--<Name>`, because its loader builds that
+   path from `repo_id.replace("/", "--")`. Put a folder in any other shape and
+   the node does not see it — it downloads a second copy of a model already
+   on disk, and offline the line fails. Same trap in `local_models`: the Qwen
+   folder name has lost its org, so the table puts it back, and `voices/` (the
+   node's saved voices) is not a model.
+20b. **The Qwen layout came from the node's README, and the README is wrong.**
+   It draws `models/qwen-tts/Qwen/<Name>`; the code has never looked there.
+   This app downloaded into that shape from its first version, nothing it could see
+   failed, and every first take quietly fetched its model a second time — or,
+   offline, failed with the weights sitting one folder over. Rule 25's lesson,
+   a second time: read the node's code, and `TheQwenNodeFindsWhatWeDownload`
+   replays its search against what `model_dir` returns. `migrate_qwen_layout`
+   moves the old folders into place at launch and before setup counts what is
+   missing. When the node has already fetched its own copy, ours is gigabytes
+   nothing can reach and it goes; when the node's copy was cut off — it loads
+   from any folder that exists, whole or not — the whole one takes its place.
+   That is also why `model_installed` treats huggingface_hub's `.incomplete`
+   like our own `.part`.
 21. **MOSS is two nodes, and `local_model_path` is only ever a folder that is
    really there.** `MossTTSModelLoader` holds the weights and hands a
    `MOSS_TTS_PIPE` to `MossTTSGenerate` or `MossTTSVoiceDesign`. Its
@@ -253,6 +269,26 @@
    entry means that model is read off the node by substring
    (`MOSS_VARIANT_HINTS`), because the repo id each display name maps to lives
    in the node's constants and never reaches `/object_info`.
+23b. **MOSS lines sample the way OpenMOSS tuned the checkpoint, never at the
+   schema defaults.** Every `MossTTSGenerate` input defaults to the Delay 8B's
+   numbers (temperature 1.7, top_p 0.8, top_k 25, repetition_penalty 1.0)
+   whatever the loader holds, and the node's own `DEFAULT_PARAMS` table is
+   published and never applied. Left to them, the Local 1.7B — the default
+   model — ran with no repetition penalty and half its top_k, which the
+   node's README says to change for that model. `MOSS_SAMPLING` is that table, kept in step
+   with the node's `utils/constants.py` like `MOSS_MODEL_REPOS`. The
+   Expressiveness slider rests at 0.9, Qwen's temperature, so on MOSS it
+   scales the model's own temperature by `value / 0.9` rather than replacing
+   it: passed through as it was, it cooled the 8B from 1.7 and VoiceGenerator
+   from 1.5.
+23c. **A Qwen clone with no transcript asks for `x_vector_only`.** The node's
+   default mode is ICL, which raises "ref_text is required when
+   x_vector_only_mode=False" — and the page never marked the box required.
+   The speaker embedding alone still copies the voice, less closely, and the
+   page says so under the box. `tests/mock_comfy.py` raises the same message
+   at run time, because ComfyUI's validation passes the graph and only the
+   node objects.
+
 24. **Readiness is per engine.** With MOSS selected, a missing Qwen folder is
    not what stands between the script and a take; reporting it as one sends
    people to download a model they are not about to use. `/api/status` takes an
@@ -418,7 +454,7 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 176 unit tests, standard library only
+npm run test:units       # 196 unit tests, standard library only
 npm test                 # 93 checks driving the real page in headless Chromium
 ```
 
@@ -495,7 +531,7 @@ same way `MODEL_REPOS` tracks the Qwen node's `HF_MODEL_MAP`.
 
 Models: `Qwen/Qwen3-TTS-12Hz-0.6B-Base` and `Qwen/Qwen3-TTS-Tokenizer-12Hz` are
 required; the 1.7B Base and 1.7B VoiceDesign folders are optional. They live in
-`ComfyUI/models/qwen-tts/Qwen/<name>/`, which is where the node searches. The
+`ComfyUI/models/qwen-tts/<name>/`, which is where the node searches (rule 20). The
 repo names in `MODEL_REPOS` are the ones in the node's own `HF_MODEL_MAP` — keep
 them in step with it, not with the node's README, which lists fewer.
 

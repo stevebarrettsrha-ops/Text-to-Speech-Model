@@ -1069,7 +1069,10 @@ function renderSpeakerBody(n) {
       '<label class="flab" style="margin-top:9px">What is said in the clip</label>' +
       '<input type="text" data-reftext="' + n + '" value="' + esc(s.ref_text) +
       '" placeholder="Type the words spoken in the clip">' +
-      '<div class="note">Matching this text to the clip makes a large difference.</div>';
+      '<div class="note">' + (isMoss()
+        ? "MOSS clones from the sound alone and does not use this."
+        : "Matching this text to the clip makes a large difference. Left empty, " +
+          "the voice is copied from its sound alone — less closely.") + "</div>";
     body.querySelector("[data-pick]").addEventListener("click", function () {
       body.querySelector("[data-file]").click(); });
     body.querySelector("[data-file]").addEventListener("change", function (e) {
@@ -1958,7 +1961,7 @@ async function loadHf() {
     // than someone moving a MOSS folder into the Qwen tree and wondering why
     // the node downloads it again.
     $("models-dir-note").textContent = (s.models_dir
-      ? "Stored in " + s.models_dir + "/qwen-tts/Qwen/ and " +
+      ? "Stored in " + s.models_dir + "/qwen-tts/ and " +
         s.models_dir + "/moss-tts/"
       : "No models folder set yet — run setup first.") +
       (s.vram_mb ? "  ·  " + (s.gpu_name || "This card") + " has " +

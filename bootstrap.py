@@ -8,7 +8,7 @@ Steps, in order:
      requirements with the interpreter that ComfyUI itself runs on — the
      portable python_embeded when that is what is there, otherwise the venv.
   4. Download the Qwen3-TTS model folders from HuggingFace into
-     ComfyUI/models/qwen-tts/Qwen/.
+     ComfyUI/models/qwen-tts/<Name>/.
   5. Start ComfyUI headless and wait for /system_stats.
 
 Everything long runs on a worker thread and reports into a Progress object the
@@ -85,7 +85,7 @@ def comfy_port(url: str) -> int:
     return port or 8188
 
 # The Qwen3-TTS collection on HuggingFace. The custom node looks for these
-# under ComfyUI/models/qwen-tts/Qwen/<folder>.
+# under ComfyUI/models/qwen-tts/<folder> — one level, no org folder.
 #
 # Which checkpoint serves which node: the CustomVoice weights carry the preset
 # speakers, the Base weights do zero-shot cloning, VoiceDesign builds a voice
@@ -192,10 +192,11 @@ MOSS_SUBDIR = Path("moss-tts")
 # Everything that differs between the two engines, in one place, so adding a
 # third is a table entry rather than a hunt through four files.
 #
-# `layout` is the part that bites: the Qwen node searches
-# models/qwen-tts/<Org>/<Name>, while the MOSS loader builds its cache path as
-# repo_id.replace("/", "--") under models/moss-tts. Put a MOSS folder in the
-# Qwen shape and the node silently ignores it and downloads its own copy.
+# `layout` is the part that bites: the Qwen node lists models/qwen-tts one
+# level deep and downloads into models/qwen-tts/<Name>, while the MOSS loader
+# builds its cache path as repo_id.replace("/", "--") under models/moss-tts.
+# Put a folder anywhere else and that node silently ignores it and downloads
+# its own copy — or, offline, fails the line.
 ENGINES = {
     "qwen": {
         "id": "qwen",
@@ -206,7 +207,7 @@ ENGINES = {
         "dir_name": "ComfyUI-Qwen3-TTS",
         "port": 8188,
         "subdir": QWEN_SUBDIR,
-        "layout": "org",
+        "layout": "name",
         "models": MODEL_REPOS,
         # A substring every entry of a healthy model list carries, for
         # `stale_engine`. Qwen has none on purpose: its node publishes
@@ -227,7 +228,7 @@ ENGINES = {
         "dir_name": "ComfyUI-MOSS-TTS",
         "port": 8189,
         "subdir": MOSS_SUBDIR,
-        "layout": "flat",
+        "layout": "org--name",
         "models": MOSS_MODEL_REPOS,
         # MossTTSModelLoader.model_variant is the one enum either node pack
         # publishes that names checkpoints, and every entry of it is a MOSS
@@ -619,21 +620,37 @@ def model_dir(models_dir: Path, repo: str, engine: str = "") -> Path:
     """Where a model folder has to live for its own node to find it.
 
     Two different layouts, and neither is a preference:
-      qwen  models/qwen-tts/<Org>/<Name>  — where the Qwen node searches.
+      qwen  models/qwen-tts/<Name>        — load_qwen_model lists
+            models/qwen-tts one level deep for a folder whose name carries the
+            size and the kind, and download_model_if_needed builds
+            <qwen_root>/<repo.split("/")[-1]>. The node's README draws an
+            <Org>/<Name> tree; its code has never looked there.
       moss  models/moss-tts/<Org>--<Name> — what the MOSS loader builds from
-            repo_id.replace("/", "--"). Put a MOSS folder in the Qwen shape
-            and the node does not see it; it downloads its own second copy.
+            repo_id.replace("/", "--").
+    Put a folder in any other shape and the node does not see it: it
+    downloads its own second copy, and offline the line fails.
     """
     eng = ENGINES[engine or engine_of(repo)]
     org, name = repo.split("/", 1)
-    if eng["layout"] == "flat":
+    if eng["layout"] == "org--name":
         return models_dir / eng["subdir"] / f"{org}--{name}"
-    return models_dir / eng["subdir"] / org / name
+    return models_dir / eng["subdir"] / name
 
 
 def qwen_model_dir(models_dir: Path, repo: str) -> Path:
     """Kept for callers that only ever meant Qwen."""
     return model_dir(models_dir, repo, "qwen")
+
+
+# A download still arriving: ours stream to .part, huggingface_hub's
+# snapshot_download (which both node packs call themselves) to .incomplete
+# under <folder>/.cache/huggingface/download.
+PARTIAL_SUFFIXES = (".part", ".incomplete")
+WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
+
+
+def partial_download(d: Path) -> bool:
+    return any(f.suffix in PARTIAL_SUFFIXES for f in d.rglob("*"))
 
 
 def model_installed(models_dir: Path, repo: str, engine: str = "") -> bool:
@@ -643,13 +660,91 @@ def model_installed(models_dir: Path, repo: str, engine: str = "") -> bool:
     # A .part is a download that stopped part way through. The config.json
     # beside it arrived first and is perfectly good, which is exactly why this
     # has to be checked: without it a folder whose weights are still half here
-    # reports as installed, and the engine reports ready.
-    if any(d.rglob("*.part")):
+    # reports as installed, and the engine reports ready. The .incomplete is
+    # the same thing left by a download the node started itself — and the
+    # node treats any folder that exists as finished, so it will load from it
+    # and fail on every line until the folder is whole.
+    if partial_download(d):
         return False
-    weights = [f for f in d.rglob("*")
-               if f.suffix in (".safetensors", ".bin", ".pt", ".pth")]
+    weights = [f for f in d.rglob("*") if f.suffix in WEIGHT_SUFFIXES]
     has_config = (d / "config.json").exists()
     return bool(weights) or has_config
+
+
+def folder_whole(d: Path) -> bool:
+    """Weights on disk and nothing still arriving: the bar one copy of a
+    folder has to clear before it is kept over another copy of itself."""
+    if not d.is_dir():
+        return False
+    files = list(d.rglob("*"))
+    return (not any(f.suffix in PARTIAL_SUFFIXES for f in files)
+            and any(f.suffix in WEIGHT_SUFFIXES for f in files))
+
+
+# Folders the Qwen node keeps under models/qwen-tts that are not models.
+QWEN_RESERVED = {"voices"}
+
+
+def migrate_qwen_layout(models_dir: Path | None, log=None) -> int:
+    """Move Qwen folders out of the <Org>/<Name> shape, into <Name>.
+
+    Script Builder used to download into models/qwen-tts/Qwen/<Name>, after
+    the node's README, which is not where the node's code looks. Every line
+    then either downloaded a second copy of a model already on disk — minutes
+    of silence on the first take, gigabytes twice over — or, offline, failed.
+    The node may also have started that second copy and been cut off, and a
+    folder that exists is one it loads from, whole or not.
+
+    Only the org folders our own tables name are touched. Per folder:
+    nothing at <Name> yet → move it there; a whole copy at <Name> already →
+    this one is the duplicate, and nothing can see it, so it goes; a partial
+    copy at <Name> and a whole one here → the whole one takes its place;
+    neither whole → both left for a download to finish. Returns how many
+    folders were settled.
+    """
+    if not models_dir:
+        return 0
+    root = Path(models_dir) / QWEN_SUBDIR
+    if not root.is_dir():
+        return 0
+    say = log or (lambda _m: None)
+    settled = 0
+    for org in sorted({m["repo"].split("/", 1)[0] for m in MODEL_REPOS}):
+        nest = root / org
+        if not nest.is_dir() or nest.is_symlink():
+            continue
+        for old in sorted(p for p in nest.iterdir()
+                          if p.is_dir() and not p.is_symlink()):
+            if old.name in QWEN_RESERVED or old.name.startswith("."):
+                continue
+            new = root / old.name
+            try:
+                if not new.exists():
+                    old.rename(new)
+                    say(f"Moved {org}/{old.name} to qwen-tts/{old.name}, "
+                        "where the Qwen node looks for it.")
+                elif folder_whole(new):
+                    shutil.rmtree(old)
+                    say(f"Removed {org}/{old.name}: a second copy of "
+                        f"qwen-tts/{old.name}, which the node already uses.")
+                elif folder_whole(old):
+                    shutil.rmtree(new)
+                    old.rename(new)
+                    say(f"Replaced an unfinished qwen-tts/{old.name} with the "
+                        f"whole copy from {org}/{old.name}.")
+                else:
+                    say(f"Left {org}/{old.name} alone: neither it nor "
+                        f"qwen-tts/{old.name} is whole yet.")
+                    continue
+                settled += 1
+            except OSError as exc:
+                say(f"Could not move {org}/{old.name} into place — {exc}. "
+                    "Close ComfyUI and start Script Builder again.")
+        try:
+            nest.rmdir()  # only when it is empty now
+        except OSError:
+            pass
+    return settled
 
 
 def wanted_models(cfg: dict, engine: str = "") -> list[dict]:
@@ -850,6 +945,13 @@ def download_repo(cfg: dict, repo: str, models_dir: Path,
         if should_cancel and should_cancel():
             return
         done_bytes += f["size"]
+    # A download the node began itself leaves .incomplete markers under
+    # <folder>/.cache. Every file they stood for is whole now, and left in
+    # place they would keep the folder reading as unfinished for good.
+    cache = target / ".cache"
+    if cache.is_dir():
+        for stale in cache.rglob("*.incomplete"):
+            stale.unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -1960,6 +2062,9 @@ def run_setup(cfg: dict, prog: Progress, comfy, chosen_dir: str = "",
 
         # 5. models --------------------------------------------------------- #
         prog.begin("models")
+        # Folders an earlier version put in the <Org>/<Name> shape are moved
+        # before anything is counted missing, or they are fetched again.
+        migrate_qwen_layout(engine_models_dir(cfg, "qwen"), prog.log)
         todo = [(eid, m) for eid in engines for m in engine_missing(cfg, eid)]
         if not todo:
             prog.finish("models", "Everything is already downloaded")
