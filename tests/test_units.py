@@ -1009,22 +1009,29 @@ class TorchReinstall(unittest.TestCase):
     """pip counts torch 2.14.0+cpu as satisfying `torch`, so Reinstall against
     the CUDA index changed nothing at all."""
 
-    def _attempt(self, installed, index, code=0, said=""):
+    def _attempt(self, installed, index, code=0, said="", offered=True):
         calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            if "index" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0 if offered else 1, "",
+                    "" if offered else "ERROR: No matching distribution "
+                                       "found for torch")
+            return subprocess.CompletedProcess(cmd, code, "", said)
+
         with mock.patch.object(bootstrap, "installed_torch",
                                return_value=installed), \
-             mock.patch.object(bootstrap, "_run",
-                               side_effect=lambda cmd, **kw: calls.append(cmd)
-                               or subprocess.CompletedProcess(cmd, code, "",
-                                                              said)):
+             mock.patch.object(bootstrap, "_run", side_effect=run):
             dropped = bootstrap.drop_mismatched_torch("py", index, lambda _m: None)
-        return dropped, calls
+        return dropped, [c for c in calls if "index" not in c]
 
     def test_a_cpu_build_is_removed_before_the_cuda_one_lands(self):
         dropped, calls = self._attempt(torch_info("2.14.0+cpu"),
                                        bootstrap.CUDA_INDEX)
         self.assertTrue(dropped)
-        self.assertTrue(any("uninstall" in c for c in calls[0]))
+        self.assertTrue(any("uninstall" in c for c in calls))
 
     def test_a_matching_build_is_left_alone(self):
         dropped, calls = self._attempt(torch_info("2.14.0+cu128", "12.8"),
@@ -1040,7 +1047,7 @@ class TorchReinstall(unittest.TestCase):
         dropped, calls = self._attempt(torch_info("2.14.0"),
                                        bootstrap.CUDA_INDEX)
         self.assertTrue(dropped)
-        self.assertTrue(any("uninstall" in c for c in calls[0]))
+        self.assertTrue(any("uninstall" in c for c in calls))
 
     def test_an_untagged_cuda_wheel_is_not_reinstalled_over_a_minor_version(self):
         # PyPI's Linux wheel is a CUDA build with no tag. It drives the card;
@@ -1049,6 +1056,46 @@ class TorchReinstall(unittest.TestCase):
                                        bootstrap.CUDA_INDEX)
         self.assertFalse(dropped)
         self.assertEqual(calls, [])
+
+    def test_the_silent_uninstall_says_what_it_is(self):
+        # pip prints nothing while it deletes thousands of files; on Windows
+        # that is a minute or more of a button that looks stuck.
+        said = []
+        with mock.patch.object(bootstrap, "installed_torch",
+                               return_value=torch_info("2.14.0+cpu")), \
+             mock.patch.object(bootstrap, "_run", return_value=
+                               subprocess.CompletedProcess([], 0, "", "")):
+            bootstrap.drop_mismatched_torch(
+                "py", bootstrap.CUDA_INDEX, lambda _m: None,
+                lambda text, pct: said.append((text, pct)))
+        self.assertEqual(said[-1], ("Removing torch 2.14.0+cpu (the cpu "
+                                    "build) first…", None))
+
+    def test_nothing_is_removed_until_the_index_has_a_replacement(self):
+        # Uninstall first, find out at the download: an environment with no
+        # torch at all, worse than the CPU build it replaced.
+        calls = []
+        with mock.patch.object(bootstrap, "installed_torch",
+                               return_value=torch_info("2.14.0+cpu")), \
+             mock.patch.object(bootstrap, "_run", side_effect=lambda cmd, **kw:
+                               calls.append(cmd) or subprocess.CompletedProcess(
+                                   cmd, 1, "", "ERROR: No matching "
+                                               "distribution found for torch")):
+            with self.assertRaises(RuntimeError) as caught:
+                bootstrap.drop_mismatched_torch("py", bootstrap.CUDA_INDEX,
+                                                lambda _m: None)
+        self.assertFalse(any("uninstall" in c for c in calls),
+                         "it removed torch with nothing to replace it")
+        self.assertIn("left in place", str(caught.exception))
+        self.assertIn("No matching distribution", str(caught.exception))
+
+    def test_an_index_that_cannot_be_asked_does_not_block_the_install(self):
+        # pip too old for `pip index`: that is not an answer, so no refusal.
+        with mock.patch.object(bootstrap, "_run", return_value=
+                               subprocess.CompletedProcess(
+                                   [], 1, "", 'ERROR: unknown command "index"')):
+            self.assertEqual(bootstrap.index_lacks_torch(
+                "py", bootstrap.CUDA_INDEX), "")
 
     def test_a_cuda_build_is_removed_when_the_cpu_one_is_asked_for(self):
         dropped, _ = self._attempt(torch_info("2.14.0", "12.8"),
@@ -1101,6 +1148,363 @@ class TorchReinstall(unittest.TestCase):
             self._install(torch_info("2.14.0"))
         self.assertIn("still", str(caught.exception))
         self.assertIn("cu128", str(caught.exception))
+
+
+class WhenAnInstallFails(unittest.TestCase):
+    """Reinstall looked as if it did nothing: its progress and its failure
+    both went to a panel a screen below the button, and the failure said
+    only "see the log"."""
+
+    @unittest.skipIf(sys.platform == "win32", "uses a shell script as python")
+    def test_pip_failing_says_what_pip_said(self):
+        root = Path(tempfile.mkdtemp(prefix="sb-pip-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        fake = root / "python"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "echo 'Collecting torch'\n"
+            "echo 'ERROR: Could not find a version that satisfies the "
+            "requirement torch (from versions: none)'\n"
+            "echo 'ERROR: No matching distribution found for torch'\n"
+            "exit 1\n")
+        fake.chmod(0o755)
+        with mock.patch.object(bootstrap, "pip_ready"), \
+             mock.patch.object(bootstrap, "pip_raw_progress", return_value=[]):
+            with self.assertRaises(RuntimeError) as caught:
+                bootstrap.pip_install(str(fake), ["torch"], lambda _m: None)
+        self.assertIn("No matching distribution found for torch",
+                      str(caught.exception))
+
+    def test_a_comfyui_requirement_that_fails_does_not_keep_the_cpu_build(self):
+        # Stopping at ComfyUI's requirements left the row reading exactly as
+        # it had before the button was pressed. The build of PyTorch is what
+        # the button is for; the requirement is reported, afterwards.
+        root = Path(tempfile.mkdtemp(prefix="sb-reinstall-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        comfy = root / "ComfyUI-Qwen3-TTS"
+        comfy.mkdir()
+        (comfy / "main.py").write_text("")
+        (comfy / "requirements.txt").write_text("av>=99\n")
+        vpy = bootstrap.venv_python(comfy)
+        vpy.parent.mkdir(parents=True)
+        vpy.write_text("")
+        cfg = copy.deepcopy(bootstrap.DEFAULT_CONFIG)
+        bootstrap.engine_cfg(cfg, "qwen").update(comfy_dir=str(comfy),
+                                                 managed=True)
+        calls = []
+
+        def pip(_py, args, *_a):
+            calls.append(args)
+            if args[:1] == ["-r"]:
+                raise RuntimeError("pip install failed: ERROR: No matching "
+                                   "distribution found for av>=99")
+
+        with mock.patch.object(bootstrap, "pip_install", side_effect=pip), \
+             mock.patch.object(bootstrap, "install_requested_torch",
+                               side_effect=lambda *_a: calls.append("torch")), \
+             mock.patch.object(bootstrap, "save_config"):
+            with self.assertRaises(RuntimeError) as caught:
+                manager._install_torch(
+                    manager.Task("dependency", "Install PyTorch"), cfg,
+                    {"engine": "qwen"})
+        self.assertEqual(calls[-1], "torch")
+        self.assertIn("PyTorch is in place", str(caught.exception))
+        self.assertIn("av>=99", str(caught.exception))
+
+
+class OnePipPerEnvironment(unittest.TestCase):
+    """A button that looked as if it had done nothing got pressed again, and
+    the one below it — two pips writing one site-packages, one of them
+    uninstalling torch, break each other."""
+
+    def _finish(self, task, timeout=10):
+        deadline = time.time() + timeout
+        while task.state == "running" and time.time() < deadline:
+            time.sleep(0.05)
+        return task.state
+
+    def test_a_second_install_into_the_same_environment_is_refused(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        with mock.patch.object(manager, "_install_torch",
+                               side_effect=lambda *_a: gate.wait(10)), \
+             mock.patch.object(manager, "_install_node_reqs"), \
+             mock.patch.object(manager, "_install_git"):
+            first = manager.install_dependency("torch_qwen", {}, {})
+            with self.assertRaises(manager.InstallBusy) as caught:
+                manager.install_dependency("node_reqs_qwen", {}, {})
+            self.assertIn("Install PyTorch for Qwen3-TTS",
+                          str(caught.exception))
+            # And the page is told so, as a refusal rather than a fault.
+            with server.app.test_client() as web:
+                r = web.post("/api/deps/torch_qwen/install", json={})
+            self.assertEqual(r.status_code, 409)
+            self.assertIn("still running", r.get_json()["error"])
+            # MOSS's environment is not Qwen's, and Git is not pip at all.
+            for other in ("node_reqs_moss", "git"):
+                self.assertEqual(self._finish(manager.install_dependency(
+                    other, {}, {})), "done")
+            gate.set()
+            self.assertEqual(self._finish(first), "done")
+            self.assertEqual(self._finish(manager.install_dependency(
+                "node_reqs_qwen", {}, {})), "done")
+
+
+def fake_torch_site(site: Path, version: str = "2.11.0+cu128",
+                    files: dict | None = None, record: bool = True) -> Path:
+    """A torch installed the way pip leaves one: files, dist-info, RECORD.
+
+    Point PYTHONPATH at `site` and the environment's own interpreter finds it
+    exactly as it would a real one — importlib.metadata reads the RECORD, and
+    find_spec finds the package.
+    """
+    import base64, hashlib
+    files = files or {
+        "torch/__init__.py": "from .version import __version__\n",
+        "torch/version.py": f"__version__ = {version!r}\ncuda = '12.8'\n",
+        "torch/utils/__init__.py": "",
+        "torch/utils/_debug_mode.py": "MODE = 1\n",
+        "torch/_subclasses/fake_tensor.py": "def _is_plain_tensor(t):\n    "
+                                            "return True\n",
+        "torchgen/__init__.py": "",
+    }
+    info = site / f"torch-{version}.dist-info"
+    info.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for rel, text in files.items():
+        (site / rel).parent.mkdir(parents=True, exist_ok=True)
+        (site / rel).write_text(text)
+        digest = base64.urlsafe_b64encode(
+            hashlib.sha256(text.encode()).digest()).rstrip(b"=").decode()
+        rows.append(f"{rel},sha256={digest},{len(text.encode())}")
+    (info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: torch\nVersion: {version}\n")
+    if record:
+        rows.append(f"torch-{version}.dist-info/METADATA,,")
+        rows.append(f"torch-{version}.dist-info/RECORD,,")
+        (info / "RECORD").write_text("\n".join(rows) + "\n")
+    return site
+
+
+class ADamagedTorch(unittest.TestCase):
+    """The Qwen engine died with "cannot import name 'is_fake_tensor'" from
+    inside torch: files of two versions mixed by an install that was cut off.
+    Its version.py read as the right build, so the row said ok, Start
+    launched it, and Reinstall — builds agreeing — did nothing at all."""
+
+    def setUp(self):
+        self.site = Path(tempfile.mkdtemp(prefix="sb-site-"))
+        self.addCleanup(shutil.rmtree, self.site, ignore_errors=True)
+        patch = mock.patch.dict(os.environ, {"PYTHONPATH": str(self.site)})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def damage(self) -> str:
+        return bootstrap.torch_damage_summary(
+            bootstrap.torch_damage(sys.executable))
+
+    def test_a_whole_install_is_not_damaged(self):
+        fake_torch_site(self.site)
+        self.assertEqual(self.damage(), "")
+
+    def test_files_left_by_another_version_are_found(self):
+        # The shape of the real one: a package directory from the newer
+        # torch, left behind beside the older torch's module of that name.
+        fake_torch_site(self.site)
+        stale = self.site / "torch" / "utils" / "_debug_mode"
+        stale.mkdir()
+        (stale / "__init__.py").write_text("from ._calls import *\n")
+        (stale / "_calls.py").write_text("from torch._subclasses.fake_tensor "
+                                         "import is_fake_tensor\n")
+        said = self.damage()
+        self.assertIn("2 files from another version are mixed in", said)
+        self.assertIn("torch/utils/_debug_mode/", said)
+
+    def test_a_file_that_never_arrived_is_found(self):
+        fake_torch_site(self.site)
+        (self.site / "torch" / "_subclasses" / "fake_tensor.py").unlink()
+        self.assertIn("1 of its files is missing", self.damage())
+
+    def test_a_file_from_another_version_in_its_place_is_found(self):
+        fake_torch_site(self.site)
+        (self.site / "torch" / "utils" / "_debug_mode.py").write_text("NEW\n")
+        self.assertIn("1 of its files is not the one that was installed "
+                      "(torch/utils/_debug_mode.py)", self.damage())
+
+    def test_two_versions_installed_over_each_other_are_found(self):
+        fake_torch_site(self.site)
+        fake_torch_site(self.site, "2.14.0+cpu")
+        self.assertIn("two versions of torch", self.damage())
+
+    def test_torch_with_no_record_of_installing_it_is_found(self):
+        fake_torch_site(self.site)
+        shutil.rmtree(self.site / "torch-2.11.0+cu128.dist-info")
+        self.assertIn("pip has no record", self.damage())
+
+    def test_an_install_with_no_record_file_is_not_judged(self):
+        # conda and some system packages ship no RECORD: every file would
+        # read as a stranger, and a working torch would be called damaged.
+        fake_torch_site(self.site, record=False)
+        (self.site / "torch" / "extra.py").write_text("")
+        self.assertEqual(self.damage(), "")
+
+    def test_reinstall_takes_out_what_pip_does_not_know_about(self):
+        fake_torch_site(self.site)
+        stale = self.site / "torch" / "utils" / "_debug_mode"
+        stale.mkdir()
+        (stale / "__init__.py").write_text("")
+        real_run = bootstrap._run
+
+        def run(cmd, **kw):
+            if "uninstall" in cmd:
+                # What pip does: exactly the files its RECORD lists.
+                info = next(self.site.glob("torch-*.dist-info"))
+                for row in (info / "RECORD").read_text().splitlines():
+                    target = self.site / row.split(",")[0]
+                    if target.is_file():
+                        target.unlink()
+                shutil.rmtree(info)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return real_run(cmd, **kw)
+
+        with mock.patch.object(bootstrap, "_run", side_effect=run):
+            bootstrap.remove_torch(sys.executable, "the damaged torch",
+                                   lambda _m: None)
+        self.assertFalse((self.site / "torch").exists(),
+                         "the leftovers pip did not know about are still there")
+        self.assertFalse((self.site / "torchgen").exists())
+        self.assertEqual(bootstrap.torch_damage(sys.executable)["dists"], {})
+
+    def test_reinstall_repairs_a_damaged_torch_of_the_right_build(self):
+        # Builds agreeing used to mean pip called it satisfied and nothing
+        # happened. A damaged torch now goes out before it goes back in.
+        calls = []
+        damaged = {"dists": {"torch": ["2.11.0+cu128"]}, "stray_count": 2,
+                   "stray": ["torch/utils/_debug_mode/__init__.py"]}
+        states = iter([damaged, {}])
+        with mock.patch.object(bootstrap, "torch_index",
+                               return_value=bootstrap.CUDA_INDEX), \
+             mock.patch.object(bootstrap, "nvidia_gpu", return_value=RTX_4060), \
+             mock.patch.object(bootstrap, "drop_mismatched_torch",
+                               return_value=False), \
+             mock.patch.object(bootstrap, "torch_damage",
+                               side_effect=lambda _py: next(states)), \
+             mock.patch.object(bootstrap, "index_lacks_torch", return_value=""), \
+             mock.patch.object(bootstrap, "installed_torch",
+                               return_value=torch_info("2.11.0+cu128", "12.8")), \
+             mock.patch.object(bootstrap, "remove_torch",
+                               side_effect=lambda *a, **k: calls.append("remove")), \
+             mock.patch.object(bootstrap, "pip_install",
+                               side_effect=lambda _py, args, *_a:
+                               calls.append("install")):
+            bootstrap.install_requested_torch("py", {}, lambda _m: None)
+        self.assertEqual(calls, ["remove", "install"])
+
+    def test_a_damaged_torch_is_not_removed_with_nothing_to_replace_it(self):
+        damaged = {"dists": {"torch": ["2.11.0+cu128"]}, "missing_count": 1,
+                   "missing": ["torch/x.py"]}
+        with mock.patch.object(bootstrap, "torch_index",
+                               return_value=bootstrap.CUDA_INDEX), \
+             mock.patch.object(bootstrap, "nvidia_gpu", return_value=RTX_4060), \
+             mock.patch.object(bootstrap, "drop_mismatched_torch",
+                               return_value=False), \
+             mock.patch.object(bootstrap, "torch_damage", return_value=damaged), \
+             mock.patch.object(bootstrap, "installed_torch",
+                               return_value=torch_info("2.11.0+cu128", "12.8")), \
+             mock.patch.object(bootstrap, "index_lacks_torch",
+                               return_value="ERROR: No matching distribution"), \
+             mock.patch.object(bootstrap, "remove_torch") as removed:
+            with self.assertRaises(RuntimeError) as caught:
+                bootstrap.install_requested_torch("py", {}, lambda _m: None)
+        removed.assert_not_called()
+        self.assertIn("left in place", str(caught.exception))
+
+    def test_start_refuses_a_damaged_torch_and_names_the_fix(self):
+        with mock.patch.object(bootstrap, "torch_damage", return_value={
+                "dists": {"torch": ["2.11.0+cu128"]}, "stray_count": 1,
+                "stray": ["torch/utils/_debug_mode/__init__.py"]}):
+            flags, refusal = bootstrap.torch_launch("py", {}, "qwen")
+        self.assertEqual(flags, [])
+        self.assertIn("damaged", refusal)
+        self.assertIn("Reinstall on PyTorch · Qwen3-TTS", refusal)
+
+    def test_the_row_marks_a_damaged_torch_for_repair(self):
+        with mock.patch.object(manager, "_probe", return_value=(0, json.dumps(
+                {"v": "2.11.0+cu128", "cuda": True, "built": "12.8",
+                 "hip": None, "dev": "NVIDIA GeForce RTX 4060"}))), \
+             mock.patch.object(bootstrap, "torch_damage", return_value={
+                 "dists": {"torch": ["2.11.0+cu128"]}, "stray_count": 1,
+                 "stray": ["torch/utils/_debug_mode/__init__.py"]}), \
+             mock.patch.object(bootstrap, "installed_torch",
+                               return_value=torch_info("2.11.0+cu128", "12.8")):
+            row = manager._torch_row("py", "_qwen", "Qwen3-TTS", {})
+        self.assertTrue(row.get("repair"))
+        self.assertIn("damaged", row["detail"])
+
+    def test_a_torch_that_will_not_import_is_not_called_missing(self):
+        with mock.patch.object(manager, "_probe", return_value=(
+                1, "Traceback …\nImportError: DLL load failed")), \
+             mock.patch.object(bootstrap, "torch_damage", return_value={}), \
+             mock.patch.object(bootstrap, "installed_torch",
+                               return_value=torch_info("2.11.0+cu128", "12.8")):
+            row = manager._torch_row("py", "_qwen", "Qwen3-TTS", {})
+        self.assertTrue(row.get("repair"))
+        self.assertIn("will not import: ImportError: DLL load failed",
+                      row["detail"])
+
+
+# The last words of the Qwen engine that prompted all this, as ComfyUI's
+# console had them — Windows paths, and the colour-coded lines it went on
+# printing after the traceback.
+DAMAGED_TORCH_CRASH = [
+    "Traceback (most recent call last):",
+    '  File "D:\\AI\\Text-to-Speech-Model-main\\ComfyUI-Qwen3-TTS\\main.py", '
+    "line 145, in <module>",
+    '  File "D:\\AI\\Text-to-Speech-Model-main\\comfy-venv-ComfyUI-Qwen3-TTS\\'
+    'Lib\\site-packages\\torch\\utils\\_debug_mode\\_utils.py", line 14, '
+    "in <module>",
+    "    from torch._subclasses.fake_tensor import is_fake_tensor",
+    "ImportError: cannot import name 'is_fake_tensor' from "
+    "'torch._subclasses.fake_tensor' (D:\\AI\\Text-to-Speech-Model-main\\"
+    "comfy-venv-ComfyUI-Qwen3-TTS\\Lib\\site-packages\\torch\\_subclasses\\"
+    "fake_tensor.py). Did you mean: '_is_plain_tensor'?",
+    "\x1b[32m[INFO]\x1b[0m FakeTensor cache stats:",
+    "\x1b[32m[INFO]\x1b[0m   cache_hits: 0",
+]
+
+
+class WhyItStoppedWhileStarting(unittest.TestCase):
+    """"Stopped while starting — its last words are below" over a traceback
+    is rule 15's stack trace with extra steps."""
+
+    def test_a_damaged_torch_is_named_and_the_fix_given(self):
+        said = bootstrap.crash_reason(DAMAGED_TORCH_CRASH, "qwen")
+        self.assertIn("Qwen3-TTS's PyTorch is damaged", said)
+        self.assertIn("is_fake_tensor", said)
+        self.assertIn("Reinstall on PyTorch · Qwen3-TTS", said)
+
+    def test_the_cpu_build_is_named(self):
+        said = bootstrap.crash_reason(
+            ['  File "x\\site-packages\\torch\\cuda\\__init__.py", line 1',
+             "AssertionError: Torch not compiled with CUDA enabled"], "moss")
+        self.assertIn("MOSS-TTS's PyTorch is the CPU-only build", said)
+
+    def test_an_import_error_outside_torch_is_not_blamed_on_torch(self):
+        said = bootstrap.crash_reason(
+            ['  File "x\\site-packages\\transformers\\__init__.py", line 1',
+             "ImportError: cannot import name 'thing'"], "qwen")
+        self.assertNotIn("PyTorch", said)
+        self.assertIn("ImportError: cannot import name 'thing'", said)
+
+    def test_a_taken_port_is_named(self):
+        said = bootstrap.crash_reason(
+            ["OSError: [WinError 10048] Only one usage of each socket address "
+             "(protocol/network address/port) is normally permitted"], "qwen")
+        self.assertIn("port is taken", said)
+
+    def test_a_console_with_no_exception_still_says_something(self):
+        self.assertIn("stopped while starting",
+                      bootstrap.crash_reason(["Starting server"], "qwen"))
 
 
 class ReadingTheTorchBuild(unittest.TestCase):
@@ -2669,6 +3073,97 @@ class StartingOnACpuOnlyTorch(EngineFixture):
                 stop_engine=lambda e: stops.append(e) or True).view()
             self.assertEqual(self.finish_task(view), "done")
         self.assertEqual(stops, [])
+
+
+class ChoosingAnEngineStartsIt(EngineFixture):
+    """Choosing an engine brings it up and takes the other one down — one
+    engine on the card (rule 31) — and choosing one that cannot start says
+    why and leaves the one that was running alone. Both engines, real
+    processes, real ports."""
+
+    def setUp(self):
+        super().setUp()
+        server.cfg.update(run_both_engines=False, want_moss=True)
+        self.urls = {}
+        for eid in ("qwen", "moss"):
+            self.urls[eid] = f"http://127.0.0.1:{free_port()}"
+            bootstrap.engine_cfg(server.cfg, eid).update(
+                comfy_url=self.urls[eid], python=sys.executable,
+                comfy_dir=str(fake_install(self.root / eid, eid)),
+                managed=True, auto_start=True)
+
+    def choose(self, eid: str):
+        with server.app.test_client() as web:
+            return web.post(f"/api/comfy/start?engine={eid}")
+
+    def test_each_engine_starts_when_chosen_and_the_other_stops(self):
+        for eid, other in (("qwen", "moss"), ("moss", "qwen"),
+                           ("qwen", "moss")):
+            with self.subTest(chose=eid):
+                r = self.choose(eid)
+                self.assertEqual(r.status_code, 200, r.get_json())
+                self.assertTrue(online(self.urls[eid]), f"{eid} never came up")
+                self.assertTrue(offline(self.urls[other]),
+                                f"{other} was left on the card")
+                self.assertFalse(server.PROCS[other].alive())
+
+    def test_an_engine_that_cannot_start_leaves_the_running_one_alone(self):
+        self.assertEqual(self.choose("qwen").status_code, 200)
+        self.assertTrue(online(self.urls["qwen"]))
+        refuse = lambda _py, _cfg, eid: ([], "MOSS-TTS's PyTorch is damaged.") \
+            if eid == "moss" else ([], "")
+        with mock.patch.object(bootstrap, "torch_launch", side_effect=refuse):
+            r = self.choose("moss")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("damaged", r.get_json()["error"])
+        self.assertTrue(server.PROCS["qwen"].alive(),
+                        "switching to a broken engine took the working one down")
+        self.assertTrue(bootstrap.comfy_online(self.urls["qwen"]))
+
+
+class AnEngineThatDiesWhileStarting(EngineFixture):
+    """Restart sat on "Restarting…" for fifteen minutes over an engine that
+    had died in its first seconds, and Start said "its last words are below"
+    over a traceback. Both notice the exit at once and say why."""
+
+    def setUp(self):
+        super().setUp()
+        self.url = f"http://127.0.0.1:{free_port()}"
+        install = fake_install(self.root)
+        (install / "main.py").write_text(
+            "import sys\nprint(%r, flush=True)\nsys.exit(1)\n"
+            % "\n".join(DAMAGED_TORCH_CRASH))
+        self.slot(comfy_url=self.url, comfy_dir=str(install),
+                  python=sys.executable)
+
+    def test_restart_says_why_at_once(self):
+        began = time.time()
+        with server.app.test_client() as web:
+            body = web.post("/api/comfy/restart?engine=qwen").get_json()
+        self.assertEqual(self.finish_task(body["task"], timeout=30), "error")
+        self.assertLess(time.time() - began, 30)
+        detail = manager.TASKS.get(body["task"]["id"]).detail
+        self.assertIn("PyTorch is damaged", detail)
+
+    def test_start_reports_why_it_stopped_in_a_sentence(self):
+        with server.app.test_client() as web:
+            self.assertEqual(web.post("/api/comfy/start?engine=qwen")
+                             .status_code, 200)
+            deadline = time.time() + 20
+            while not server.PROCS["qwen"].crashed() and time.time() < deadline:
+                time.sleep(0.1)
+            time.sleep(0.3)             # let the reader drain the pipe
+            slot = web.get("/api/status?engine=qwen").get_json()["installs"]["qwen"]
+            log = web.get("/api/comfy/log?engine=qwen").get_json()
+        self.assertFalse(slot["running"])
+        self.assertIn("PyTorch is damaged", slot["stopped"])
+        self.assertIn("PyTorch is damaged", log["stopped"])
+
+    def test_a_take_is_told_why_instead_of_waiting(self):
+        began = time.time()
+        why = server.activate("qwen")
+        self.assertLess(time.time() - began, 30)
+        self.assertIn("Reinstall on PyTorch · Qwen3-TTS", why)
 
 
 class WhenThePortWillNotBeGivenUp(EngineFixture):

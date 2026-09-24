@@ -481,6 +481,37 @@ try {
        && labels2.models === 'Download the models'
        && labels2.foreign === 'Another ComfyUI is on that port',
      'the primary button names the actual blocker', JSON.stringify(labels2));
+  const whileStarting = await page.evaluate(() => {
+    engineStarting = true;
+    const label = blocker({ ready: false, setup_complete: true,
+                            comfy_online: false }).label;
+    engineStarting = false;
+    return label;
+  });
+  is(/^Starting .+…$/.test(whileStarting),
+     'and says the engine is starting while it is', whileStarting);
+
+  // Choosing an engine starts it. The picker used to change only which engine
+  // a take would ask for, and the chosen one sat offline until Read found it
+  // so. Faked here as offline, because both stand-ins are always up.
+  const asked = [];
+  const mossOffline = { ...(await app.api('/api/status?engine=moss')),
+                        engine: 'moss', comfy_online: false, ready: false,
+                        setup_complete: true, setup_running: false };
+  await page.route(u => u.pathname === '/api/status',
+                   r => r.fulfill({ json: mossOffline }));
+  await page.route(u => u.pathname === '/api/comfy/start', r => {
+    asked.push(new URL(r.request().url()).searchParams.get('engine'));
+    return r.fulfill({ json: { ok: true, already: true } });
+  });
+  await page.evaluate(() => setEngine('moss'));
+  await sleep(800);
+  is(asked.join() === 'moss', 'choosing an engine starts it', asked.join());
+  await page.unrouteAll({ behavior: 'ignoreErrors' });
+  await page.evaluate(() => setEngine('qwen'));
+  await sleep(1200);
+  is(asked.join() === 'moss',
+     'and choosing one that is already up starts nothing', asked.join());
 
   /* ------------------------------------------ a PyTorch that cannot start */
   // A CPU-only PyTorch beside an NVIDIA card read "warn", so Install
@@ -526,6 +557,69 @@ try {
     { timeout: 15000 });
   is(repairsAsked.join() === '/api/deps/torch_qwen/install',
      'and Install everything missing repairs it', repairsAsked.join(', '));
+  await page.unrouteAll({ behavior: 'ignoreErrors' });
+  await page.evaluate(() => loadDeps());
+  await sleep(400);
+
+  // Pressing Reinstall on a 3 GB PyTorch showed "Working…" on the button and
+  // nothing else for as long as it took: the progress was in the Activity
+  // panel, a screen further down. A running install paints its own row now,
+  // from the task list, so it holds across a re-render and a reload.
+  const dl = { id: 'fake-dl', kind: 'dependency',
+               title: 'Install PyTorch for Qwen3-TTS',
+               meta: { dep: 'torch_qwen', engine: 'qwen' }, state: 'running',
+               pct: 76, lines: [], cursor: 0,
+               detail: 'torch — 30 of 40 MB (76%) · 4.4 MB/s · 0m 02s left' };
+  await page.route(u => u.pathname === '/api/tasks', r => r.fulfill({
+    json: new URL(r.request().url()).searchParams.get('id') ? dl : [dl] }));
+  const torchRow = () => page.$$eval('#dep-list .fitem', rows => {
+    const row = rows.find(x => x.textContent.includes('PyTorch · Qwen3-TTS'));
+    return row ? { line: row.querySelector('.n span').textContent,
+                   button: row.querySelector('button').textContent.trim() }
+               : null;
+  });
+  await page.evaluate(() => pollTasks());
+  await sleep(500);
+  const painted = await torchRow();
+  is(painted && painted.line.includes('30 of 40 MB') && painted.button === '76%',
+     'a running install shows its progress on its own row',
+     JSON.stringify(painted));
+  await page.evaluate(() => loadDeps());
+  await sleep(600);
+  const repainted = await torchRow();
+  is(repainted && repainted.button === '76%',
+     'and keeps showing it when the list is drawn again',
+     JSON.stringify(repainted));
+  Object.assign(dl, { state: 'done', pct: 100,
+                      detail: 'PyTorch installed. Start the engine to use it.' });
+  await page.waitForFunction(() => !S.taskId, null, { timeout: 10000 });
+  const done = (await page.textContent('#toast')).trim();
+  is(done.includes('Start the engine to use it'),
+     'and the toast it ends on names the next step', done);
+
+  // A failure stays on its row. The toast that said so was gone in seconds,
+  // and the row it left read exactly as before the press.
+  const failed = { ...dl, id: 'fake-fail', state: 'error', pct: 0,
+                   detail: 'pip install failed: ERROR: No matching '
+                         + 'distribution found for torch' };
+  await page.unrouteAll({ behavior: 'ignoreErrors' });
+  await page.route(u => u.pathname === '/api/tasks', r => r.fulfill({
+    json: new URL(r.request().url()).searchParams.get('id') ? failed : [failed] }));
+  await page.evaluate(() => pollTasks());
+  await sleep(500);
+  const errLine = () => page.$$eval('#dep-list .fitem', rows => {
+    const row = rows.find(x => x.textContent.includes('PyTorch · Qwen3-TTS'));
+    const err = row && row.querySelector('.dep-err');
+    return err ? err.textContent : '';
+  });
+  const shown = await errLine();
+  is(shown.includes('No matching distribution found for torch'),
+     'a failed install says why on its own row', shown);
+  await page.evaluate(() => loadDeps());
+  await sleep(600);
+  is((await errLine()).includes('No matching distribution'),
+     'and still says it after the list is drawn again');
+  await page.evaluate(() => { S.tasks = []; });
   await page.unrouteAll({ behavior: 'ignoreErrors' });
   await page.evaluate(() => loadDeps());
   await sleep(400);

@@ -205,7 +205,25 @@ def _torch_row(py_comfy: str, suffix: str, label: str,
                        "'hip':getattr(torch.version,'hip',None),"
                        "'dev':(torch.cuda.get_device_name(0) "
                        "if torch.cuda.is_available() else '')}))")
+    # Read before anything else: a damaged torch imports fine here and still
+    # dies inside ComfyUI, and its version reads as exactly the right build —
+    # which is how this row said "ok" over an engine that could not start.
+    damage = bootstrap.torch_damage_summary(bootstrap.torch_damage(py_comfy))
+    if damage:
+        have = bootstrap.installed_torch(py_comfy)
+        return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
+                "state": "warn", "repair": True, "action": "reinstall",
+                "detail": (f"torch {have.get('version', '')} is damaged — "
+                           f"{damage}. ComfyUI will not start on it. Press "
+                           "Reinstall.")}
     if code != 0:
+        have = bootstrap.installed_torch(py_comfy)
+        if have:
+            last = (out or "").strip().splitlines()[-1:] or [""]
+            return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
+                    "state": "warn", "repair": True, "action": "reinstall",
+                    "detail": (f"torch {have['version']} is installed but will "
+                               f"not import: {last[0][:160]} Press Reinstall.")}
         return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
                 "state": "missing", "detail": f"Not installed in the {kind}.",
                 "action": "install"}
@@ -442,6 +460,19 @@ def dependencies(cfg: dict, clients=None, engine: str = "") -> list[dict]:
 
 # The installs that run pip in an engine's own environment.
 PIP_STEPS = ("node", "torch", "node_reqs")
+_INSTALL_LOCK = threading.Lock()
+
+
+class InstallBusy(RuntimeError):
+    """Another install is already writing this engine's environment."""
+
+
+def dep_parts(dep_id: str) -> tuple[str, str]:
+    """"torch_moss" -> ("torch", "moss"); a bare id is the default engine's."""
+    base, _, eid = dep_id.rpartition("_")
+    if eid not in ENGINES:
+        base, eid = dep_id, bootstrap.DEFAULT_ENGINE
+    return base, eid
 
 
 def install_dependency(dep_id: str, cfg: dict, opts: dict,
@@ -457,10 +488,14 @@ def install_dependency(dep_id: str, cfg: dict, opts: dict,
     will not let pip replace a file a running ComfyUI has loaded — torch's
     DLLs above all, which is exactly what a Reinstall has to replace — and the
     engine has to restart to use new packages anyway.
+
+    One pip at a time per environment. A button that looked as if it had done
+    nothing got pressed again, and the row below it too, and two pips writing
+    the same site-packages — one of them uninstalling torch — break each
+    other; on Windows the loser fails on a file the winner holds. So a second
+    one is refused, naming the one that is running and how far it has got.
     """
-    base, _, eid = dep_id.rpartition("_")
-    if eid not in ENGINES:
-        base, eid = dep_id, bootstrap.DEFAULT_ENGINE
+    base, eid = dep_parts(dep_id)
     label = ENGINES[eid]["label"]
     titles = {"git": "Install Git",
               "comfyui": f"Install ComfyUI for {label}",
@@ -486,8 +521,18 @@ def install_dependency(dep_id: str, cfg: dict, opts: dict,
         else:
             raise RuntimeError(f"Nothing to install for '{dep_id}'.")
 
-    return spawn("dependency", titles.get(base, dep_id), run,
-                 {"dep": dep_id, "engine": eid})
+    with _INSTALL_LOCK:
+        if base in PIP_STEPS:
+            for other in TASKS.running("dependency"):
+                kind, where = dep_parts(other.meta.get("dep", ""))
+                if kind in PIP_STEPS and where == eid:
+                    raise InstallBusy(
+                        f"{other.title} is still running"
+                        + (f" ({other.detail})" if other.detail else "")
+                        + f" — one install at a time into {label}'s "
+                          "environment. Wait for it to finish.")
+        return spawn("dependency", titles.get(base, dep_id), run,
+                     {"dep": dep_id, "engine": eid})
 
 
 def _reporter(task: Task):
@@ -593,12 +638,25 @@ def _install_torch(task: Task, cfg: dict, opts: dict) -> None:
     bootstrap.pip_install(str(target), ["--upgrade", "pip", "wheel"],
                           task.log, say)
     task.set(detail="Installing ComfyUI requirements…")
-    bootstrap.pip_install(str(target),
-                          ["-r", str(comfy_dir / "requirements.txt")],
-                          task.log, say)
+    # The build of PyTorch is what this button is for. A requirement of
+    # ComfyUI's that will not install is worth reporting, but it is no reason
+    # to leave the CPU build in place — which is what stopping here did, and
+    # the row then read exactly as it had before the button was pressed.
+    reqs_failed = ""
+    try:
+        bootstrap.pip_install(str(target),
+                              ["-r", str(comfy_dir / "requirements.txt")],
+                              task.log, say)
+    except RuntimeError as exc:
+        reqs_failed = str(exc)
+        task.log(f"ComfyUI's requirements did not all install ({exc}) — "
+                 "carrying on with PyTorch.")
     task.set(detail="Installing the selected PyTorch build — the long one…")
     bootstrap.install_requested_torch(str(target), cfg, task.log, say)
-    task.set(detail="PyTorch installed.")
+    if reqs_failed:
+        raise RuntimeError("PyTorch is in place, but ComfyUI's own "
+                           f"requirements did not all install — {reqs_failed}")
+    task.set(detail="PyTorch installed. Start the engine to use it.")
 
 
 def _install_node_reqs(task: Task, cfg: dict, engine: str = "") -> None:
