@@ -1471,6 +1471,7 @@ def pip_install(python: str, args: list[str], log, on_detail=None) -> None:
     log("$ " + " ".join(cmd[:8]) + (" …" if len(cmd) > 8 else ""))
 
     state: dict = {}
+    errors: list[str] = []
     last = [0.0]
     last_pct = [-1.0]
     started = time.time()
@@ -1512,6 +1513,8 @@ def pip_install(python: str, args: list[str], log, on_detail=None) -> None:
                                     "Successfully", "ERROR", "Building",
                                     "WARNING: ")):
                     log(line[:200])
+                if line.startswith("ERROR"):
+                    errors.append(line)
                 shown = pip_progress(line, state)
                 if not (shown and on_detail):
                     continue
@@ -1530,6 +1533,11 @@ def pip_install(python: str, args: list[str], log, on_detail=None) -> None:
             stop.set()
         code = proc.wait()
     if code != 0:
+        # pip's own last word names the package and the reason. "See the log"
+        # sent people to a panel a screen away from the button they pressed,
+        # which is how a failed Reinstall came to look like nothing at all.
+        if errors:
+            raise RuntimeError("pip install failed: " + errors[-1][:300])
         raise RuntimeError("pip install failed — see the log.")
 
 
@@ -1761,7 +1769,30 @@ def torch_mismatch(info: dict, wanted: str) -> bool:
     return torch_kind(info) != build_kind(wanted)
 
 
-def drop_mismatched_torch(python: str, index: str, log) -> bool:
+def index_lacks_torch(python: str, index: str) -> str:
+    """What pip said if `index` has no torch this interpreter can install.
+
+    "" when it has one, and "" when pip could not be asked at all — a
+    question that cannot be put is no reason to block the install.
+    `pip index versions` reads the listing and filters it by this Python's
+    own tags, so it answers without downloading anything.
+    """
+    try:
+        res = _run([str(python), "-m", "pip", "index", "versions", "torch",
+                    "--index-url", index, "--disable-pip-version-check"],
+                   timeout=180)
+    except Exception:  # noqa: BLE001
+        return ""
+    if res.returncode == 0:
+        return ""
+    said = ((res.stderr or "") + (res.stdout or "")).strip()
+    if "No matching distribution" not in said:
+        return ""
+    return said.splitlines()[-1][:200]
+
+
+def drop_mismatched_torch(python: str, index: str, log,
+                          on_detail=None) -> bool:
     """Remove a torch whose build is not the one being asked for.
 
     pip treats `torch` as satisfied by torch 2.14.0+cpu, so pointing it at the
@@ -1774,6 +1805,10 @@ def drop_mismatched_torch(python: str, index: str, log) -> bool:
     An uninstall that fails raises. Carrying on used to be silent: pip then
     found the old build still there, called the request satisfied, and the
     task reported PyTorch installed over the build it had failed to replace.
+
+    And nothing is removed until the index is known to have a replacement for
+    this Python. Uninstalling first and finding out at the download left an
+    environment with no torch at all — worse than the CPU build it replaced.
     """
     wanted = torch_build(index)
     if not wanted:
@@ -1784,6 +1819,22 @@ def drop_mismatched_torch(python: str, index: str, log) -> bool:
     log(f"Installed torch is {have['version']} (the {torch_kind(have)} "
         f"build), but the {wanted} build was asked for — removing it first, "
         "because pip counts the old one as good enough.")
+    if on_detail:
+        on_detail(f"Checking {index} has a {wanted} build for this Python…",
+                  None)
+    lacking = index_lacks_torch(python, index)
+    if lacking:
+        raise RuntimeError(
+            f"{index} has no PyTorch this environment's Python can install "
+            f"({lacking}), so torch {have['version']} was left in place "
+            "rather than removed with nothing to replace it. If the machine "
+            "is offline, try again once it is not; otherwise pick another "
+            "build in the PyTorch picker.")
+    if on_detail:
+        # pip prints nothing while it deletes thousands of files, which on
+        # Windows is a minute or more — say what that silence is.
+        on_detail(f"Removing torch {have['version']} (the "
+                  f"{torch_kind(have)} build) first…", None)
     why = ""
     try:
         res = _run([str(python), "-m", "pip", "uninstall", "-y",
@@ -1818,7 +1869,7 @@ def install_requested_torch(python: str, cfg: dict, log, on_detail=None) -> None
     index = torch_index(cfg)
     gpu = nvidia_gpu()
     log(f"Graphics: {gpu['name'] or 'no NVIDIA GPU found'}")
-    drop_mismatched_torch(python, index, log)
+    drop_mismatched_torch(python, index, log, on_detail)
     # torchvision rides along: ComfyUI's requirements name it, the drop above
     # takes it out with the other two, and it has to come back from the same
     # index as the torch it is built against.

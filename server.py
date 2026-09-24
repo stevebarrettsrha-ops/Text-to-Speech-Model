@@ -1112,6 +1112,8 @@ def api_dep_install(dep_id: str):
                         "task": manager.install_dependency(
                             dep_id, cfg, body,
                             stop_engine=_stop_for_install).view()})
+    except manager.InstallBusy as exc:
+        return jsonify({"error": str(exc)}), 409
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 400
 

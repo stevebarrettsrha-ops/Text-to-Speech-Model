@@ -1009,16 +1009,23 @@ class TorchReinstall(unittest.TestCase):
     """pip counts torch 2.14.0+cpu as satisfying `torch`, so Reinstall against
     the CUDA index changed nothing at all."""
 
-    def _attempt(self, installed, index, code=0, said=""):
+    def _attempt(self, installed, index, code=0, said="", offered=True):
         calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            if "index" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0 if offered else 1, "",
+                    "" if offered else "ERROR: No matching distribution "
+                                       "found for torch")
+            return subprocess.CompletedProcess(cmd, code, "", said)
+
         with mock.patch.object(bootstrap, "installed_torch",
                                return_value=installed), \
-             mock.patch.object(bootstrap, "_run",
-                               side_effect=lambda cmd, **kw: calls.append(cmd)
-                               or subprocess.CompletedProcess(cmd, code, "",
-                                                              said)):
+             mock.patch.object(bootstrap, "_run", side_effect=run):
             dropped = bootstrap.drop_mismatched_torch("py", index, lambda _m: None)
-        return dropped, calls
+        return dropped, [c for c in calls if "index" not in c]
 
     def test_a_cpu_build_is_removed_before_the_cuda_one_lands(self):
         dropped, calls = self._attempt(torch_info("2.14.0+cpu"),
@@ -1049,6 +1056,46 @@ class TorchReinstall(unittest.TestCase):
                                        bootstrap.CUDA_INDEX)
         self.assertFalse(dropped)
         self.assertEqual(calls, [])
+
+    def test_the_silent_uninstall_says_what_it_is(self):
+        # pip prints nothing while it deletes thousands of files; on Windows
+        # that is a minute or more of a button that looks stuck.
+        said = []
+        with mock.patch.object(bootstrap, "installed_torch",
+                               return_value=torch_info("2.14.0+cpu")), \
+             mock.patch.object(bootstrap, "_run", return_value=
+                               subprocess.CompletedProcess([], 0, "", "")):
+            bootstrap.drop_mismatched_torch(
+                "py", bootstrap.CUDA_INDEX, lambda _m: None,
+                lambda text, pct: said.append((text, pct)))
+        self.assertEqual(said[-1], ("Removing torch 2.14.0+cpu (the cpu "
+                                    "build) first…", None))
+
+    def test_nothing_is_removed_until_the_index_has_a_replacement(self):
+        # Uninstall first, find out at the download: an environment with no
+        # torch at all, worse than the CPU build it replaced.
+        calls = []
+        with mock.patch.object(bootstrap, "installed_torch",
+                               return_value=torch_info("2.14.0+cpu")), \
+             mock.patch.object(bootstrap, "_run", side_effect=lambda cmd, **kw:
+                               calls.append(cmd) or subprocess.CompletedProcess(
+                                   cmd, 1, "", "ERROR: No matching "
+                                               "distribution found for torch")):
+            with self.assertRaises(RuntimeError) as caught:
+                bootstrap.drop_mismatched_torch("py", bootstrap.CUDA_INDEX,
+                                                lambda _m: None)
+        self.assertFalse(any("uninstall" in c for c in calls),
+                         "it removed torch with nothing to replace it")
+        self.assertIn("left in place", str(caught.exception))
+        self.assertIn("No matching distribution", str(caught.exception))
+
+    def test_an_index_that_cannot_be_asked_does_not_block_the_install(self):
+        # pip too old for `pip index`: that is not an answer, so no refusal.
+        with mock.patch.object(bootstrap, "_run", return_value=
+                               subprocess.CompletedProcess(
+                                   [], 1, "", 'ERROR: unknown command "index"')):
+            self.assertEqual(bootstrap.index_lacks_torch(
+                "py", bootstrap.CUDA_INDEX), "")
 
     def test_a_cuda_build_is_removed_when_the_cpu_one_is_asked_for(self):
         dropped, _ = self._attempt(torch_info("2.14.0", "12.8"),
@@ -1101,6 +1148,106 @@ class TorchReinstall(unittest.TestCase):
             self._install(torch_info("2.14.0"))
         self.assertIn("still", str(caught.exception))
         self.assertIn("cu128", str(caught.exception))
+
+
+class WhenAnInstallFails(unittest.TestCase):
+    """Reinstall looked as if it did nothing: its progress and its failure
+    both went to a panel a screen below the button, and the failure said
+    only "see the log"."""
+
+    @unittest.skipIf(sys.platform == "win32", "uses a shell script as python")
+    def test_pip_failing_says_what_pip_said(self):
+        root = Path(tempfile.mkdtemp(prefix="sb-pip-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        fake = root / "python"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "echo 'Collecting torch'\n"
+            "echo 'ERROR: Could not find a version that satisfies the "
+            "requirement torch (from versions: none)'\n"
+            "echo 'ERROR: No matching distribution found for torch'\n"
+            "exit 1\n")
+        fake.chmod(0o755)
+        with mock.patch.object(bootstrap, "pip_ready"), \
+             mock.patch.object(bootstrap, "pip_raw_progress", return_value=[]):
+            with self.assertRaises(RuntimeError) as caught:
+                bootstrap.pip_install(str(fake), ["torch"], lambda _m: None)
+        self.assertIn("No matching distribution found for torch",
+                      str(caught.exception))
+
+    def test_a_comfyui_requirement_that_fails_does_not_keep_the_cpu_build(self):
+        # Stopping at ComfyUI's requirements left the row reading exactly as
+        # it had before the button was pressed. The build of PyTorch is what
+        # the button is for; the requirement is reported, afterwards.
+        root = Path(tempfile.mkdtemp(prefix="sb-reinstall-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        comfy = root / "ComfyUI-Qwen3-TTS"
+        comfy.mkdir()
+        (comfy / "main.py").write_text("")
+        (comfy / "requirements.txt").write_text("av>=99\n")
+        vpy = bootstrap.venv_python(comfy)
+        vpy.parent.mkdir(parents=True)
+        vpy.write_text("")
+        cfg = copy.deepcopy(bootstrap.DEFAULT_CONFIG)
+        bootstrap.engine_cfg(cfg, "qwen").update(comfy_dir=str(comfy),
+                                                 managed=True)
+        calls = []
+
+        def pip(_py, args, *_a):
+            calls.append(args)
+            if args[:1] == ["-r"]:
+                raise RuntimeError("pip install failed: ERROR: No matching "
+                                   "distribution found for av>=99")
+
+        with mock.patch.object(bootstrap, "pip_install", side_effect=pip), \
+             mock.patch.object(bootstrap, "install_requested_torch",
+                               side_effect=lambda *_a: calls.append("torch")), \
+             mock.patch.object(bootstrap, "save_config"):
+            with self.assertRaises(RuntimeError) as caught:
+                manager._install_torch(
+                    manager.Task("dependency", "Install PyTorch"), cfg,
+                    {"engine": "qwen"})
+        self.assertEqual(calls[-1], "torch")
+        self.assertIn("PyTorch is in place", str(caught.exception))
+        self.assertIn("av>=99", str(caught.exception))
+
+
+class OnePipPerEnvironment(unittest.TestCase):
+    """A button that looked as if it had done nothing got pressed again, and
+    the one below it — two pips writing one site-packages, one of them
+    uninstalling torch, break each other."""
+
+    def _finish(self, task, timeout=10):
+        deadline = time.time() + timeout
+        while task.state == "running" and time.time() < deadline:
+            time.sleep(0.05)
+        return task.state
+
+    def test_a_second_install_into_the_same_environment_is_refused(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        with mock.patch.object(manager, "_install_torch",
+                               side_effect=lambda *_a: gate.wait(10)), \
+             mock.patch.object(manager, "_install_node_reqs"), \
+             mock.patch.object(manager, "_install_git"):
+            first = manager.install_dependency("torch_qwen", {}, {})
+            with self.assertRaises(manager.InstallBusy) as caught:
+                manager.install_dependency("node_reqs_qwen", {}, {})
+            self.assertIn("Install PyTorch for Qwen3-TTS",
+                          str(caught.exception))
+            # And the page is told so, as a refusal rather than a fault.
+            with server.app.test_client() as web:
+                r = web.post("/api/deps/torch_qwen/install", json={})
+            self.assertEqual(r.status_code, 409)
+            self.assertIn("still running", r.get_json()["error"])
+            # MOSS's environment is not Qwen's, and Git is not pip at all.
+            for other in ("node_reqs_moss", "git"):
+                self.assertEqual(self._finish(manager.install_dependency(
+                    other, {}, {})), "done")
+            gate.set()
+            self.assertEqual(self._finish(first), "done")
+            self.assertEqual(self._finish(manager.install_dependency(
+                "node_reqs_qwen", {}, {})), "done")
 
 
 class ReadingTheTorchBuild(unittest.TestCase):

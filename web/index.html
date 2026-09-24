@@ -288,6 +288,7 @@
   .fitem .n{font-size:13px;min-width:0}
   .fitem .n b{font-weight:500;display:block;word-break:break-all}
   .fitem .n span{font-size:11.5px;color:var(--dim)}
+  .fitem .n .dep-err{display:block;color:#ff9a9a;margin-top:2px}
   .fitem .right{margin-left:auto;display:flex;align-items:center;gap:8px;flex:none}
   .state{font-size:11px;padding:3px 9px;border-radius:999px;border:1px solid var(--line);
          color:var(--muted);white-space:nowrap}
@@ -1573,6 +1574,7 @@ async function loadDeps(fresh) {
           || (it.state === "warn" && it.id.indexOf("engine") === 0)) bad++;
       var el = document.createElement("div");
       el.className = "fitem";
+      el.dataset.dep = it.id;
       el.innerHTML = '<div class="n"><b>' + esc(it.label) + "</b><span>" +
         esc(it.detail || "") + (it.hint ? " — " + esc(it.hint) : "") +
         '</span></div><div class="right"><span class="state ' + it.state + '">' +
@@ -1594,6 +1596,7 @@ async function loadDeps(fresh) {
       box.appendChild(el);
     });
     $("engineTag").hidden = bad === 0;
+    paintDepTasks(S.tasks || []);
   } catch (e) {
     box.innerHTML = '<div class="empty bad-text">' + esc(e.message) + "</div>";
   }
@@ -1605,8 +1608,51 @@ function mkBtn(label, fn) {
   b.addEventListener("click", fn);
   return b;
 }
+/* The row whose button was pressed is where the eye is, and the Activity
+   panel is a screen further down. A 3 GB PyTorch said "Working…" on that
+   button and nothing else for as long as it took, which read as nothing
+   happening at all. So every running install paints its own row: what it is
+   doing on the line under the name, how far on the button. Painted from the
+   task list, so it survives a re-render and a reload. */
+function paintDepTasks(list) {
+  var seen = {};
+  // Newest first, so the first task met for a row is its latest attempt.
+  list.forEach(function (t) {
+    if (t.kind !== "dependency" || !t.meta || seen[t.meta.dep]) return;
+    seen[t.meta.dep] = true;
+    var row = document.querySelector('#dep-list .fitem[data-dep="'
+                                     + t.meta.dep + '"]');
+    if (!row) return;
+    // A failure stays on the row until the next attempt: the toast that said
+    // so is gone in seconds, and the row it left behind read exactly as it
+    // had before the button was pressed — which looks like nothing happened.
+    var state = row.querySelector(".state");
+    if (t.state === "error" && !(state && state.textContent === "ok")) {
+      var n = row.querySelector(".n"), err = n.querySelector(".dep-err");
+      if (!err) {
+        err = document.createElement("span");
+        err.className = "dep-err";
+        n.appendChild(err);
+      }
+      err.textContent = "Last try failed: "
+        + (t.detail || "see the Activity log below.");
+      return;
+    }
+    if (t.state !== "running") return;
+    var stale = row.querySelector(".dep-err");
+    if (stale) stale.remove();
+    var line = row.querySelector(".n span");
+    if (line && t.detail) line.textContent = t.detail;
+    var btn = row.querySelector(".right button");
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spin"></span>'
+        + esc(t.pct > 0 ? Math.round(t.pct) + "%" : "Working…");
+    }
+  });
+}
 async function installDep(id, btn) {
-  if (btn) { btn.disabled = true; btn.textContent = "Working…"; }
+  var b = busy(btn, "Working…");
   try {
     var r = await api("/api/deps/" + id + "/install", { method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1615,7 +1661,7 @@ async function installDep(id, btn) {
     pollTasks();
   } catch (e) {
     toast(e.message, true);
-    if (btn) { btn.disabled = false; btn.textContent = "Install"; }
+    b.done();
   }
 }
 function waitForTask(id) {
@@ -1913,6 +1959,8 @@ async function pollTasks() {
   clearTimeout(taskTimer);
   var list = [];
   try { list = await api("/api/tasks"); } catch (e) { return; }
+  S.tasks = list;
+  paintDepTasks(list);
   var dls = list.filter(function (t) { return t.kind === "download"; });
   var box = $("dl-list");
   if (box) {
@@ -1959,10 +2007,18 @@ async function pollTasks() {
       }
       $("btnCancelTask").hidden = t.state !== "running";
       if (t.state !== "running") {
+        // The list this tick painted from still has it running; left that
+        // way, the redraw below would put the spinner back on a finished row.
+        (S.tasks || []).forEach(function (x) {
+          if (x.id === t.id) { x.state = t.state; x.detail = t.detail; } });
         S.taskId = null;
         loadDeps(); loadLocal(); refreshStatus();
-        toast(t.state === "done" ? t.title + " finished."
-          : t.title + " failed — check the log.", t.state !== "done");
+        // What it ended on is usually the next step ("Restart ComfyUI"),
+        // and the Activity panel it would otherwise sit in is off-screen.
+        toast(t.state === "done"
+          ? t.title + " finished" + (t.detail ? " — " + t.detail : ".")
+          : t.title + " failed — " + (t.detail || "check the log."),
+          t.state !== "done");
       }
     } catch (e) { S.taskId = null; }
   }
