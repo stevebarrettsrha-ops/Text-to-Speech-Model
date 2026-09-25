@@ -2096,6 +2096,79 @@ def forget_torch_health() -> None:
     """Drop every kept answer — called when an install has run pip."""
     with _TORCH_HEALTH_LOCK:
         _TORCH_HEALTH.clear()
+        _ATTENTION.clear()
+
+
+# What the Qwen node will do with an attention choice, asked of the engine's
+# own interpreter. The node caches its model under the attention it
+# *resolved* ("sdpa") and then compares that with the one it was *asked
+# for* ("auto") before every line — never equal, so every line after the
+# first threw the model away and read it back from disk ("Attention changed
+# from 'sdpa' to 'auto', clearing cache…"). Asked for by the name it will
+# store, it keeps the model loaded. The probe mirrors the node's own
+# get_attention_implementation: pre-Ampere CUDA is eager whatever was asked,
+# then sageattention, flash-attn and sdpa by what actually imports.
+ATTENTION_PROBE = r"""
+import json
+major = None
+try:
+    import torch
+    if torch.cuda.is_available():
+        major = torch.cuda.get_device_capability()[0]
+except Exception:
+    pass
+have = []
+for name, module in (("sage_attn", "sageattention"), ("flash_attn", "flash_attn")):
+    try:
+        __import__(module)
+        have.append(name)
+    except Exception:
+        pass
+print(json.dumps({"major": major, "have": have}))
+"""
+_ATTENTION: dict[str, dict] = {}
+
+
+def attention_support(python: str) -> dict:
+    """{"major": 8, "have": ["flash_attn"]} for this interpreter, {} unknown.
+
+    Read once per interpreter per run — it imports torch — and forgotten
+    with the torch answers when an install runs pip.
+    """
+    key = str(python or "")
+    if not key or not Path(key).exists():
+        return {}
+    with _TORCH_HEALTH_LOCK:
+        if key in _ATTENTION:
+            return _ATTENTION[key]
+    try:
+        out = _run([key, "-c", ATTENTION_PROBE], timeout=120)
+        found = json.loads((out.stdout or "").strip().splitlines()[-1])
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(found, dict):
+        return {}
+    with _TORCH_HEALTH_LOCK:
+        _ATTENTION[key] = found
+    return found
+
+
+def qwen_attention(selection: str, found: dict) -> str:
+    """The attention the Qwen node will store its model under for `selection`.
+
+    Unknown hardware answers "sdpa" for "auto": it is what auto picks on any
+    card from the last five years without extra packages, and being asked for
+    by name the node keeps it cached — "auto" never is.
+    """
+    selection = selection or "auto"
+    major = found.get("major")
+    if major is not None and major < 8:
+        return "eager"
+    have = list(found.get("have") or []) + ["sdpa", "eager"]
+    if selection == "auto":
+        return next(a for a in ("sage_attn", "flash_attn", "sdpa", "eager")
+                    if a in have)
+    return selection if selection in have else "sdpa"
 
 
 def torch_damage_summary(found: dict) -> str:

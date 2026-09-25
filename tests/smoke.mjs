@@ -657,6 +657,36 @@ try {
   await page.evaluate(() => loadDeps());
   await sleep(400);
 
+  /* ------------------------------------------- a take that outlives the list */
+  // /api/jobs dropped a finished job whose take ran past three minutes, and
+  // the page waited on it for good: Read disabled, no "Take ready", nothing
+  // in the library. It asks for its own job by id now, and a job that is gone
+  // altogether lets go of the button and says so.
+  {
+    let askedId = null;
+    await page.route(u => u.pathname === '/api/jobs', r => {
+      askedId = new URL(r.request().url()).searchParams.get('id');
+      return r.fulfill({ json: [] });
+    });
+    await page.evaluate(() => {
+      S.job = 'vanished';
+      document.getElementById('btnRun').disabled = true;
+      document.getElementById('btnStop').hidden = false;
+      pollJob(false);
+    });
+    await page.waitForFunction(
+      () => !document.getElementById('btnRun').disabled, null,
+      { timeout: 15000 }).catch(() => {});
+    is(askedId === 'vanished', 'the page asks for the job it is waiting on by id',
+       String(askedId));
+    is(!(await page.$eval('#btnRun', b => b.disabled)),
+       'and a job that has vanished gives the Read button back');
+    const said = (await page.textContent('#toast')).trim();
+    is(/Lost track of that take/.test(said), 'and says what happened', said);
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await page.evaluate(() => { S.job = null; });
+  }
+
   /* ------------------------------------------------- whose ComfyUI is this */
   // 8188 is the port every ComfyUI picks by default, so the one answering is
   // quite often somebody else's — and that looks exactly like nodes that will

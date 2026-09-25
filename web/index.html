@@ -1316,16 +1316,33 @@ async function previewVoice(n) {
     pollJob(true);
   } catch (e) { toast(e.message, true); }
 }
-var jobTimer = null;
+var jobTimer = null, jobMisses = 0;
 async function pollJob(isPreview) {
   clearTimeout(jobTimer);
   var jobs;
-  try { jobs = await api("/api/jobs"); }
+  // Asked for by id, so the server lists this job however long it ran.
+  try { jobs = await api("/api/jobs?id=" + encodeURIComponent(S.job || "")); }
   catch (e) { jobTimer = setTimeout(function () { pollJob(isPreview); }, 3000); return; }
   S.jobs = jobs;
   renderJobs();
   var job = jobs.filter(function (j) { return j.id === S.job; })[0];
-  if (!job) { jobTimer = setTimeout(function () { pollJob(isPreview); }, 1500); return; }
+  if (!job) {
+    // Gone altogether — the app was restarted under it. Waiting on forever
+    // left the Read button disabled over nothing, so say so and let go.
+    if (++jobMisses < 5) {
+      jobTimer = setTimeout(function () { pollJob(isPreview); }, 1500);
+      return;
+    }
+    jobMisses = 0;
+    $("btnRun").disabled = false;
+    $("btnStop").hidden = true;
+    highlight(-1);
+    loadTakes();
+    toast("Lost track of that take — Script Builder was restarted while it "
+          + "ran. Anything it finished is in the Library.", true);
+    return;
+  }
+  jobMisses = 0;
   if (job.status === "running") {
     // A voice sample is one line of its own, not a line of the script.
     highlight(!isPreview && typeof job.line_index === "number"

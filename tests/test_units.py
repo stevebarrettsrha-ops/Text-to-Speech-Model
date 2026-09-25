@@ -634,6 +634,43 @@ class DeadEngine(unittest.TestCase):
         self.assertNotIn("HTTPConnectionPool", message)
 
 
+class TheQwenNodeKeepsItsModel(unittest.TestCase):
+    """The Qwen node resolves "auto" to a real attention, caches the model
+    under that, and before each line compares it with what it was asked for.
+    Asked for "auto", the two never match and every line reloads the model —
+    so the app asks by the name the node's get_attention_implementation would
+    arrive at, mirrored here case for case."""
+
+    def test_auto_names_what_the_node_would_pick(self):
+        cases = [({"major": 8, "have": []}, "sdpa"),
+                 ({"major": 8, "have": ["flash_attn"]}, "flash_attn"),
+                 ({"major": 9, "have": ["sage_attn", "flash_attn"]},
+                  "sage_attn"),
+                 ({"major": 7, "have": ["flash_attn"]}, "eager"),
+                 ({"major": None, "have": []}, "sdpa"),
+                 ({}, "sdpa")]
+        for found, want in cases:
+            with self.subTest(found=found):
+                self.assertEqual(bootstrap.qwen_attention("auto", found), want)
+
+    def test_a_choice_the_node_cannot_honour_is_sent_as_its_fallback(self):
+        # Asked for flash_attn it does not have, the node falls back to sdpa
+        # and stores that — so asking for flash_attn again reloads each line.
+        self.assertEqual(bootstrap.qwen_attention(
+            "flash_attn", {"major": 8, "have": []}), "sdpa")
+        self.assertEqual(bootstrap.qwen_attention(
+            "sdpa", {"major": 7, "have": []}), "eager")
+        self.assertEqual(bootstrap.qwen_attention(
+            "eager", {"major": 8, "have": []}), "eager")
+
+    def test_the_probe_runs_in_the_engine_s_own_interpreter(self):
+        bootstrap.forget_torch_health()
+        self.addCleanup(bootstrap.forget_torch_health)
+        found = bootstrap.attention_support(sys.executable)
+        self.assertIn("have", found)
+        self.assertEqual(bootstrap.attention_support(""), {})
+
+
 class OneModelLoadPerTake(unittest.TestCase):
     """Both node packs hold one checkpoint at a time, so on an 8 GB card the
     order lines are spoken in decides how many times a model is read from
@@ -649,7 +686,8 @@ class OneModelLoadPerTake(unittest.TestCase):
             self.calls.append({"text": line["text"],
                                "weights": comfy.ComfyClient.line_weights(
                                    voice, opts),
-                               "unload": opts["unload"]})
+                               "unload": opts["unload"],
+                               "attention": opts.get("attention")})
             return {"prompt": {}}
 
         def queue(self, prompt):
@@ -692,6 +730,25 @@ class OneModelLoadPerTake(unittest.TestCase):
                 ("1", "a3")]
     MIXED = {"1": {"name": "Ann", "kind": "preset", "speaker": "Aiden"},
              "2": {"name": "Bo", "kind": "clone", "ref_audio": "bo.wav"}}
+
+    def test_the_qwen_node_is_asked_for_attention_by_the_name_it_keeps(self):
+        # "Attention changed from 'sdpa' to 'auto', clearing cache…" on every
+        # line: the node stores the attention it resolved and compares the
+        # one it was asked for, so "auto" reloaded the model per line.
+        with mock.patch.object(bootstrap, "attention_support",
+                               return_value={"major": 8, "have": []}):
+            job = self.run_take(self.MIXED, self.DIALOGUE[:2],
+                                attention="auto")
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertEqual({c["attention"] for c in self.client.calls},
+                         {"sdpa"})
+
+    def test_a_take_records_when_it_finished(self):
+        # /api/jobs keeps a finished job listed by this, not by when it began.
+        before = time.time()
+        job = self.run_take(self.MIXED, self.DIALOGUE[:2])
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertGreaterEqual(job.get("finished", 0), before)
 
     def test_a_preset_answering_a_clone_loads_each_model_once(self):
         # Spoken in script order this swapped CustomVoice for Base on every
@@ -897,6 +954,22 @@ class JobsKeepToThemselves(unittest.TestCase):
         self.addCleanup(lambda: (server.jobs.clear(),
                                  server.jobs.update(self.saved_jobs)))
         self.app = server.app.test_client()
+
+    def test_a_take_longer_than_three_minutes_is_still_seen_to_finish(self):
+        # Listed by when it was created, a take that ran past the window left
+        # /api/jobs the instant it finished: no "Take ready", no error, a Read
+        # button disabled for good over a take that was sitting on disk.
+        now = time.time()
+        server.jobs["long"] = {"id": "long", "status": "done",
+                               "created": now - 600, "finished": now - 1}
+        server.jobs["stale"] = {"id": "stale", "status": "error",
+                                "created": now - 900, "finished": now - 600}
+        listed = {j["id"] for j in self.app.get("/api/jobs").get_json()}
+        self.assertEqual(listed, {"long"})
+        # And the one the page is waiting on is listed however old it is.
+        mine = {j["id"] for j in
+                self.app.get("/api/jobs?id=stale").get_json()}
+        self.assertEqual(mine, {"long", "stale"})
 
     def test_stop_after_a_take_has_finished_interrupts_nothing(self):
         # The player's Stop sends the last job's id, and this used to stop

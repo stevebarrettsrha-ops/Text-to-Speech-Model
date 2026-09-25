@@ -496,6 +496,22 @@
    so the switch is hidden there rather than promising what it cannot do.
    `result()` reads the history once and calls a prompt ComfyUI finished with
    no audio an error, instead of waiting fifteen minutes for nothing.
+31e. **The Qwen node is asked for attention by the name it will keep.** It
+   caches the model under the attention it *resolved* ("sdpa") and, before
+   every line, compares that with the one it was *asked for* — so "auto"
+   never matched, and every line after the first logged "Attention changed
+   from 'sdpa' to 'auto', clearing cache…" and read the model back from disk.
+   `qwen_attention` mirrors the node's `get_attention_implementation`
+   (pre-Ampere is eager whatever is asked; then sage_attn, flash_attn, sdpa by
+   what really imports, read once per interpreter by `attention_support`), and
+   `run_job` sends that name. Unknown hardware gets "sdpa", never "auto".
+31f. **A finished job stays listed by when it finished.** `/api/jobs` kept
+   a job for 180 seconds from `created`, so a take longer than three minutes
+   left the list the instant it ended: the page never saw it finish, the Read
+   button stayed disabled, and the library was never reloaded over a take
+   that was on disk. `set_state` stamps `finished`, the page asks with `?id=`
+   for the job it is waiting on, and a job that is gone altogether (the app
+   restarted under it) gives the button back and says so.
 31d. **A job keeps to its own engine, prompt and clips.** `activate` refuses
    (`busy_elsewhere`) while another engine is reading a take, and `/api/speak`
    registers the job before bringing its engine up: switching engines mid-take
@@ -590,8 +606,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 288 unit tests, standard library only
-npm test                 # 112 checks driving the real page in headless Chromium
+npm run test:units       # 294 unit tests, standard library only
+npm test                 # 115 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script
