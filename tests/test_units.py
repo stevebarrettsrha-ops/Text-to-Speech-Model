@@ -871,6 +871,105 @@ class TakesJoinFromFlac(unittest.TestCase):
         self.assertTrue(server.stitch_wavs(wavs, d / "take.wav", 0.5))
 
 
+class JobsKeepToThemselves(unittest.TestCase):
+    """A take, a Stop and an engine switch each touched more than their own."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.client = mock.MagicMock()
+        for target, value in (("for_engine", lambda *_: self.client),
+                              ("REFS_DIR", self.dir / "refs"),
+                              ("engine_online", lambda *_: True)):
+            patcher = mock.patch.object(server, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.saved_jobs = dict(server.jobs)
+        server.jobs.clear()
+        self.addCleanup(lambda: (server.jobs.clear(),
+                                 server.jobs.update(self.saved_jobs)))
+        self.app = server.app.test_client()
+
+    def test_stop_after_a_take_has_finished_interrupts_nothing(self):
+        # The player's Stop sends the last job's id, and this used to stop
+        # whatever the engine was doing — a self-test, a preview — regardless.
+        server.jobs["old"] = {"id": "old", "status": "done", "engine": "qwen",
+                              "prompt_id": "p1"}
+        r = self.app.post("/api/jobs/old/cancel")
+        self.assertFalse(r.get_json()["running"])
+        self.client.interrupt.assert_not_called()
+
+    def test_stop_on_a_running_take_interrupts_its_own_prompt(self):
+        server.jobs["now"] = {"id": "now", "status": "running",
+                              "engine": "moss", "prompt_id": "p9"}
+        self.app.post("/api/jobs/now/cancel")
+        self.client.interrupt.assert_called_once_with("p9")
+        self.assertTrue(server.jobs["now"]["cancelled"])
+
+    def test_switching_engines_mid_take_leaves_the_take_s_engine_running(self):
+        server.jobs["t"] = {"id": "t", "status": "running", "engine": "qwen",
+                            "title": "Chapter one"}
+        with mock.patch.dict(server.cfg, {"run_both_engines": False}), \
+                mock.patch.object(server.PROCS["qwen"], "stop") as stop:
+            why = server.activate("moss")
+        self.assertIn("Chapter one", why)
+        stop.assert_not_called()
+
+    def test_with_room_for_both_a_take_does_not_block_a_switch(self):
+        server.jobs["t"] = {"id": "t", "status": "running", "engine": "qwen"}
+        with mock.patch.dict(server.cfg, {"run_both_engines": True}):
+            self.assertEqual(server.busy_elsewhere("moss"), "")
+
+    def test_a_reference_is_kept_by_its_contents(self):
+        # Uploaded by file name with overwrite on, two speakers' own
+        # "recording.wav" became one voice.
+        names = []
+        for body in (b"RIFF-one", b"RIFF-two"):
+            r = self.app.post("/api/upload-reference", data={
+                "file": (io.BytesIO(body), "recording.wav")},
+                content_type="multipart/form-data")
+            names.append(r.get_json()["name"])
+        self.assertNotEqual(names[0], names[1])
+        self.assertTrue(all(n.endswith(".wav") for n in names))
+        self.assertTrue((self.dir / "refs" / names[0]).is_file())
+
+    def test_the_engine_that_speaks_the_line_is_sent_the_clip(self):
+        # Each engine is its own ComfyUI with its own input folder: a clip
+        # uploaded while Qwen was showing did not exist for MOSS.
+        r = self.app.post("/api/upload-reference", data={
+            "file": (io.BytesIO(b"RIFF-voice"), "me.wav")},
+            content_type="multipart/form-data")
+        name = r.get_json()["name"]
+        self.client.reset_mock()
+        server.ensure_reference("moss", name)
+        self.client.upload_bytes.assert_called_once()
+        self.assertEqual(self.client.upload_bytes.call_args[0][:2],
+                         (name, b"RIFF-voice"))
+
+    def test_a_pause_of_nothing_is_nothing(self):
+        clip = self.dir / "c.wav"
+        make_clip(clip)
+        self.client.build_line.return_value = {"prompt": {}}
+        self.client.queue.return_value = "p"
+        self.client.result.return_value = ([{"filename": "c.wav"}], None)
+        resp = mock.MagicMock()
+        resp.__enter__.return_value = resp
+        resp.iter_content.return_value = [clip.read_bytes()]
+        self.client.view.return_value = resp
+        server.jobs["z"] = {"id": "z", "status": "running"}
+        with mock.patch.object(server, "TAKES_DIR", self.dir / "takes"), \
+                mock.patch.object(server, "TAKES_PATH",
+                                  self.dir / "takes.json"):
+            server.run_job("z", {"engine": "qwen", "pause": 0,
+                                 "speakers": {"1": {"kind": "preset"}},
+                                 "lines": [{"speaker": 1, "text": "a"},
+                                           {"speaker": 1, "text": "b"}]})
+        take = server.jobs["z"]["take"]
+        self.assertEqual(take["pause"], 0.0)
+        with wave.open(str(self.dir / "takes" / take["id"] / "take.wav")) as w:
+            self.assertEqual(w.getnframes(), 4000)
+
+
 class ALineThatSavedNothing(unittest.TestCase):
     """A prompt ComfyUI finished with no audio was waited on for the whole
     fifteen-minute timeout, because nothing was ever going to arrive."""

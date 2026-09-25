@@ -484,7 +484,14 @@ def upload():
 @app.post("/interrupt")
 def interrupt():
     INTERRUPTED.set()
-    LOG.append("INTERRUPT")
+    pid = (request.get_json(silent=True) or {}).get("prompt_id") or ""
+    LOG.append(f"INTERRUPT {pid}".strip())
+    return jsonify({"ok": True})
+
+
+@app.post("/queue")
+def queue_edit():
+    LOG.append(f"DEQUEUE {(request.get_json(silent=True) or {}).get('delete')}")
     return jsonify({"ok": True})
 
 

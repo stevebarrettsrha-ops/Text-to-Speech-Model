@@ -662,9 +662,18 @@ class ComfyClient:
                 raise ComfyError(r.text[:400])
         return r.json()["prompt_id"]
 
-    def interrupt(self) -> None:
+    def interrupt(self, prompt_id: str = "") -> None:
+        """Stop a prompt. Given its id, only that one — ComfyUI skips the
+        interrupt when something else is running — and it is also taken out
+        of the queue if it had not started. Without an id, whatever runs."""
         try:
-            requests.post(f"{self.url}/interrupt", timeout=10)
+            if prompt_id:
+                requests.post(f"{self.url}/interrupt",
+                              json={"prompt_id": prompt_id}, timeout=10)
+                requests.post(f"{self.url}/queue",
+                              json={"delete": [prompt_id]}, timeout=10)
+            else:
+                requests.post(f"{self.url}/interrupt", timeout=10)
         except Exception:
             pass
 
@@ -724,6 +733,18 @@ class ComfyClient:
                   "type": item.get("type", "output")}
         return _reach(lambda: requests.get(f"{self.url}/view", params=params,
                                           stream=True, timeout=180), self.url)
+
+    def upload_bytes(self, name: str, data: bytes, mimetype: str) -> str:
+        files = {"image": (name, data, mimetype or "audio/wav")}
+        r = _reach(lambda: requests.post(
+            f"{self.url}/upload/image", files=files,
+            data={"type": "input", "overwrite": "true"}, timeout=180),
+            self.url)
+        r.raise_for_status()
+        data = r.json()
+        got = data.get("name") or name
+        sub = data.get("subfolder") or ""
+        return f"{sub}/{got}" if sub else got
 
     def upload_audio(self, file_storage) -> str:
         files = {"image": (file_storage.filename, file_storage.stream,
