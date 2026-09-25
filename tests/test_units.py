@@ -634,6 +634,86 @@ class DeadEngine(unittest.TestCase):
         self.assertNotIn("HTTPConnectionPool", message)
 
 
+class TheDesignPanelSaysWhatIsThere(unittest.TestCase):
+    """The Design panel told everyone "Needs the 1.7B VoiceDesign model",
+    with nothing to press — on a machine that had it, that read as a fault.
+    /api/voices now says which model a designed voice loads and whether it
+    is on disk, per engine."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="sb-design-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        patch = mock.patch.object(server, "cfg", split_cfg(self.root))
+        patch.start()
+        self.addCleanup(patch.stop)
+        vram = mock.patch.object(server, "gpu_vram", return_value=8188)
+        vram.start()
+        self.addCleanup(vram.stop)
+
+    def _have(self, engine, repo):
+        base = bootstrap.engine_models_dir(server.cfg, engine)
+        d = bootstrap.model_dir(base, repo, engine)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "model.safetensors").write_text("w")
+
+    def test_each_engine_names_its_own_design_model(self):
+        self.assertEqual(server.design_model("qwen")["repo"],
+                         "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+        self.assertEqual(server.design_model("moss")["repo"],
+                         "OpenMOSS-Team/MOSS-VoiceGenerator")
+
+    def test_absent_until_its_weights_are_on_disk(self):
+        self.assertIs(server.design_model("qwen")["installed"], False)
+        self._have("qwen", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+        self.assertIs(server.design_model("qwen")["installed"], True)
+        # And the other engine's copy is not this one's.
+        self.assertIs(server.design_model("moss")["installed"], False)
+
+    def test_no_models_folder_is_unknown_not_missing(self):
+        server.cfg["engines"]["qwen"]["models_dir"] = str(self.root / "nowhere")
+        self.assertIsNone(server.design_model("qwen")["installed"])
+
+    def test_it_fits_an_8_gb_card(self):
+        self.assertIs(server.design_model("qwen")["fits"], True)
+
+
+class TheQwenNodeKeepsItsModel(unittest.TestCase):
+    """The Qwen node resolves "auto" to a real attention, caches the model
+    under that, and before each line compares it with what it was asked for.
+    Asked for "auto", the two never match and every line reloads the model —
+    so the app asks by the name the node's get_attention_implementation would
+    arrive at, mirrored here case for case."""
+
+    def test_auto_names_what_the_node_would_pick(self):
+        cases = [({"major": 8, "have": []}, "sdpa"),
+                 ({"major": 8, "have": ["flash_attn"]}, "flash_attn"),
+                 ({"major": 9, "have": ["sage_attn", "flash_attn"]},
+                  "sage_attn"),
+                 ({"major": 7, "have": ["flash_attn"]}, "eager"),
+                 ({"major": None, "have": []}, "sdpa"),
+                 ({}, "sdpa")]
+        for found, want in cases:
+            with self.subTest(found=found):
+                self.assertEqual(bootstrap.qwen_attention("auto", found), want)
+
+    def test_a_choice_the_node_cannot_honour_is_sent_as_its_fallback(self):
+        # Asked for flash_attn it does not have, the node falls back to sdpa
+        # and stores that — so asking for flash_attn again reloads each line.
+        self.assertEqual(bootstrap.qwen_attention(
+            "flash_attn", {"major": 8, "have": []}), "sdpa")
+        self.assertEqual(bootstrap.qwen_attention(
+            "sdpa", {"major": 7, "have": []}), "eager")
+        self.assertEqual(bootstrap.qwen_attention(
+            "eager", {"major": 8, "have": []}), "eager")
+
+    def test_the_probe_runs_in_the_engine_s_own_interpreter(self):
+        bootstrap.forget_torch_health()
+        self.addCleanup(bootstrap.forget_torch_health)
+        found = bootstrap.attention_support(sys.executable)
+        self.assertIn("have", found)
+        self.assertEqual(bootstrap.attention_support(""), {})
+
+
 class OneModelLoadPerTake(unittest.TestCase):
     """Both node packs hold one checkpoint at a time, so on an 8 GB card the
     order lines are spoken in decides how many times a model is read from
@@ -649,7 +729,8 @@ class OneModelLoadPerTake(unittest.TestCase):
             self.calls.append({"text": line["text"],
                                "weights": comfy.ComfyClient.line_weights(
                                    voice, opts),
-                               "unload": opts["unload"]})
+                               "unload": opts["unload"],
+                               "attention": opts.get("attention")})
             return {"prompt": {}}
 
         def queue(self, prompt):
@@ -692,6 +773,25 @@ class OneModelLoadPerTake(unittest.TestCase):
                 ("1", "a3")]
     MIXED = {"1": {"name": "Ann", "kind": "preset", "speaker": "Aiden"},
              "2": {"name": "Bo", "kind": "clone", "ref_audio": "bo.wav"}}
+
+    def test_the_qwen_node_is_asked_for_attention_by_the_name_it_keeps(self):
+        # "Attention changed from 'sdpa' to 'auto', clearing cache…" on every
+        # line: the node stores the attention it resolved and compares the
+        # one it was asked for, so "auto" reloaded the model per line.
+        with mock.patch.object(bootstrap, "attention_support",
+                               return_value={"major": 8, "have": []}):
+            job = self.run_take(self.MIXED, self.DIALOGUE[:2],
+                                attention="auto")
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertEqual({c["attention"] for c in self.client.calls},
+                         {"sdpa"})
+
+    def test_a_take_records_when_it_finished(self):
+        # /api/jobs keeps a finished job listed by this, not by when it began.
+        before = time.time()
+        job = self.run_take(self.MIXED, self.DIALOGUE[:2])
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertGreaterEqual(job.get("finished", 0), before)
 
     def test_a_preset_answering_a_clone_loads_each_model_once(self):
         # Spoken in script order this swapped CustomVoice for Base on every
@@ -897,6 +997,22 @@ class JobsKeepToThemselves(unittest.TestCase):
         self.addCleanup(lambda: (server.jobs.clear(),
                                  server.jobs.update(self.saved_jobs)))
         self.app = server.app.test_client()
+
+    def test_a_take_longer_than_three_minutes_is_still_seen_to_finish(self):
+        # Listed by when it was created, a take that ran past the window left
+        # /api/jobs the instant it finished: no "Take ready", no error, a Read
+        # button disabled for good over a take that was sitting on disk.
+        now = time.time()
+        server.jobs["long"] = {"id": "long", "status": "done",
+                               "created": now - 600, "finished": now - 1}
+        server.jobs["stale"] = {"id": "stale", "status": "error",
+                                "created": now - 900, "finished": now - 600}
+        listed = {j["id"] for j in self.app.get("/api/jobs").get_json()}
+        self.assertEqual(listed, {"long"})
+        # And the one the page is waiting on is listed however old it is.
+        mine = {j["id"] for j in
+                self.app.get("/api/jobs?id=stale").get_json()}
+        self.assertEqual(mine, {"long", "stale"})
 
     def test_stop_after_a_take_has_finished_interrupts_nothing(self):
         # The player's Stop sends the last job's id, and this used to stop
@@ -1935,6 +2051,54 @@ class ADamagedTorch(unittest.TestCase):
         self.assertTrue(row.get("repair"))
         self.assertIn("damaged", row["detail"])
 
+    def test_the_engine_page_reads_torch_again_only_once_pip_has_changed_it(self):
+        # The Engine page's list sat empty under "Checking what is missing…"
+        # while every torch .py file was hashed, for both engines, on every
+        # visit — long enough that the Reinstall button the console pointed
+        # at never appeared. The answer is kept until pip touches torch.
+        bootstrap.forget_torch_health()
+        self.addCleanup(bootstrap.forget_torch_health)
+        fake_torch_site(self.site)
+        with mock.patch.object(bootstrap, "torch_damage",
+                               wraps=bootstrap.torch_damage) as probe:
+            first = bootstrap.torch_damage_cached(sys.executable)
+            again = bootstrap.torch_damage_cached(sys.executable)
+            self.assertEqual(probe.call_count, 1,
+                             "torch was read again with nothing changed")
+            self.assertEqual(first, again)
+            # pip installing a second torch over the first: a new dist-info.
+            fake_torch_site(self.site, "2.14.0+cpu")
+            said = bootstrap.torch_damage_summary(
+                bootstrap.torch_damage_cached(sys.executable))
+            self.assertEqual(probe.call_count, 2)
+            self.assertIn("two versions of torch", said)
+            # Recheck reads it afresh whatever the folders say.
+            bootstrap.torch_damage_cached(sys.executable, fresh=True)
+            self.assertEqual(probe.call_count, 3)
+
+    def test_an_answer_that_names_no_folder_is_not_kept(self):
+        # Nothing to tell a changed install by, so nothing to trust later.
+        bootstrap.forget_torch_health()
+        self.addCleanup(bootstrap.forget_torch_health)
+        with mock.patch.object(bootstrap, "torch_damage",
+                               return_value={"dists": {}}) as probe:
+            bootstrap.torch_damage_cached("py")
+            bootstrap.torch_damage_cached("py")
+        self.assertEqual(probe.call_count, 2)
+
+    def test_an_install_forgets_what_torch_looked_like(self):
+        # Finished, failed or cut off, pip has run: the kept answer is gone.
+        bootstrap._TORCH_HEALTH["py"] = (("x",), {"root": "/nowhere"})
+        self.addCleanup(bootstrap.forget_torch_health)
+        with mock.patch.object(manager, "_install_torch",
+                               side_effect=RuntimeError("cut off")):
+            task = manager.install_dependency("torch_qwen", {}, {})
+            deadline = time.time() + 10
+            while task.state == "running" and time.time() < deadline:
+                time.sleep(0.02)
+        self.assertEqual(task.state, "error")
+        self.assertEqual(bootstrap._TORCH_HEALTH, {})
+
     def test_a_torch_that_will_not_import_is_not_called_missing(self):
         with mock.patch.object(manager, "_probe", return_value=(
                 1, "Traceback …\nImportError: DLL load failed")), \
@@ -2289,6 +2453,32 @@ class NodeImportDiagnosis(unittest.TestCase):
                       bootstrap.node_import_error(sys.executable, self.root))
 
 
+class TheEngineConsoleIsPlainText(unittest.TestCase):
+    """ComfyUI colours its log even into a pipe, and the engine console
+    printed "\x1b[32m[INFO]\x1b[0m" as boxes and brackets on every line."""
+
+    def test_what_the_engine_prints_arrives_without_its_colour_codes(self):
+        said = ("\x1b[32m[INFO]\x1b[0m comfy-kitchen version: 0.2.35",
+                "\x1b[1m\x1b[33m[WARNING]\x1b[0m ****** User settings ******",
+                "\x1b]0;ComfyUI\x07Starting server")
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys\nfor l in sys.argv[1:]: print(l)", *said],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            **bootstrap.PY_TEXT)
+        engine = bootstrap.ComfyProcess()
+        engine._pump(child, bootstrap.Progress())
+        child.wait()
+        self.assertEqual(engine.lines, [
+            "[INFO] comfy-kitchen version: 0.2.35",
+            "[WARNING] ****** User settings ******",
+            "Starting server"])
+
+    def test_a_line_with_no_codes_is_left_exactly_as_it_was(self):
+        line = "Traceback (most recent call last): [x] ~ \\ ok"
+        self.assertEqual(bootstrap.plain(line), line)
+
+
 class NodesNotLoaded(unittest.TestCase):
     """ComfyUI reads custom_nodes once, at startup, so installing them into a
     running engine leaves it running without them."""
@@ -2367,6 +2557,26 @@ class NodesNotLoaded(unittest.TestCase):
         rows = {i["id"]: i for i in items
                 if i["id"] in ("node_qwen", "node_moss")}
         self.assertEqual({r["state"] for r in rows.values()}, {"missing"})
+
+    def test_the_engines_are_checked_side_by_side(self):
+        # Each engine costs a torch import, a transformers import and a read
+        # of torch's files. One after the other, the Engine page's list stayed
+        # empty for the length of both. Each engine's check here waits for
+        # the other's to start, which only a side-by-side run gets past.
+        both = threading.Barrier(len(bootstrap.ENGINES), timeout=10)
+
+        def row(_py, suffix, label, _cfg=None, _fresh=False):
+            both.wait()
+            return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
+                    "state": "ok", "detail": "", "action": "reinstall"}
+
+        with mock.patch.object(manager, "_torch_row", side_effect=row):
+            items = manager.dependencies(
+                self.cfg, {e: self.Engine(True) for e in bootstrap.ENGINES})
+        ids = [i["id"] for i in items]
+        # And the list still reads in engine order, whichever finished first.
+        self.assertEqual(ids[:3], ["python", "git", "comfyui_qwen"])
+        self.assertLess(ids.index("engine_qwen"), ids.index("comfyui_moss"))
 
     def test_an_engine_turned_off_is_not_reported_as_missing(self):
         items = manager.dependencies(dict(self.cfg, want_moss=False),

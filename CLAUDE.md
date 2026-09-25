@@ -99,6 +99,21 @@
    the torch folders it left behind, in the one directory the interpreter
    loads torch from — never before `index_lacks_torch` says a replacement
    exists.
+5f. **The Engine page reads torch's files only when pip has changed them.**
+   `torch_damage` hashes every `.py` torch ships, twice over when two versions
+   are installed over each other, and the report used to run it on every visit,
+   engine after engine. The dependency list sat empty under "Checking what is
+   missing…" for all of that, while the engine console above it pointed at a
+   Reinstall button in that same list. `torch_damage_cached` keeps the answer
+   until `_torch_fingerprint` changes: site-packages itself, the torch folders
+   at its top (pip's `~orch` stash included) and each torch RECORD, all of
+   which pip touches when it installs or uninstalls torch. An answer that
+   names no folder is never kept. Recheck (`fresh`), Start
+   (`torch_launch`) and Reinstall still read afresh, and any pip install task
+   clears the cache however it ends. The two engines are checked side by side
+   (`_engine_rows` on a thread each), the page says it is checking instead of
+   showing an empty list, and callers that ask at the same moment share one
+   request (`fetchDeps`).
 5d. **ComfyUI is never launched on a torch it will die on.** It asks CUDA for
    a device while it imports, so a CPU-only torch without `--cpu` stops as it
    starts — "AssertionError: Torch not compiled with CUDA enabled", a stack
@@ -252,6 +267,16 @@
    5e), no driver, a taken port, out of memory — each with the control that
    clears it, and anything else is its own last exception line, never
    nothing. `/api/status` and `/api/comfy/log` carry it as `stopped`.
+18j. **The Engine badge has two witnesses, and either raises it.** The
+   status poll (engine up, nodes loaded) and the dependency list (anything
+   missing or `repair`) each used to set it alone, and the poll runs every six
+   seconds, so it put the badge down over a PyTorch the list had just marked
+   for repair whenever any engine answered. `paintEngineTag` combines them.
+18k. **The engine console is plain text.** ComfyUI colours its log even
+   into a pipe, so every line arrived wrapped in `\x1b[32m…\x1b[0m` and the
+   page printed the escapes. `plain()` strips them where lines are read —
+   `ComfyProcess._pump` and `manager.stream` — so `crash_reason` and the
+   Activity log see the same text a person does.
 18d. **`already` is not `started`.** `/api/comfy/start` returns `already` when
    something answers the address, and the page used to toast "Starting…"
    regardless: pressed, claims to work, changes nothing. It now says what is
@@ -373,6 +398,17 @@
    at run time, because ComfyUI's validation passes the graph and only the
    node objects.
 
+23d. **The Design panel says whether its model is here, and every voice
+   source can be heard.** It said "Needs the 1.7B VoiceDesign model — one
+   button on the Models page" to everyone, with that model installed and no
+   button in sight, and only Preset had Hear it — so a designed voice had no
+   way to begin short of reading the whole script. `/api/voices` carries
+   `design_model` (repo, `installed` — None where there is no models folder
+   to look in — and `fits`), the note offers Download it where it is
+   missing, and `hearIt()` puts Hear it under Clone and Design too, naming
+   what is still to do (a clip, a description, the download) instead of
+   sending a line that will fail.
+
 24. **Readiness is per engine.** With MOSS selected, a missing Qwen folder is
    not what stands between the script and a take; reporting it as one sends
    people to download a model they are not about to use. `/api/status` takes an
@@ -471,6 +507,22 @@
    so the switch is hidden there rather than promising what it cannot do.
    `result()` reads the history once and calls a prompt ComfyUI finished with
    no audio an error, instead of waiting fifteen minutes for nothing.
+31e. **The Qwen node is asked for attention by the name it will keep.** It
+   caches the model under the attention it *resolved* ("sdpa") and, before
+   every line, compares that with the one it was *asked for* — so "auto"
+   never matched, and every line after the first logged "Attention changed
+   from 'sdpa' to 'auto', clearing cache…" and read the model back from disk.
+   `qwen_attention` mirrors the node's `get_attention_implementation`
+   (pre-Ampere is eager whatever is asked; then sage_attn, flash_attn, sdpa by
+   what really imports, read once per interpreter by `attention_support`), and
+   `run_job` sends that name. Unknown hardware gets "sdpa", never "auto".
+31f. **A finished job stays listed by when it finished.** `/api/jobs` kept
+   a job for 180 seconds from `created`, so a take longer than three minutes
+   left the list the instant it ended: the page never saw it finish, the Read
+   button stayed disabled, and the library was never reloaded over a take
+   that was on disk. `set_state` stamps `finished`, the page asks with `?id=`
+   for the job it is waiting on, and a job that is gone altogether (the app
+   restarted under it) gives the button back and says so.
 31d. **A job keeps to its own engine, prompt and clips.** `activate` refuses
    (`busy_elsewhere`) while another engine is reading a take, and `/api/speak`
    registers the job before bringing its engine up: switching engines mid-take
@@ -565,8 +617,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 282 unit tests, standard library only
-npm test                 # 108 checks driving the real page in headless Chromium
+npm run test:units       # 298 unit tests, standard library only
+npm test                 # 119 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script

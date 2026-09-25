@@ -562,6 +562,11 @@ def generation_order(voices: list[dict], opts: dict) -> list[int]:
 
 def run_job(job_id: str, payload: dict) -> None:
     def set_state(**kw):
+        # When it ended, not when it began, is what /api/jobs keeps a finished
+        # job listed by: a take that ran longer than that window used to drop
+        # out of the list the moment it finished.
+        if kw.get("status", "running") != "running":
+            kw["finished"] = time.time()
         with jobs_lock:
             jobs[job_id].update(kw)
 
@@ -588,6 +593,14 @@ def run_job(job_id: str, payload: dict) -> None:
         if engine == "moss":
             opts["moss_model"] = payload.get("moss_model") or ""
             opts["moss_dirs"] = moss_dirs()
+        else:
+            # By the name the node will store, never "auto": it compares the
+            # two before every line, and "auto" against "sdpa" reloaded the
+            # model from disk for each one (bootstrap.qwen_attention).
+            opts["attention"] = bootstrap.qwen_attention(
+                opts["attention"],
+                bootstrap.attention_support(
+                    bootstrap.comfy_python(cfg, engine)))
         # The slider goes down to 0, and `or 0.5` read that as "not given".
         pause = payload.get("pause")
         pause = 0.5 if pause in (None, "") else max(float(pause), 0.0)
@@ -808,6 +821,28 @@ def api_status():
     return jsonify(payload)
 
 
+def design_model(engine: str, client=None) -> dict:
+    """The model a designed voice loads on this engine, and whether it is here.
+
+    The Design panel said "Needs the 1.7B VoiceDesign model" to everyone,
+    whether they had it or not, and gave them nothing to press — so it read
+    as something missing on a machine where nothing was. `installed` is None
+    when there is no models folder to look in, which is not the same as no.
+    """
+    group = "moss_design" if engine == "moss" else "design"
+    m = next((m for m in bootstrap.ENGINES[engine]["models"]
+              if m["group"] == group), None)
+    if not m:
+        return {}
+    base = bootstrap.engine_models_dir(cfg, engine)
+    installed = (bootstrap.model_installed(base, m["repo"], engine)
+                 if base and base.is_dir() else None)
+    return {"repo": m["repo"], "params": m.get("params", ""),
+            "vram_gb": m.get("vram_gb"), "installed": installed,
+            "fits": bootstrap.fits_vram(m.get("vram_gb") or 0,
+                                        gpu_vram(client))}
+
+
 @app.get("/api/voices")
 def api_voices():
     want = request.args.get("engine") or current_engine()
@@ -848,6 +883,7 @@ def api_voices():
                 "variants": client.moss_variants(),
                 "attentions": [],
                 "capabilities": client.capabilities("moss"),
+                "design_model": design_model("moss", client),
             })
         speakers = client.speakers()
         return jsonify({
@@ -857,6 +893,7 @@ def api_voices():
             "models": client.models(),
             "attentions": client.attentions(),
             "capabilities": client.capabilities("qwen"),
+            "design_model": design_model("qwen", client),
         })
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 400
@@ -1248,12 +1285,17 @@ def api_deps():
     # The GPU answer is cached — it costs a PowerShell query on Windows and
     # cannot change without a reboot. Recheck asks again anyway, because
     # installing the driver is exactly what someone does between two presses.
-    gpu = dict(bootstrap.nvidia_gpu(refresh=request.args.get("fresh") == "1"))
+    fresh = request.args.get("fresh") == "1"
+    gpu = dict(bootstrap.nvidia_gpu(refresh=fresh))
     if not gpu.get("vram_mb") and any_live:
         # nvidia-smi missing but ComfyUI running: it carries its own CUDA and
         # knows the card, which is exactly the gap rule 5b is about.
         gpu["vram_mb"] = any_live.vram_mb()
-    return jsonify({"items": manager.dependencies(cfg, live, current_engine()),
+    # Recheck also reads torch's files again rather than trusting the copy
+    # kept since pip last touched them: it is pressed because something is
+    # suspected, and that is the one time a kept answer is the wrong one.
+    return jsonify({"items": manager.dependencies(cfg, live, current_engine(),
+                                                  fresh),
                     "torch_index": cfg.get("torch_index", ""),
                     "gpu": gpu,
                     "torch_auto": bootstrap.torch_index({})})
@@ -1431,10 +1473,19 @@ def api_speak():
 
 @app.get("/api/jobs")
 def api_jobs():
+    # A finished job stays listed for three minutes from when it *finished*.
+    # Counted from when it was created, a take longer than three minutes left
+    # the list at the instant it ended: the page never saw it finish, never
+    # said "Take ready" or why it failed, never reloaded the library, and
+    # left the Read button disabled over a take that was sitting on disk.
+    # `id` is the job the page is waiting on, listed however old it is.
+    mine = request.args.get("id", "")
+    now = time.time()
     with jobs_lock:
-        active = [j for j in jobs.values()
-                  if j["status"] == "running" or time.time() - j["created"] < 180]
-        return jsonify(sorted(active, key=lambda j: j["created"], reverse=True))
+        active = [dict(j) for j in jobs.values()
+                  if j["status"] == "running" or j["id"] == mine
+                  or now - j.get("finished", j["created"]) < 180]
+    return jsonify(sorted(active, key=lambda j: j["created"], reverse=True))
 
 
 @app.post("/api/jobs/<job_id>/cancel")

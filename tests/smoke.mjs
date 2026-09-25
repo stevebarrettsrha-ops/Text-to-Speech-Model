@@ -140,6 +140,41 @@ try {
   await page.click('#cardVoices > summary');
   await sleep(400);
 
+  /* ------------------------------------------------------- designed voice */
+  // Design had no button to try the voice, and its note said "Needs the 1.7B
+  // VoiceDesign model" whether or not the model was there — which read as a
+  // fault on a machine that had it.
+  {
+    const designNote = () => page.$eval('#spk-1 [data-dnote]',
+                                        e => e.textContent);
+    await page.evaluate(() => {
+      S.voices.design_model = { repo: 'Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign',
+                                installed: true, vram_gb: 5, fits: true };
+      S.speakers[1].instruct = '';
+      setSource(1, 'design');
+    });
+    is(!!(await page.$('#spk-1 [data-preview="1"]')),
+       'a designed voice can be heard before the script is read');
+    const have = await designNote();
+    is(/^Uses the 1\.7B VoiceDesign model/.test(have),
+       'and with its model on disk nothing reads as missing', have);
+    await page.click('#spk-1 [data-preview="1"]');
+    await sleep(200);
+    const empty = (await page.textContent('#toast')).trim();
+    is(/Describe .* voice first/.test(empty),
+       'Hear it with no description says what to write', empty);
+    await page.evaluate(() => {
+      S.voices.design_model.installed = false;
+      renderSpeakerBody(1);
+    });
+    const lacking = await designNote();
+    is(/not downloaded yet/.test(lacking)
+       && !!(await page.$('#spk-1 [data-dnote] button.go')),
+       'without it, the note offers the download right there', lacking);
+    await page.evaluate(() => { setSource(1, 'preset'); loadVoices(); });
+    await sleep(400);
+  }
+
   /* ------------------------------------------------------------ generate */
   const before = (await takes()).length;
   await page.click('#btnRun');
@@ -521,6 +556,31 @@ try {
   // it started, every time. The server marks that row `repair`; the page has
   // to raise the badge for it and repair it with everything else. No machine
   // here has the card, so the report is the one thing faked.
+  // The list sat empty under "Checking what is missing…" for as long as the
+  // report took, while the engine console above it pointed at a Reinstall
+  // button in that list. It says it is checking now, and opening the page
+  // and pressing Install everything missing share one report between them.
+  {
+    const held = await app.api('/api/deps');
+    let asked = 0, release;
+    const gate = new Promise(r => { release = r; });
+    await page.route(u => u.pathname === '/api/deps', async r => {
+      asked++; await gate; return r.fulfill({ json: held });
+    });
+    await page.evaluate(() => { document.getElementById('dep-list').innerHTML = '';
+                                loadDeps(); loadDeps(); });
+    await sleep(300);
+    const waiting = (await page.textContent('#dep-list')).trim();
+    is(/Checking each engine/.test(waiting),
+       'an Engine list still being checked says so instead of sitting empty',
+       waiting);
+    release();
+    await sleep(400);
+    is(asked === 1, 'and two callers at once share one report', String(asked));
+    is((await page.$$('#dep-list .fitem')).length > 0,
+       'and the rows replace the notice when it lands');
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+  }
   const realDeps = await app.api('/api/deps');
   const repairDeps = { ...realDeps, items: realDeps.items.map(i =>
     i.id === 'torch_qwen'
@@ -545,6 +605,12 @@ try {
   await sleep(400);
   is(await page.$eval('#engineTag', e => !e.hidden),
      'a PyTorch that cannot start raises the Engine badge');
+  // The status poll runs every six seconds and used to put the badge back
+  // down whenever an engine answered, whatever the list had found.
+  await page.evaluate(() => refreshStatus());
+  await sleep(300);
+  is(await page.$eval('#engineTag', e => !e.hidden),
+     'and the status poll does not put it back down');
   const repairBtn = await page.$$eval('#dep-list .fitem', rows => {
     const row = rows.find(x => x.textContent.includes('PyTorch · Qwen3-TTS'));
     const btn = row && row.querySelector('button');
@@ -625,6 +691,36 @@ try {
   await page.unrouteAll({ behavior: 'ignoreErrors' });
   await page.evaluate(() => loadDeps());
   await sleep(400);
+
+  /* ------------------------------------------- a take that outlives the list */
+  // /api/jobs dropped a finished job whose take ran past three minutes, and
+  // the page waited on it for good: Read disabled, no "Take ready", nothing
+  // in the library. It asks for its own job by id now, and a job that is gone
+  // altogether lets go of the button and says so.
+  {
+    let askedId = null;
+    await page.route(u => u.pathname === '/api/jobs', r => {
+      askedId = new URL(r.request().url()).searchParams.get('id');
+      return r.fulfill({ json: [] });
+    });
+    await page.evaluate(() => {
+      S.job = 'vanished';
+      document.getElementById('btnRun').disabled = true;
+      document.getElementById('btnStop').hidden = false;
+      pollJob(false);
+    });
+    await page.waitForFunction(
+      () => !document.getElementById('btnRun').disabled, null,
+      { timeout: 15000 }).catch(() => {});
+    is(askedId === 'vanished', 'the page asks for the job it is waiting on by id',
+       String(askedId));
+    is(!(await page.$eval('#btnRun', b => b.disabled)),
+       'and a job that has vanished gives the Read button back');
+    const said = (await page.textContent('#toast')).trim();
+    is(/Lost track of that take/.test(said), 'and says what happened', said);
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await page.evaluate(() => { S.job = null; });
+  }
 
   /* ------------------------------------------------- whose ComfyUI is this */
   // 8188 is the port every ComfyUI picks by default, so the one answering is

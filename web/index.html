@@ -90,7 +90,7 @@
   .btn.go{background:linear-gradient(100deg,var(--accent),var(--accent-2));color:#fff}
   .btn.thin{padding:7px 13px;font-size:12.5px}
   .btn:disabled{opacity:.45;cursor:not-allowed}
-  .btn .spin{display:inline-block;width:12px;height:12px;border:2px solid currentColor;
+  .btn .spin,.empty .spin{display:inline-block;width:12px;height:12px;border:2px solid currentColor;
     border-right-color:transparent;border-radius:50%;margin-right:7px;
     vertical-align:-2px;animation:rot .8s linear infinite}
   @keyframes rot{to{transform:rotate(360deg)}}
@@ -1080,18 +1080,64 @@ function renderSpeakerBody(n) {
       uploadRef(n, e.target); });
     body.querySelector("[data-reftext]").addEventListener("input", function (e) {
       S.speakers[n].ref_text = e.target.value; saveDraft(); });
+    body.appendChild(hearIt(n));
   } else {
+    // What the note says depends on whether the model is on disk. It used to
+    // say "Needs the 1.7B VoiceDesign model" to everyone and offer nothing to
+    // press, which read as something missing whether it was or not.
+    var dm = S.voices.design_model || {};
+    var need = isMoss() ? "MOSS-VoiceGenerator (1.7B)"
+                        : "the 1.7B VoiceDesign model";
     body.innerHTML = '<label class="flab">Describe the voice</label>' +
       '<textarea rows="3" data-instruct="' + n +
       '" placeholder="A gentle female voice with a high pitch, speaking slowly">' +
       esc(s.instruct) + "</textarea>" +
-      '<div class="note">' + (isMoss()
-        ? "Needs MOSS-VoiceGenerator — 1.7B, the same size as the base model. One button on the Models page."
-        : "Needs the 1.7B VoiceDesign model — one button on the Models page.") +
-      "</div>";
+      '<div class="note" data-dnote></div>';
+    var note = body.querySelector("[data-dnote]");
+    if (dm.installed === false) {
+      note.textContent = "Needs " + need + ", which is not downloaded yet"
+        + (dm.vram_gb ? " (about " + dm.vram_gb + " GB of graphics memory)" : "")
+        + ". ";
+      var get = mkBtn("Download it", function () {
+        if (dm.fits === false && !confirm(dm.repo + " wants about " + dm.vram_gb
+            + " GB of graphics memory, more than this card has. Download it "
+            + "anyway?")) return;
+        startDownload(dm.repo, get);
+      });
+      get.className = "btn thin go";
+      note.appendChild(get);
+    } else {
+      note.textContent = (dm.installed ? "Uses " + need + ". " : "Needs "
+        + need + " — on the Models page if you do not have it. ")
+        + "Say who is speaking: age, pitch, pace, accent, mood. Each line is "
+        + "designed afresh, so the voice can drift from line to line — Clone "
+        + "a sample you like to hold it steady.";
+    }
     body.querySelector("[data-instruct]").addEventListener("input", function (e) {
       S.speakers[n].instruct = e.target.value; saveDraft(); });
+    body.appendChild(hearIt(n));
   }
+}
+/* Every voice source can be heard before a whole script is spent on it —
+   only Preset could, so a designed voice had no way to begin at all short
+   of reading the script. Each one says what it is still missing. */
+function hearIt(n) {
+  var row = document.createElement("div");
+  row.style.cssText = "display:flex;justify-content:flex-end;margin-top:9px";
+  var b = mkBtn("Hear it", function () {
+    var s = S.speakers[n], dm = S.voices.design_model || {};
+    if (s.kind === "clone" && !s.ref_audio) {
+      toast("Choose a clip for " + spkName(n) + " first.", true); return; }
+    if (s.kind === "design" && !(s.instruct || "").trim()) {
+      toast("Describe " + spkName(n) + "'s voice first.", true); return; }
+    if (s.kind === "design" && dm.installed === false) {
+      toast("Download the voice design model first — the button is just "
+            + "above.", true); return; }
+    previewVoice(n);
+  });
+  b.dataset.preview = n;
+  row.appendChild(b);
+  return row;
 }
 function setSource(n, kind) {
   S.speakers[n].kind = kind;
@@ -1316,16 +1362,33 @@ async function previewVoice(n) {
     pollJob(true);
   } catch (e) { toast(e.message, true); }
 }
-var jobTimer = null;
+var jobTimer = null, jobMisses = 0;
 async function pollJob(isPreview) {
   clearTimeout(jobTimer);
   var jobs;
-  try { jobs = await api("/api/jobs"); }
+  // Asked for by id, so the server lists this job however long it ran.
+  try { jobs = await api("/api/jobs?id=" + encodeURIComponent(S.job || "")); }
   catch (e) { jobTimer = setTimeout(function () { pollJob(isPreview); }, 3000); return; }
   S.jobs = jobs;
   renderJobs();
   var job = jobs.filter(function (j) { return j.id === S.job; })[0];
-  if (!job) { jobTimer = setTimeout(function () { pollJob(isPreview); }, 1500); return; }
+  if (!job) {
+    // Gone altogether — the app was restarted under it. Waiting on forever
+    // left the Read button disabled over nothing, so say so and let go.
+    if (++jobMisses < 5) {
+      jobTimer = setTimeout(function () { pollJob(isPreview); }, 1500);
+      return;
+    }
+    jobMisses = 0;
+    $("btnRun").disabled = false;
+    $("btnStop").hidden = true;
+    highlight(-1);
+    loadTakes();
+    toast("Lost track of that take — Script Builder was restarted while it "
+          + "ran. Anything it finished is in the Library.", true);
+    return;
+  }
+  jobMisses = 0;
   if (job.status === "running") {
     // A voice sample is one line of its own, not a line of the script.
     highlight(!isPreview && typeof job.line_index === "number"
@@ -1577,10 +1640,33 @@ async function removeTake(t) {
 }
 
 /* ========================= engine page ========================= */
+/* One /api/deps at a time. Opening the Engine page and pressing Install
+   everything missing each asked for the whole report, so a check that already
+   takes seconds per engine ran twice over. A caller that arrives while one is
+   out waits for that one — unless it wants a fresh read and the one out is
+   not. */
+var depsAsk = null;
+function fetchDeps(fresh) {
+  if (depsAsk && (depsAsk.fresh || !fresh)) return depsAsk.promise;
+  var ask = { fresh: !!fresh };
+  ask.promise = api("/api/deps" + (fresh ? "?fresh=1" : ""));
+  depsAsk = ask;
+  var clear = function () { if (depsAsk === ask) depsAsk = null; };
+  ask.promise.then(clear, clear);
+  return ask.promise;
+}
 async function loadDeps(fresh) {
   var box = $("dep-list");
+  // An empty list under a spinner read as a page that had stopped — and the
+  // engine console above it was pointing at a Reinstall button in this list.
+  // Rows already drawn stay up while they are checked again.
+  if (!box.querySelector(".fitem")) {
+    box.innerHTML = '<div class="empty"><span class="spin"></span>Checking '
+      + "each engine's install — PyTorch's files are read one by one, which "
+      + "takes a few seconds…</div>";
+  }
   try {
-    var d = await api("/api/deps" + (fresh ? "?fresh=1" : ""));
+    var d = await fetchDeps(fresh);
     $("torch-index").value = d.torch_index || "";
     // Say what Automatic picked. "Automatic" on its own is what let a machine
     // with an RTX 4060 in it quietly take the CPU build.
@@ -1623,7 +1709,8 @@ async function loadDeps(fresh) {
       }
       box.appendChild(el);
     });
-    $("engineTag").hidden = bad === 0;
+    S.depsBad = bad;
+    paintEngineTag();
     paintDepTasks(S.tasks || []);
   } catch (e) {
     box.innerHTML = '<div class="empty bad-text">' + esc(e.message) + "</div>";
@@ -1726,7 +1813,7 @@ async function installAllMissing() {
   });
   var b = busy($("btnInstallAll"), "Checking what is missing…");
   try {
-    var d = await api("/api/deps");
+    var d = await fetchDeps();
     var missing = order.filter(function (id) {
       return d.items.some(function (i) {
         return i.id === id && (i.state === "missing" || i.repair); });
@@ -1979,7 +2066,7 @@ async function startEngine(ev) {
    error — so an engine that failed for any other reason is offered nothing. */
 async function offerRepair(engine) {
   var d;
-  try { d = await api("/api/deps"); } catch (e) { return; }
+  try { d = await fetchDeps(); } catch (e) { return; }
   var row = (d.items || []).filter(function (i) {
     return i.id === "torch_" + engine && i.repair; })[0];
   if (row && confirm(row.detail + "\n\nReinstall PyTorch now? It downloads "
@@ -2055,7 +2142,8 @@ async function pollTasks() {
         (S.tasks || []).forEach(function (x) {
           if (x.id === t.id) { x.state = t.state; x.detail = t.detail; } });
         S.taskId = null;
-        loadDeps(); loadLocal(); refreshStatus();
+        // loadVoices too: the Design panel says whether its model is here.
+        loadDeps(); loadLocal(); refreshStatus(); loadVoices();
         // What it ended on is usually the next step ("Restart ComfyUI"),
         // and the Activity panel it would otherwise sit in is off-screen.
         toast(t.state === "done"
@@ -2310,6 +2398,17 @@ async function pollSetup() {
 }
 
 /* ========================= status ========================= */
+/* The Engine badge has two witnesses — the status poll (is the engine up with
+   its nodes) and the dependency list (is anything missing or in need of
+   repair) — and each used to set it alone. The poll runs every six seconds,
+   so it put the badge down over a PyTorch the list had just marked for
+   repair whenever any engine answered. Either one raises it now. */
+function paintEngineTag() {
+  var st = S.status;
+  var down = !!st && !(st.comfy_online && st.nodes_ready);
+  $("engineTag").hidden = !(down || S.depsBad > 0);
+}
+/* ========================= status ========================= */
 async function refreshStatus() {
   var st;
   try { st = await api("/api/status"); } catch (e) { return; }
@@ -2330,7 +2429,7 @@ async function refreshStatus() {
     : st.missing_models.length ? "Models missing"
     : st.models_known === false ? "No models folder" : "Engine loading";
   $("modelsTag").hidden = !(st.missing_models && st.missing_models.length);
-  $("engineTag").hidden = !!(st.comfy_online && st.nodes_ready);
+  paintEngineTag();
   $("runLabel").textContent = blocker(st).label;
   $("gpuMetric").querySelector("span").textContent =
     st.ready ? "ready" : st.comfy_online ? "loading" : "offline";

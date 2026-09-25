@@ -22,6 +22,7 @@ import threading
 import time
 import uuid
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import bootstrap
@@ -124,7 +125,7 @@ def stream(cmd: list[str], task: Task, keep: tuple[str, ...] = ()) -> int:
                             env=bootstrap.py_env(), bufsize=1)
     assert proc.stdout
     for line in proc.stdout:
-        line = line.rstrip()
+        line = bootstrap.plain(line).rstrip()
         if not line:
             continue
         if not keep or line.startswith(keep):
@@ -191,14 +192,31 @@ def no_cuda_reason(version: str, cpu_only: bool | None = None) -> str:
 
 
 def _torch_row(py_comfy: str, suffix: str, label: str,
-               cfg: dict | None = None) -> dict:
-    """PyTorch as this engine's own environment has it."""
+               cfg: dict | None = None, fresh: bool = False) -> dict:
+    """PyTorch as this engine's own environment has it.
+
+    `fresh` reads torch's files again even if pip has not touched them since
+    the last look — what Recheck asks for.
+    """
     if not py_comfy:
         return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
                 "state": "unknown", "detail": "Install ComfyUI first.",
                 "action": "install"}
     kind = "portable python_embeded" if "python_embeded" in py_comfy \
         else "virtual environment"
+    # Read before anything else: a damaged torch imports fine here and still
+    # dies inside ComfyUI, and its version reads as exactly the right build —
+    # which is how this row said "ok" over an engine that could not start.
+    # Nor is there any point importing it: the answer is already known.
+    damage = bootstrap.torch_damage_summary(bootstrap.torch_damage_cached(
+        py_comfy, fresh))
+    if damage:
+        have = bootstrap.installed_torch(py_comfy)
+        return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
+                "state": "warn", "repair": True, "action": "reinstall",
+                "detail": (f"torch {have.get('version', '')} is damaged — "
+                           f"{damage}. ComfyUI will not start on it. Press "
+                           "Reinstall.")}
     code, out = _probe(py_comfy,
                        "import torch,json;"
                        "print(json.dumps({'v':torch.__version__,"
@@ -207,17 +225,6 @@ def _torch_row(py_comfy: str, suffix: str, label: str,
                        "'hip':getattr(torch.version,'hip',None),"
                        "'dev':(torch.cuda.get_device_name(0) "
                        "if torch.cuda.is_available() else '')}))")
-    # Read before anything else: a damaged torch imports fine here and still
-    # dies inside ComfyUI, and its version reads as exactly the right build —
-    # which is how this row said "ok" over an engine that could not start.
-    damage = bootstrap.torch_damage_summary(bootstrap.torch_damage(py_comfy))
-    if damage:
-        have = bootstrap.installed_torch(py_comfy)
-        return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
-                "state": "warn", "repair": True, "action": "reinstall",
-                "detail": (f"torch {have.get('version', '')} is damaged — "
-                           f"{damage}. ComfyUI will not start on it. Press "
-                           "Reinstall.")}
     if code != 0:
         have = bootstrap.installed_torch(py_comfy)
         if have:
@@ -319,7 +326,8 @@ def engine_row(label: str, suffix: str, url: str, online: bool,
             "state": "ok", "detail": url + where, "action": None}
 
 
-def dependencies(cfg: dict, clients=None, engine: str = "") -> list[dict]:
+def dependencies(cfg: dict, clients=None, engine: str = "",
+                 fresh: bool = False) -> list[dict]:
     """What each engine needs, engine by engine.
 
     They no longer share anything below ComfyUI — separate clones, separate
@@ -349,135 +357,149 @@ def dependencies(cfg: dict, clients=None, engine: str = "") -> list[dict]:
                   "detail": git or "Needed to download ComfyUI and the nodes.",
                   "action": None if git else "install"})
 
-    for eid, eng in ENGINES.items():
-        label, suffix = eng["label"], "_" + eid
-        if not bootstrap.engine_enabled(cfg, eid):
-            items.append({"id": "comfyui" + suffix,
-                          "label": f"ComfyUI · {label}", "state": "off",
-                          "detail": "Turned off in Settings.", "action": None})
-            continue
-        slot = bootstrap.engine_cfg(cfg, eid)
-        client = clients.get(eid)
-        comfy_dir = Path(slot["comfy_dir"]) if slot.get("comfy_dir") else None
+    # The engines share nothing below ComfyUI, so they are checked side by
+    # side: each costs a torch import, a transformers import and a read of
+    # torch's files, and one after the other that kept the Engine page's list
+    # empty under its spinner for the length of both.
+    engines = list(ENGINES)
+    with ThreadPoolExecutor(max_workers=len(engines)) as pool:
+        for rows in pool.map(lambda e: _engine_rows(cfg, e, clients.get(e),
+                                                     fresh), engines):
+            items.extend(rows)
+    return items
 
-        # Its own ComfyUI ------------------------------------------------- #
-        if comfy_dir and (comfy_dir / "main.py").exists():
-            items.append({"id": "comfyui" + suffix,
-                          "label": f"ComfyUI · {label}", "state": "ok",
-                          "detail": str(comfy_dir), "action": "update"})
+
+def _engine_rows(cfg: dict, eid: str, client, fresh: bool = False) \
+        -> list[dict]:
+    """One engine's rows of the dependency report, in the order shown."""
+    eng = ENGINES[eid]
+    label, suffix = eng["label"], "_" + eid
+    items: list[dict] = []
+    if not bootstrap.engine_enabled(cfg, eid):
+        return [{"id": "comfyui" + suffix,
+                 "label": f"ComfyUI · {label}", "state": "off",
+                 "detail": "Turned off in Settings.", "action": None}]
+    slot = bootstrap.engine_cfg(cfg, eid)
+    comfy_dir = Path(slot["comfy_dir"]) if slot.get("comfy_dir") else None
+
+    # Its own ComfyUI ------------------------------------------------- #
+    if comfy_dir and (comfy_dir / "main.py").exists():
+        items.append({"id": "comfyui" + suffix,
+                      "label": f"ComfyUI · {label}", "state": "ok",
+                      "detail": str(comfy_dir), "action": "update"})
+    else:
+        items.append({"id": "comfyui" + suffix,
+                      "label": f"ComfyUI · {label}", "state": "missing",
+                      "detail": f"{label} has no ComfyUI of its own yet — "
+                                f"it would go in {APP_DIR / eng['dir_name']}.",
+                      "action": "install"})
+
+    # Its own nodes ---------------------------------------------------- #
+    loaded = client.engine_ready(eid) if client else None
+    if not (comfy_dir and bootstrap.node_installed(comfy_dir, eid)):
+        if loaded:
+            items.append({"id": "node" + suffix, "label": f"{label} nodes",
+                          "state": "ok",
+                          "detail": "Loaded by the ComfyUI you are "
+                                    "running. Set its folder in Settings "
+                                    "to manage them from here.",
+                          "action": None})
         else:
-            items.append({"id": "comfyui" + suffix,
-                          "label": f"ComfyUI · {label}", "state": "missing",
-                          "detail": f"{label} has no ComfyUI of its own yet — "
-                                    f"it would go in {APP_DIR / eng['dir_name']}.",
+            items.append({"id": "node" + suffix, "label": f"{label} nodes",
+                          "state": "missing",
+                          "detail": f"{eng['node_repo']} is not installed.",
                           "action": "install"})
+    else:
+        items.append({
+            "id": "node" + suffix, "label": f"{label} nodes",
+            "state": "ok" if loaded is not False else "warn",
+            "detail": (str(comfy_dir / "custom_nodes" / eng["node_dir"])
+                       if loaded is not False else
+                       "Installed, but this ComfyUI started before they "
+                       "were. Restart it so it loads them."),
+            "action": "update" if loaded is not False else "restart"})
 
-        # Its own nodes ---------------------------------------------------- #
-        loaded = client.engine_ready(eid) if client else None
-        if not (comfy_dir and bootstrap.node_installed(comfy_dir, eid)):
-            if loaded:
-                items.append({"id": "node" + suffix, "label": f"{label} nodes",
-                              "state": "ok",
-                              "detail": "Loaded by the ComfyUI you are "
-                                        "running. Set its folder in Settings "
-                                        "to manage them from here.",
-                              "action": None})
-            else:
-                items.append({"id": "node" + suffix, "label": f"{label} nodes",
-                              "state": "missing",
-                              "detail": f"{eng['node_repo']} is not installed.",
-                              "action": "install"})
-        else:
-            items.append({
-                "id": "node" + suffix, "label": f"{label} nodes",
-                "state": "ok" if loaded is not False else "warn",
-                "detail": (str(comfy_dir / "custom_nodes" / eng["node_dir"])
-                           if loaded is not False else
-                           "Installed, but this ComfyUI started before they "
-                           "were. Restart it so it loads them."),
-                "action": "update" if loaded is not False else "restart"})
+    # Its own environment ---------------------------------------------- #
+    py_comfy = comfy_python(cfg, eid)
+    items.append(_torch_row(py_comfy, suffix, label, cfg, fresh))
 
-        # Its own environment ---------------------------------------------- #
-        py_comfy = comfy_python(cfg, eid)
-        items.append(_torch_row(py_comfy, suffix, label, cfg))
-
-        if py_comfy:
-            code, out = _probe(py_comfy,
-                               "import transformers,librosa;"
-                               "print(transformers.__version__)")
-            if code != 0:
-                items.append({"id": "node_reqs" + suffix,
-                              "label": f"Speech packages · {label}",
-                              "state": "missing",
-                              "detail": "transformers or librosa is missing.",
-                              "action": "install"})
-            else:
-                ver = out.splitlines()[-1].strip()
-                have = version_tuple(ver)
-                # Qwen3-TTS is the strict one: 4.57.3, or 5.0 and up. MOSS asks
-                # only for 4.40+, and now that they no longer share an
-                # environment each is judged on its own floor. Compared as
-                # numbers: as text, "4.9" passed a floor of "4.40".
-                if eid == "qwen":
-                    good = have[:3] == (4, 57, 3) or have >= (5,)
-                    need = "Qwen3-TTS needs 4.57.3, or 5.0 and up."
-                else:
-                    good = have >= (4, 40)
-                    need = f"{ENGINES[eid]['label']} needs 4.40 or later."
-                items.append({
-                    "id": "node_reqs" + suffix,
-                    "label": f"Speech packages · {label}",
-                    "state": "ok" if good else "warn",
-                    "detail": f"transformers {ver}" + ("" if good else
-                              f" — {need}"),
-                    "action": "install"})
-        else:
+    if py_comfy:
+        code, out = _probe(py_comfy,
+                           "import transformers,librosa;"
+                           "print(transformers.__version__)")
+        if code != 0:
             items.append({"id": "node_reqs" + suffix,
                           "label": f"Speech packages · {label}",
-                          "state": "unknown", "detail": "Install ComfyUI first.",
+                          "state": "missing",
+                          "detail": "transformers or librosa is missing.",
                           "action": "install"})
-
-        # Its own models ---------------------------------------------------- #
-        models_dir = bootstrap.engine_models_dir(cfg, eid)
-        if models_dir and models_dir.is_dir():
-            missing = bootstrap.missing_models(models_dir, cfg, eid)
-            need = [m for m in missing
-                    if m["group"] in ("core", "preset", "moss_core")]
-            if need:
-                items.append({"id": "models" + suffix,
-                              "label": f"Voices and models · {label}",
-                              "state": "missing",
-                              "detail": "Missing: " + ", ".join(m["repo"] for m in need),
-                              "action": "models"})
-            elif missing:
-                items.append({"id": "models" + suffix,
-                              "label": f"Voices and models · {label}",
-                              "state": "warn",
-                              "detail": "Optional: " + ", ".join(m["repo"]
-                                                                 for m in missing),
-                              "action": "models"})
+        else:
+            ver = out.splitlines()[-1].strip()
+            have = version_tuple(ver)
+            # Qwen3-TTS is the strict one: 4.57.3, or 5.0 and up. MOSS asks
+            # only for 4.40+, and now that they no longer share an
+            # environment each is judged on its own floor. Compared as
+            # numbers: as text, "4.9" passed a floor of "4.40".
+            if eid == "qwen":
+                good = have[:3] == (4, 57, 3) or have >= (5,)
+                need = "Qwen3-TTS needs 4.57.3, or 5.0 and up."
             else:
-                items.append({"id": "models" + suffix,
-                              "label": f"Voices and models · {label}",
-                              "state": "ok", "detail": "All folders present.",
-                              "action": "models"})
+                good = have >= (4, 40)
+                need = f"{ENGINES[eid]['label']} needs 4.40 or later."
+            items.append({
+                "id": "node_reqs" + suffix,
+                "label": f"Speech packages · {label}",
+                "state": "ok" if good else "warn",
+                "detail": f"transformers {ver}" + ("" if good else
+                          f" — {need}"),
+                "action": "install"})
+    else:
+        items.append({"id": "node_reqs" + suffix,
+                      "label": f"Speech packages · {label}",
+                      "state": "unknown", "detail": "Install ComfyUI first.",
+                      "action": "install"})
+
+    # Its own models ---------------------------------------------------- #
+    models_dir = bootstrap.engine_models_dir(cfg, eid)
+    if models_dir and models_dir.is_dir():
+        missing = bootstrap.missing_models(models_dir, cfg, eid)
+        need = [m for m in missing
+                if m["group"] in ("core", "preset", "moss_core")]
+        if need:
+            items.append({"id": "models" + suffix,
+                          "label": f"Voices and models · {label}",
+                          "state": "missing",
+                          "detail": "Missing: " + ", ".join(m["repo"] for m in need),
+                          "action": "models"})
+        elif missing:
+            items.append({"id": "models" + suffix,
+                          "label": f"Voices and models · {label}",
+                          "state": "warn",
+                          "detail": "Optional: " + ", ".join(m["repo"]
+                                                             for m in missing),
+                          "action": "models"})
         else:
             items.append({"id": "models" + suffix,
                           "label": f"Voices and models · {label}",
-                          "state": "unknown",
-                          "detail": "Set up this engine first.",
+                          "state": "ok", "detail": "All folders present.",
                           "action": "models"})
+    else:
+        items.append({"id": "models" + suffix,
+                      "label": f"Voices and models · {label}",
+                      "state": "unknown",
+                      "detail": "Set up this engine first.",
+                      "action": "models"})
 
-        # Is it up, and is it ours ------------------------------------------- #
-        online = bootstrap.comfy_online(slot["comfy_url"])
-        root = ""
-        if online and client:
-            try:
-                root = client.engine_root()
-            except Exception:  # noqa: BLE001
-                root = ""
-        items.append(engine_row(label, suffix, slot["comfy_url"], online,
-                                slot.get("comfy_dir") or "", root))
+    # Is it up, and is it ours ------------------------------------------- #
+    online = bootstrap.comfy_online(slot["comfy_url"])
+    root = ""
+    if online and client:
+        try:
+            root = client.engine_root()
+        except Exception:  # noqa: BLE001
+            root = ""
+    items.append(engine_row(label, suffix, slot["comfy_url"], online,
+                            slot.get("comfy_dir") or "", root))
     return items
 
 
@@ -528,6 +550,15 @@ def install_dependency(dep_id: str, cfg: dict, opts: dict,
     opts = dict(opts, engine=eid)
 
     def run(task: Task) -> None:
+        try:
+            _run(task)
+        finally:
+            # Whatever pip did — finished, failed or cut off — torch's files
+            # are read again rather than trusted from before it ran.
+            if base in PIP_STEPS:
+                bootstrap.forget_torch_health()
+
+    def _run(task: Task) -> None:
         if base in PIP_STEPS and stop_engine and stop_engine(eid):
             task.log(f"Stopped {label}'s ComfyUI first — its packages are "
                      "about to change, and a running ComfyUI holds them open.")

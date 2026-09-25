@@ -1008,6 +1008,18 @@ def download_repo(cfg: dict, repo: str, models_dir: Path,
 # --------------------------------------------------------------------------- #
 # ComfyUI process
 # --------------------------------------------------------------------------- #
+# ComfyUI colours its log whether or not anything is reading it as a
+# terminal, so a piped line arrives as "\x1b[32m[INFO]\x1b[0m ..." and the
+# engine console printed the escapes as boxes and brackets around every
+# line. Colour sequences (CSI), title sequences (OSC) and a stray ESC go.
+ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|.?)")
+
+
+def plain(line: str) -> str:
+    """A console line without its terminal colour codes."""
+    return ANSI.sub("", line) if "\x1b" in line else line
+
+
 class ComfyProcess:
     def __init__(self) -> None:
         self.proc: subprocess.Popen | None = None
@@ -1105,7 +1117,7 @@ class ComfyProcess:
         assert proc.stdout
         try:
             for line in proc.stdout:
-                line = line.rstrip()
+                line = plain(line).rstrip()
                 with self._lock:
                     self._append(line)
                 if any(k in line for k in ("Error", "Traceback", "error:",
@@ -2022,6 +2034,141 @@ def torch_damage(python: str) -> dict:
     except (ValueError, IndexError):
         return {}
     return found if isinstance(found, dict) else {}
+
+
+# The dependency report's copy of torch_damage, per interpreter. The probe
+# hashes every .py file torch ships — thousands, twice over when two versions
+# are installed over each other — and the Engine page asked for it on every
+# visit, both engines one after the other, so the list sat empty under a
+# spinner long enough to read as a page that had stopped. The answer only
+# changes when pip changes torch, and pip cannot do that without touching
+# what the fingerprint below reads: site-packages itself (a new dist-info, or
+# the ~orch folder an uninstall stashes into), the torch folders at its top,
+# and each torch RECORD. Launch, Reinstall and Recheck still read afresh.
+_TORCH_HEALTH: dict[str, tuple[tuple, dict]] = {}
+_TORCH_HEALTH_LOCK = threading.Lock()
+# "~" is how pip names what it stashes while it uninstalls ("~orch").
+TORCH_TOPS = ("torch", "functorch", "~")
+
+
+def _torch_fingerprint(root: str) -> tuple:
+    """What pip cannot change torch in `root` without changing."""
+    marks = []
+    try:
+        marks.append(("", os.stat(root).st_mtime_ns))
+        for entry in sorted(os.scandir(root), key=lambda e: e.name):
+            if not entry.name.lower().startswith(TORCH_TOPS):
+                continue
+            st = entry.stat()
+            marks.append((entry.name, st.st_mtime_ns))
+            if entry.name.endswith(".dist-info"):
+                rec = os.stat(os.path.join(entry.path, "RECORD"))
+                marks.append(("RECORD", rec.st_mtime_ns, rec.st_size))
+    except OSError:
+        return ()
+    return tuple(marks)
+
+
+def torch_damage_cached(python: str, fresh: bool = False) -> dict:
+    """torch_damage, read again only when pip has changed torch since.
+
+    Only an answer that names where torch lives is kept — without the folder
+    there is nothing to tell a changed install by — and `fresh` always asks.
+    """
+    key = str(python)
+    with _TORCH_HEALTH_LOCK:
+        held = None if fresh else _TORCH_HEALTH.get(key)
+    if held:
+        mark, found = held
+        if mark and mark == _torch_fingerprint(found["root"]):
+            return found
+    found = torch_damage(python)
+    mark = _torch_fingerprint(found["root"]) if found.get("root") else ()
+    with _TORCH_HEALTH_LOCK:
+        if mark:
+            _TORCH_HEALTH[key] = (mark, found)
+        else:
+            _TORCH_HEALTH.pop(key, None)
+    return found
+
+
+def forget_torch_health() -> None:
+    """Drop every kept answer — called when an install has run pip."""
+    with _TORCH_HEALTH_LOCK:
+        _TORCH_HEALTH.clear()
+        _ATTENTION.clear()
+
+
+# What the Qwen node will do with an attention choice, asked of the engine's
+# own interpreter. The node caches its model under the attention it
+# *resolved* ("sdpa") and then compares that with the one it was *asked
+# for* ("auto") before every line — never equal, so every line after the
+# first threw the model away and read it back from disk ("Attention changed
+# from 'sdpa' to 'auto', clearing cache…"). Asked for by the name it will
+# store, it keeps the model loaded. The probe mirrors the node's own
+# get_attention_implementation: pre-Ampere CUDA is eager whatever was asked,
+# then sageattention, flash-attn and sdpa by what actually imports.
+ATTENTION_PROBE = r"""
+import json
+major = None
+try:
+    import torch
+    if torch.cuda.is_available():
+        major = torch.cuda.get_device_capability()[0]
+except Exception:
+    pass
+have = []
+for name, module in (("sage_attn", "sageattention"), ("flash_attn", "flash_attn")):
+    try:
+        __import__(module)
+        have.append(name)
+    except Exception:
+        pass
+print(json.dumps({"major": major, "have": have}))
+"""
+_ATTENTION: dict[str, dict] = {}
+
+
+def attention_support(python: str) -> dict:
+    """{"major": 8, "have": ["flash_attn"]} for this interpreter, {} unknown.
+
+    Read once per interpreter per run — it imports torch — and forgotten
+    with the torch answers when an install runs pip.
+    """
+    key = str(python or "")
+    if not key or not Path(key).exists():
+        return {}
+    with _TORCH_HEALTH_LOCK:
+        if key in _ATTENTION:
+            return _ATTENTION[key]
+    try:
+        out = _run([key, "-c", ATTENTION_PROBE], timeout=120)
+        found = json.loads((out.stdout or "").strip().splitlines()[-1])
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(found, dict):
+        return {}
+    with _TORCH_HEALTH_LOCK:
+        _ATTENTION[key] = found
+    return found
+
+
+def qwen_attention(selection: str, found: dict) -> str:
+    """The attention the Qwen node will store its model under for `selection`.
+
+    Unknown hardware answers "sdpa" for "auto": it is what auto picks on any
+    card from the last five years without extra packages, and being asked for
+    by name the node keeps it cached — "auto" never is.
+    """
+    selection = selection or "auto"
+    major = found.get("major")
+    if major is not None and major < 8:
+        return "eager"
+    have = list(found.get("have") or []) + ["sdpa", "eager"]
+    if selection == "auto":
+        return next(a for a in ("sage_attn", "flash_attn", "sdpa", "eager")
+                    if a in have)
+    return selection if selection in have else "sdpa"
 
 
 def torch_damage_summary(found: dict) -> str:
