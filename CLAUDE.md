@@ -398,6 +398,17 @@
    at run time, because ComfyUI's validation passes the graph and only the
    node objects.
 
+23d. **The Design panel says whether its model is here, and every voice
+   source can be heard.** It said "Needs the 1.7B VoiceDesign model — one
+   button on the Models page" to everyone, with that model installed and no
+   button in sight, and only Preset had Hear it — so a designed voice had no
+   way to begin short of reading the whole script. `/api/voices` carries
+   `design_model` (repo, `installed` — None where there is no models folder
+   to look in — and `fits`), the note offers Download it where it is
+   missing, and `hearIt()` puts Hear it under Clone and Design too, naming
+   what is still to do (a clip, a description, the download) instead of
+   sending a line that will fail.
+
 24. **Readiness is per engine.** With MOSS selected, a missing Qwen folder is
    not what stands between the script and a take; reporting it as one sends
    people to download a model they are not about to use. `/api/status` takes an
@@ -606,8 +617,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 294 unit tests, standard library only
-npm test                 # 115 checks driving the real page in headless Chromium
+npm run test:units       # 298 unit tests, standard library only
+npm test                 # 119 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script

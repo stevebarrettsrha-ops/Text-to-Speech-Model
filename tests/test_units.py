@@ -634,6 +634,49 @@ class DeadEngine(unittest.TestCase):
         self.assertNotIn("HTTPConnectionPool", message)
 
 
+class TheDesignPanelSaysWhatIsThere(unittest.TestCase):
+    """The Design panel told everyone "Needs the 1.7B VoiceDesign model",
+    with nothing to press — on a machine that had it, that read as a fault.
+    /api/voices now says which model a designed voice loads and whether it
+    is on disk, per engine."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="sb-design-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        patch = mock.patch.object(server, "cfg", split_cfg(self.root))
+        patch.start()
+        self.addCleanup(patch.stop)
+        vram = mock.patch.object(server, "gpu_vram", return_value=8188)
+        vram.start()
+        self.addCleanup(vram.stop)
+
+    def _have(self, engine, repo):
+        base = bootstrap.engine_models_dir(server.cfg, engine)
+        d = bootstrap.model_dir(base, repo, engine)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "model.safetensors").write_text("w")
+
+    def test_each_engine_names_its_own_design_model(self):
+        self.assertEqual(server.design_model("qwen")["repo"],
+                         "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+        self.assertEqual(server.design_model("moss")["repo"],
+                         "OpenMOSS-Team/MOSS-VoiceGenerator")
+
+    def test_absent_until_its_weights_are_on_disk(self):
+        self.assertIs(server.design_model("qwen")["installed"], False)
+        self._have("qwen", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+        self.assertIs(server.design_model("qwen")["installed"], True)
+        # And the other engine's copy is not this one's.
+        self.assertIs(server.design_model("moss")["installed"], False)
+
+    def test_no_models_folder_is_unknown_not_missing(self):
+        server.cfg["engines"]["qwen"]["models_dir"] = str(self.root / "nowhere")
+        self.assertIsNone(server.design_model("qwen")["installed"])
+
+    def test_it_fits_an_8_gb_card(self):
+        self.assertIs(server.design_model("qwen")["fits"], True)
+
+
 class TheQwenNodeKeepsItsModel(unittest.TestCase):
     """The Qwen node resolves "auto" to a real attention, caches the model
     under that, and before each line compares it with what it was asked for.

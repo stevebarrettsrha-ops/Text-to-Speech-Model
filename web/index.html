@@ -1080,18 +1080,64 @@ function renderSpeakerBody(n) {
       uploadRef(n, e.target); });
     body.querySelector("[data-reftext]").addEventListener("input", function (e) {
       S.speakers[n].ref_text = e.target.value; saveDraft(); });
+    body.appendChild(hearIt(n));
   } else {
+    // What the note says depends on whether the model is on disk. It used to
+    // say "Needs the 1.7B VoiceDesign model" to everyone and offer nothing to
+    // press, which read as something missing whether it was or not.
+    var dm = S.voices.design_model || {};
+    var need = isMoss() ? "MOSS-VoiceGenerator (1.7B)"
+                        : "the 1.7B VoiceDesign model";
     body.innerHTML = '<label class="flab">Describe the voice</label>' +
       '<textarea rows="3" data-instruct="' + n +
       '" placeholder="A gentle female voice with a high pitch, speaking slowly">' +
       esc(s.instruct) + "</textarea>" +
-      '<div class="note">' + (isMoss()
-        ? "Needs MOSS-VoiceGenerator — 1.7B, the same size as the base model. One button on the Models page."
-        : "Needs the 1.7B VoiceDesign model — one button on the Models page.") +
-      "</div>";
+      '<div class="note" data-dnote></div>';
+    var note = body.querySelector("[data-dnote]");
+    if (dm.installed === false) {
+      note.textContent = "Needs " + need + ", which is not downloaded yet"
+        + (dm.vram_gb ? " (about " + dm.vram_gb + " GB of graphics memory)" : "")
+        + ". ";
+      var get = mkBtn("Download it", function () {
+        if (dm.fits === false && !confirm(dm.repo + " wants about " + dm.vram_gb
+            + " GB of graphics memory, more than this card has. Download it "
+            + "anyway?")) return;
+        startDownload(dm.repo, get);
+      });
+      get.className = "btn thin go";
+      note.appendChild(get);
+    } else {
+      note.textContent = (dm.installed ? "Uses " + need + ". " : "Needs "
+        + need + " — on the Models page if you do not have it. ")
+        + "Say who is speaking: age, pitch, pace, accent, mood. Each line is "
+        + "designed afresh, so the voice can drift from line to line — Clone "
+        + "a sample you like to hold it steady.";
+    }
     body.querySelector("[data-instruct]").addEventListener("input", function (e) {
       S.speakers[n].instruct = e.target.value; saveDraft(); });
+    body.appendChild(hearIt(n));
   }
+}
+/* Every voice source can be heard before a whole script is spent on it —
+   only Preset could, so a designed voice had no way to begin at all short
+   of reading the script. Each one says what it is still missing. */
+function hearIt(n) {
+  var row = document.createElement("div");
+  row.style.cssText = "display:flex;justify-content:flex-end;margin-top:9px";
+  var b = mkBtn("Hear it", function () {
+    var s = S.speakers[n], dm = S.voices.design_model || {};
+    if (s.kind === "clone" && !s.ref_audio) {
+      toast("Choose a clip for " + spkName(n) + " first.", true); return; }
+    if (s.kind === "design" && !(s.instruct || "").trim()) {
+      toast("Describe " + spkName(n) + "'s voice first.", true); return; }
+    if (s.kind === "design" && dm.installed === false) {
+      toast("Download the voice design model first — the button is just "
+            + "above.", true); return; }
+    previewVoice(n);
+  });
+  b.dataset.preview = n;
+  row.appendChild(b);
+  return row;
 }
 function setSource(n, kind) {
   S.speakers[n].kind = kind;
@@ -2096,7 +2142,8 @@ async function pollTasks() {
         (S.tasks || []).forEach(function (x) {
           if (x.id === t.id) { x.state = t.state; x.detail = t.detail; } });
         S.taskId = null;
-        loadDeps(); loadLocal(); refreshStatus();
+        // loadVoices too: the Design panel says whether its model is here.
+        loadDeps(); loadLocal(); refreshStatus(); loadVoices();
         // What it ended on is usually the next step ("Restart ComfyUI"),
         // and the Activity panel it would otherwise sit in is off-screen.
         toast(t.state === "done"

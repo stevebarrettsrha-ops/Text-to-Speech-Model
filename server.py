@@ -821,6 +821,28 @@ def api_status():
     return jsonify(payload)
 
 
+def design_model(engine: str, client=None) -> dict:
+    """The model a designed voice loads on this engine, and whether it is here.
+
+    The Design panel said "Needs the 1.7B VoiceDesign model" to everyone,
+    whether they had it or not, and gave them nothing to press — so it read
+    as something missing on a machine where nothing was. `installed` is None
+    when there is no models folder to look in, which is not the same as no.
+    """
+    group = "moss_design" if engine == "moss" else "design"
+    m = next((m for m in bootstrap.ENGINES[engine]["models"]
+              if m["group"] == group), None)
+    if not m:
+        return {}
+    base = bootstrap.engine_models_dir(cfg, engine)
+    installed = (bootstrap.model_installed(base, m["repo"], engine)
+                 if base and base.is_dir() else None)
+    return {"repo": m["repo"], "params": m.get("params", ""),
+            "vram_gb": m.get("vram_gb"), "installed": installed,
+            "fits": bootstrap.fits_vram(m.get("vram_gb") or 0,
+                                        gpu_vram(client))}
+
+
 @app.get("/api/voices")
 def api_voices():
     want = request.args.get("engine") or current_engine()
@@ -861,6 +883,7 @@ def api_voices():
                 "variants": client.moss_variants(),
                 "attentions": [],
                 "capabilities": client.capabilities("moss"),
+                "design_model": design_model("moss", client),
             })
         speakers = client.speakers()
         return jsonify({
@@ -870,6 +893,7 @@ def api_voices():
             "models": client.models(),
             "attentions": client.attentions(),
             "capabilities": client.capabilities("qwen"),
+            "design_model": design_model("qwen", client),
         })
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 400

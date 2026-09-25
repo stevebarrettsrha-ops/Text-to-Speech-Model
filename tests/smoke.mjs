@@ -140,6 +140,41 @@ try {
   await page.click('#cardVoices > summary');
   await sleep(400);
 
+  /* ------------------------------------------------------- designed voice */
+  // Design had no button to try the voice, and its note said "Needs the 1.7B
+  // VoiceDesign model" whether or not the model was there — which read as a
+  // fault on a machine that had it.
+  {
+    const designNote = () => page.$eval('#spk-1 [data-dnote]',
+                                        e => e.textContent);
+    await page.evaluate(() => {
+      S.voices.design_model = { repo: 'Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign',
+                                installed: true, vram_gb: 5, fits: true };
+      S.speakers[1].instruct = '';
+      setSource(1, 'design');
+    });
+    is(!!(await page.$('#spk-1 [data-preview="1"]')),
+       'a designed voice can be heard before the script is read');
+    const have = await designNote();
+    is(/^Uses the 1\.7B VoiceDesign model/.test(have),
+       'and with its model on disk nothing reads as missing', have);
+    await page.click('#spk-1 [data-preview="1"]');
+    await sleep(200);
+    const empty = (await page.textContent('#toast')).trim();
+    is(/Describe .* voice first/.test(empty),
+       'Hear it with no description says what to write', empty);
+    await page.evaluate(() => {
+      S.voices.design_model.installed = false;
+      renderSpeakerBody(1);
+    });
+    const lacking = await designNote();
+    is(/not downloaded yet/.test(lacking)
+       && !!(await page.$('#spk-1 [data-dnote] button.go')),
+       'without it, the note offers the download right there', lacking);
+    await page.evaluate(() => { setSource(1, 'preset'); loadVoices(); });
+    await sleep(400);
+  }
+
   /* ------------------------------------------------------------ generate */
   const before = (await takes()).length;
   await page.click('#btnRun');
