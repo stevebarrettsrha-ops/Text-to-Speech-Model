@@ -626,6 +626,147 @@ class DeadEngine(unittest.TestCase):
         self.assertNotIn("HTTPConnectionPool", message)
 
 
+class OneModelLoadPerTake(unittest.TestCase):
+    """Both node packs hold one checkpoint at a time, so on an 8 GB card the
+    order lines are spoken in decides how many times a model is read from
+    disk, and the unload switch decides whether it happens on every line."""
+
+    class Recorder:
+        """Stands in for a ComfyClient: builds nothing, remembers everything."""
+
+        def __init__(self, root: Path):
+            self.root, self.calls, self.n = root, [], 0
+
+        def build_line(self, line, voice, opts):
+            self.calls.append({"text": line["text"],
+                               "weights": comfy.ComfyClient.line_weights(
+                                   voice, opts),
+                               "unload": opts["unload"]})
+            return {"prompt": {}}
+
+        def queue(self, prompt):
+            self.n += 1
+            return f"p{self.n}"
+
+        def result(self, prompt_id):
+            clip = make_clip(self.root / f"{prompt_id}.wav")
+            return [{"filename": clip.name}], None
+
+        def view(self, item):
+            resp = mock.MagicMock()
+            resp.__enter__.return_value = resp
+            resp.iter_content.return_value = [
+                (self.root / item["filename"]).read_bytes()]
+            return resp
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.client = self.Recorder(self.dir)
+        for target, value in (("for_engine", lambda *_: self.client),
+                              ("TAKES_DIR", self.dir / "takes"),
+                              ("TAKES_PATH", self.dir / "takes.json")):
+            patcher = mock.patch.object(server, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_take(self, speakers, lines, **extra):
+        job = f"job{len(server.jobs)}"
+        server.jobs[job] = {"status": "running"}
+        self.addCleanup(server.jobs.pop, job, None)
+        server.run_job(job, dict({"engine": "qwen", "model": "0.6B",
+                                  "pause": 0.1, "speakers": speakers,
+                                  "lines": [{"speaker": k, "text": t}
+                                            for k, t in lines]}, **extra))
+        return server.jobs[job]
+
+    DIALOGUE = [("1", "a1"), ("2", "b1"), ("1", "a2"), ("2", "b2"),
+                ("1", "a3")]
+    MIXED = {"1": {"name": "Ann", "kind": "preset", "speaker": "Aiden"},
+             "2": {"name": "Bo", "kind": "clone", "ref_audio": "bo.wav"}}
+
+    def test_a_preset_answering_a_clone_loads_each_model_once(self):
+        # Spoken in script order this swapped CustomVoice for Base on every
+        # line: five lines, five loads from disk.
+        job = self.run_take(self.MIXED, self.DIALOGUE)
+        self.assertEqual(job["status"], "done", job.get("error"))
+        weights = [c["weights"] for c in self.client.calls]
+        swaps = sum(1 for a, b in zip(weights, weights[1:]) if a != b)
+        self.assertEqual(swaps, 1)
+        self.assertEqual([c["text"] for c in self.client.calls],
+                         ["a1", "a2", "a3", "b1", "b2"])
+
+    def test_the_take_is_still_joined_in_script_order(self):
+        job = self.run_take(self.MIXED, self.DIALOGUE)
+        lines = job["take"]["lines"]
+        self.assertEqual([ln["text"] for ln in lines],
+                         [t for _, t in self.DIALOGUE])
+        self.assertEqual([ln["index"] for ln in lines], list(range(5)))
+        self.assertEqual(lines[1]["file"], "line_001.wav")
+
+    def test_free_memory_is_asked_for_once_after_the_last_line(self):
+        # Sent with every line it unloaded the model after each one, and the
+        # next line read it back from disk.
+        self.run_take(self.MIXED, self.DIALOGUE, unload=True)
+        self.assertEqual([c["unload"] for c in self.client.calls],
+                         [False] * 4 + [True])
+
+    def test_with_the_switch_off_nothing_is_unloaded(self):
+        self.run_take(self.MIXED, self.DIALOGUE, unload=False)
+        self.assertFalse(any(c["unload"] for c in self.client.calls))
+
+    def test_one_voice_keeps_script_order(self):
+        both = {"1": self.MIXED["1"], "2": dict(self.MIXED["1"], name="Cy")}
+        self.run_take(both, self.DIALOGUE)
+        self.assertEqual([c["text"] for c in self.client.calls],
+                         [t for _, t in self.DIALOGUE])
+
+    def test_the_weights_follow_what_each_builder_loads(self):
+        w = comfy.ComfyClient.line_weights
+        qwen = {"engine": "qwen", "model": "0.6B"}
+        self.assertNotEqual(w({"kind": "preset"}, qwen),
+                            w({"kind": "clone"}, qwen))
+        # A designed voice is always the 1.7B, whatever the picker says.
+        self.assertEqual(w({"kind": "design"}, qwen),
+                         w({"kind": "design"}, dict(qwen, model="1.7B")))
+        moss = {"engine": "moss", "moss_model": comfy.MOSS_DEFAULT_MODEL}
+        # MOSS clones and speaks in its own voice on one loader.
+        self.assertEqual(w({"kind": "preset"}, moss),
+                         w({"kind": "clone"}, moss))
+        self.assertEqual(w({"kind": "design"}, moss),
+                         ("moss", comfy.MOSS_VOICE_GENERATOR))
+
+
+class ALineThatSavedNothing(unittest.TestCase):
+    """A prompt ComfyUI finished with no audio was waited on for the whole
+    fifteen-minute timeout, because nothing was ever going to arrive."""
+
+    def client_with(self, hist):
+        c = comfy.ComfyClient()
+        c.history = lambda _pid: hist
+        return c
+
+    def test_finished_without_audio_is_an_error(self):
+        outs, err = self.client_with({
+            "status": {"status_str": "success", "completed": True},
+            "outputs": {}}).result("p")
+        self.assertEqual(outs, [])
+        self.assertIn("saved no audio", err)
+
+    def test_still_running_is_not(self):
+        self.assertEqual(self.client_with({
+            "status": {"status_str": "running", "completed": False},
+            "outputs": {}}).result("p"), ([], None))
+
+    def test_the_node_s_own_error_comes_first(self):
+        _, err = self.client_with({"status": {
+            "status_str": "error", "completed": False,
+            "messages": [["execution_error", {
+                "node_type": "VoiceCloneNode",
+                "exception_message": "CUDA out of memory"}]]}}).result("p")
+        self.assertEqual(err, "VoiceCloneNode: CUDA out of memory")
+
+
 class WhyTheNodesDidNotLoad(unittest.TestCase):
     """The probe exists to get the node pack's own exception out of ComfyUI's
     console, where nobody running from a launcher can read it. Reporting its

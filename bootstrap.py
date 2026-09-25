@@ -168,7 +168,11 @@ DEFAULT_CONFIG = {
     "hf_repo": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
     "want_clone": True,
     "want_17b": False,
-    "want_voicedesign": False,
+    # On by default for the same reason as MOSS's below: the Voices card
+    # offers "Described" on the primary engine, and with the folder absent
+    # the node fetched ~4 GB in the middle of someone's first designed take —
+    # or, offline, failed it. At 1.7B it fits the same 8 GB card.
+    "want_voicedesign": True,
     "want_moss": True,
     "want_moss_8b": False,
     # On by default: MOSS has no preset speakers, so describing a voice is one

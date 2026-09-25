@@ -394,16 +394,20 @@ def wait_for_prompt(prompt_id: str, job_id: str, engine: str,
     engines mid-take.
     """
     started = time.time()
+    # A short line on a warm model is back in well under a second, and a
+    # whole second of polling latency per line was most of the gap between
+    # lines. The wait backs off to a second once a line is clearly working.
+    wait = 0.2
     while True:
-        time.sleep(1.0)
+        time.sleep(wait)
+        wait = min(wait * 1.5, 1.0)
         with jobs_lock:
             if jobs[job_id].get("cancelled"):
                 for_engine(engine).interrupt()
                 raise ComfyError("Cancelled")
-        err = for_engine(engine).failed(prompt_id)
+        outs, err = for_engine(engine).result(prompt_id)
         if err:
             raise ComfyError(err)
-        outs = for_engine(engine).outputs(prompt_id)
         if outs:
             return outs
         if time.time() - started > timeout:
@@ -442,6 +446,22 @@ def moss_dirs() -> dict:
     return out
 
 
+def generation_order(voices: list[dict], opts: dict) -> list[int]:
+    """The order to speak the lines in, so each checkpoint loads once a take.
+
+    Each engine holds one model at a time, so a preset speaker answering a
+    cloned one swapped weights on every line — seconds of disk read apiece,
+    and on an 8 GB card most of the take. Lines are grouped by the weights
+    they need, in the order each is first needed, and kept in script order
+    within a group; the take is still joined in script order.
+    """
+    groups: dict[tuple, list[int]] = {}
+    for i, voice in enumerate(voices):
+        groups.setdefault(ComfyClient.line_weights(voice, opts),
+                          []).append(i)
+    return [i for group in groups.values() for i in group]
+
+
 def run_job(job_id: str, payload: dict) -> None:
     def set_state(**kw):
         with jobs_lock:
@@ -472,10 +492,9 @@ def run_job(job_id: str, payload: dict) -> None:
             opts["moss_dirs"] = moss_dirs()
         pause = float(payload.get("pause") or 0.5)
         folder.mkdir(parents=True, exist_ok=True)
-        clips: list[Path] = []
-        meta_lines: list[dict] = []
 
-        for i, line in enumerate(lines):
+        keys, voices = [], []
+        for line in lines:
             key = str(line.get("speaker", 1))
             # JSON object keys are strings, but a take loaded back can carry
             # integer ones. A key that is neither is a speaker we do not have,
@@ -483,11 +502,24 @@ def run_job(job_id: str, payload: dict) -> None:
             voice = speakers.get(key) or {}
             if not voice and key.isdigit():
                 voice = speakers.get(int(key)) or {}
+            keys.append(key)
+            voices.append(voice)
+        order = generation_order(voices, opts)
+        # Asked for once per take, on its last line. Sent with every line it
+        # made the node drop its weights after each one and read them back
+        # from disk for the next: a take paid a model load per line for a
+        # switch that says "after each run".
+        unload = opts["unload"]
+        made: dict[int, Path] = {}
+
+        for done, i in enumerate(order):
+            line, key, voice = lines[i], keys[i], voices[i]
             set_state(stage=f"Line {i + 1} of {len(lines)} · "
                             f"{voice.get('name') or 'Speaker ' + key}",
-                      pct=round(i / max(len(lines), 1) * 100, 1),
+                      pct=round(done / max(len(lines), 1) * 100, 1),
                       line_index=i)
 
+            opts["unload"] = unload and done == len(order) - 1
             built = for_engine(engine).build_line(line, voice, opts)
             prompt_id = for_engine(engine).queue(built["prompt"])
             outs = wait_for_prompt(prompt_id, job_id, engine)
@@ -499,9 +531,13 @@ def run_job(job_id: str, payload: dict) -> None:
                 with open(dest, "wb") as fh:
                     for chunk in resp.iter_content(1024 * 256):
                         fh.write(chunk)
-            clips.append(dest)
-            meta_lines.append({"index": i, "speaker": int(key) if key.isdigit() else 1,
-                               "text": line.get("text", ""), "file": dest.name})
+            made[i] = dest
+
+        clips = [made[i] for i in sorted(made)]
+        meta_lines = [{"index": i,
+                       "speaker": int(keys[i]) if keys[i].isdigit() else 1,
+                       "text": lines[i].get("text", ""),
+                       "file": made[i].name} for i in sorted(made)]
 
         if not clips:
             raise ComfyError("There is nothing in the script to say.")

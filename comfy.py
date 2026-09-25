@@ -383,6 +383,27 @@ class ComfyClient:
         g["3"] = self._node(save_class, wanted)
         return fmt
 
+    @staticmethod
+    def line_weights(voice: dict, opts: dict) -> tuple:
+        """Which checkpoint a line makes the engine hold.
+
+        Both node packs keep exactly one model resident: Qwen's
+        `load_qwen_model` clears its cache before loading a different one, and
+        MOSS's loader moves the last model off the card first. So a script
+        alternating a preset speaker with a cloned one reloads a checkpoint
+        from disk on every line. `run_job` groups lines by this key, and this
+        mirrors the choices the two builders below make.
+        """
+        kind = voice.get("kind") or "preset"
+        if (opts.get("engine") or "qwen") == "moss":
+            if kind == "design":
+                return ("moss", MOSS_VOICE_GENERATOR)
+            return ("moss", opts.get("moss_model") or MOSS_DEFAULT_MODEL)
+        if kind == "design":
+            return ("qwen", DESIGN, "1.7B")
+        node = CLONE if kind == "clone" else CUSTOM
+        return ("qwen", node, opts.get("model") or "")
+
     def build_line(self, line: dict, voice: dict, opts: dict) -> dict:
         """One line of dialogue → one prompt graph, on whichever engine."""
         if (opts.get("engine") or "qwen") == "moss":
@@ -613,8 +634,8 @@ class ComfyClient:
         r.raise_for_status()
         return r.json().get(prompt_id) or {}
 
-    def outputs(self, prompt_id: str) -> list[dict]:
-        hist = self.history(prompt_id)
+    @staticmethod
+    def _audio(hist: dict) -> list[dict]:
         found = []
         for node_out in (hist.get("outputs") or {}).values():
             for key in ("audio", "audios", "result"):
@@ -623,8 +644,9 @@ class ComfyClient:
                         found.append(item)
         return found
 
-    def failed(self, prompt_id: str) -> str | None:
-        status = (self.history(prompt_id).get("status") or {})
+    @staticmethod
+    def _error(hist: dict) -> str | None:
+        status = (hist.get("status") or {})
         if status.get("status_str") == "error":
             for kind, data in status.get("messages", []):
                 if kind == "execution_error":
@@ -632,6 +654,29 @@ class ComfyClient:
                             f"{data.get('exception_message')}")
             return "ComfyUI reported an error while generating."
         return None
+
+    def outputs(self, prompt_id: str) -> list[dict]:
+        return self._audio(self.history(prompt_id))
+
+    def failed(self, prompt_id: str) -> str | None:
+        return self._error(self.history(prompt_id))
+
+    def result(self, prompt_id: str) -> tuple[list[dict], str | None]:
+        """(audio, error) from one read of the history.
+
+        A prompt ComfyUI calls finished with no audio in it is an error now:
+        it used to be waited on for the full fifteen minutes, since nothing
+        was ever going to arrive.
+        """
+        hist = self.history(prompt_id)
+        err = self._error(hist)
+        if err:
+            return [], err
+        outs = self._audio(hist)
+        if not outs and (hist.get("status") or {}).get("completed"):
+            return [], ("ComfyUI finished the line but saved no audio. "
+                        "Check the engine's console for a warning.")
+        return outs, None
 
     def view(self, item: dict):
         params = {"filename": item.get("filename", ""),

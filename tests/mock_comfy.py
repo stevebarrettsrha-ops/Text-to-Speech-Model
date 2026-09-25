@@ -442,10 +442,12 @@ def run_prompt(pid, graph, text, fmt):
         rate = [24000, 16000, 44100][len(HISTORY) % 3]
     make_wav(dest, max(0.4, min(len(text), 80) * 0.045), 180 + len(text) % 200,
              rate=rate, silent=bool(MODE.get("silent")))
-    HISTORY[pid]["status"] = {"status_str": "success", "completed": True,
-                              "messages": []}
+    # Outputs before status, as ComfyUI publishes them together: a reader
+    # that saw "completed" with no audio would rightly call it a failure.
     HISTORY[pid]["outputs"] = {"3": {"audio": [
         {"filename": name, "subfolder": "audio", "type": "output"}]}}
+    HISTORY[pid]["status"] = {"status_str": "success", "completed": True,
+                              "messages": []}
 
 
 @app.get("/history/<pid>")

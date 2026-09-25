@@ -441,6 +441,20 @@
 31b. **`wait_for_prompt` is told which engine queued the line.** There are two
    clients now, and reading the selected one inside the wait loop polls the
    wrong ComfyUI the moment someone switches engines mid-take.
+31c. **A take loads each checkpoint once, and frees the card once.** Both
+   node packs hold a single model: Qwen's `load_qwen_model` clears its cache
+   before loading a different one, and the MOSS loader moves the last model off
+   the card. Spoken in script order, a preset speaker answering a cloned one
+   swapped CustomVoice for Base on every line — a read from disk each time, and
+   on an 8 GB card most of the take. `generation_order` groups lines by
+   `ComfyClient.line_weights` (which must mirror what the builders load), keeps
+   script order within a group, and the take is joined in script order. And
+   `unload` rides only the take's last line: sent with every line, "Free GPU
+   memory after each run" dropped the weights after each one and read them back
+   for the next. MOSS keeps its model in a module global no graph can release,
+   so the switch is hidden there rather than promising what it cannot do.
+   `result()` reads the history once and calls a prompt ComfyUI finished with
+   no audio an error, instead of waiting fifteen minutes for nothing.
 32. **The dependency report is per engine, and so are the install ids.**
    `comfyui_moss`, `torch_qwen`, `node_reqs_moss` — Python and Git are the only
    rows left that both engines share. `install_dependency` reads the engine off

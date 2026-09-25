@@ -350,6 +350,8 @@ try {
      'and says why rather than showing an empty picker');
   is(await page.$eval('#rowAttn', e => e.hidden),
      'the attention picker is hidden on MOSS, which has none');
+  is(await page.$eval('#rowUnload', e => e.hidden),
+     'so is the free-memory switch, which MOSS cannot honour');
   const mossModels = await page.$$eval('#model-sel option',
     e => e.map(x => ({ v: x.value, t: x.textContent, off: x.disabled })));
   is(mossModels.some(m => m.v.startsWith('OpenMOSS-Team/')),

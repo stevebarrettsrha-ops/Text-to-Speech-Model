@@ -494,7 +494,7 @@
               <span class="v" id="temp-v">0.90</span></div></div></div>
           <div class="orow" id="rowAttn"><span class="lab">Attention <i class="hint">i</i></span>
             <div class="ctl"><select id="attn-sel"><option value="auto">auto</option></select></div></div>
-          <div class="orow"><span class="lab">Free GPU memory after each run <i class="hint">i</i></span>
+          <div class="orow" id="rowUnload"><span class="lab">Free GPU memory after each run <i class="hint">i</i></span>
             <div class="ctl"><div class="segmented" id="segUnload">
               <button data-v="on">On</button><button class="on" data-v="off">Off</button>
             </div></div></div>
@@ -668,7 +668,7 @@
         <div class="switch"><label for="opt-clone">Voice cloning from a clip</label>
           <input type="checkbox" id="opt-clone" checked></div>
         <div class="switch"><label for="opt-design">Voice design from a description</label>
-          <input type="checkbox" id="opt-design"></div>
+          <input type="checkbox" id="opt-design" checked></div>
         <div class="switch"><label for="opt-17b">1.7B versions (better, slower)</label>
           <input type="checkbox" id="opt-17b"></div>
         <div class="switch"><label for="opt-moss">MOSS-TTS as a second engine</label>
@@ -1145,6 +1145,10 @@ async function loadVoices() {
     // attention itself from the card. An empty select reading "auto" is fine;
     // a stale Qwen list next to a MOSS take is not.
     $("rowAttn").hidden = isMoss();
+    // MOSS's loader keeps its model in a module global that nothing in a
+    // graph can release, so the switch would promise memory it cannot free.
+    // Qwen's node honours it — once, after a take's last line.
+    $("rowUnload").hidden = isMoss();
     renderSpeakers();
   } catch (e) { renderSpeakers(); }
 }
