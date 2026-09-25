@@ -27,6 +27,20 @@
    `/object_info` and matches inputs through candidate-name lists. The
    Qwen-TTS node renames inputs between releases; a schema read turns that into
    a clear message instead of a wrong value.
+2c. **A node is asked for by the name ComfyUI registered, never its Python
+   class name.** ComfyUI keys `/object_info` and the prompt's `class_type` by
+   `NODE_CLASS_MAPPINGS`, and the Qwen pack maps `FB_Qwen3TTSCustomVoice` to
+   `CustomVoiceNode`. This app asked for `CustomVoiceNode` from its first
+   version, the stand-in ComfyUI answered to it, and the suite passed — while
+   on every real install the Qwen engine read "nodes not loaded" and no line
+   could be built. The class names are roles now; `ComfyClient.real()` resolves
+   each through `QWEN_CLASS_NAMES` against the schema, and the stand-in
+   registers the real keys. Transcribe a node pack from its `__init__.py`, not
+   from `nodes.py`.
+2d. **Every Python child talks UTF-8 on its pipe, both ends** (`PY_TEXT`,
+   `py_env`). Windows gives a piped child the ANSI code page with strict
+   errors, ComfyUI's log interceptor keeps it, and the Qwen pack prints an
+   emoji as it imports — IMPORT FAILED, only when this app started ComfyUI.
 3. **Preset voices, models and attention modes are read from the node, never
    typed into the source.** `CustomVoiceNode.speaker` is the only truth about
    which voices exist.
@@ -107,7 +121,9 @@
    look complete for good: the `.part` to resume from was gone, and the folder
    counted as installed with truncated weights in it. `model_installed()` also
    returns False while any `.part` remains, or a repo whose config.json landed
-   first reports installed while its weights are still arriving. Whole-repo
+   first reports installed while its weights are still arriving — and it needs
+   weight files, not a config: a weights request that failed before its `.part`
+   opened left config.json alone, and that counted as installed for good. Whole-repo
    downloads skip `.bin` duplicates of safetensors and repo furniture.
 7. **One line of dialogue is one graph.** Do not switch to
    `DialogueInferenceNode` — see below.
@@ -441,6 +457,29 @@
 31b. **`wait_for_prompt` is told which engine queued the line.** There are two
    clients now, and reading the selected one inside the wait loop polls the
    wrong ComfyUI the moment someone switches engines mid-take.
+31c. **A take loads each checkpoint once, and frees the card once.** Both
+   node packs hold a single model: Qwen's `load_qwen_model` clears its cache
+   before loading a different one, and the MOSS loader moves the last model off
+   the card. Spoken in script order, a preset speaker answering a cloned one
+   swapped CustomVoice for Base on every line — a read from disk each time, and
+   on an 8 GB card most of the take. `generation_order` groups lines by
+   `ComfyClient.line_weights` (which must mirror what the builders load), keeps
+   script order within a group, and the take is joined in script order. And
+   `unload` rides only the take's last line: sent with every line, "Free GPU
+   memory after each run" dropped the weights after each one and read them back
+   for the next. MOSS keeps its model in a module global no graph can release,
+   so the switch is hidden there rather than promising what it cannot do.
+   `result()` reads the history once and calls a prompt ComfyUI finished with
+   no audio an error, instead of waiting fifteen minutes for nothing.
+31d. **A job keeps to its own engine, prompt and clips.** `activate` refuses
+   (`busy_elsewhere`) while another engine is reading a take, and `/api/speak`
+   registers the job before bringing its engine up: switching engines mid-take
+   stopped the take's engine under it. Cancel acts only on a running job, by its
+   own `prompt_id` — the player's Stop sends the last job's id, and used to
+   interrupt a self-test. Reference clips live in `data/references` under a
+   content hash and `ensure_reference` sends one to whichever engine speaks the
+   line: each ComfyUI has its own input folder, and uploads by file name made
+   two speakers' `recording.wav` one voice.
 32. **The dependency report is per engine, and so are the install ids.**
    `comfyui_moss`, `torch_qwen`, `node_reqs_moss` — Python and Git are the only
    rows left that both engines share. `install_dependency` reads the engine off
@@ -526,8 +565,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 247 unit tests, standard library only
-npm test                 # 104 checks driving the real page in headless Chromium
+npm run test:units       # 282 unit tests, standard library only
+npm test                 # 108 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script
@@ -571,8 +610,9 @@ hand on purpose: the gate has to keep running with nothing installed.
 
 ## Version floor
 
-Node classes used: `CustomVoiceNode`, `VoiceCloneNode`, `VoiceDesignNode`,
-`LoadAudio`, `SaveAudioAdvanced` (falls back to `SaveAudio`), and from
+Node classes used: `CustomVoiceNode`, `VoiceCloneNode`, `VoiceDesignNode`
+(registered as `FB_Qwen3TTSCustomVoice`, `FB_Qwen3TTSVoiceClone`,
+`FB_Qwen3TTSVoiceDesign` — rule 2c), `LoadAudio`, `SaveAudioAdvanced` (falls back to `SaveAudio`), and from
 MOSS `MossTTSModelLoader`, `MossTTSGenerate`, `MossTTSVoiceDesign`. Qwen3-TTS
 needs `transformers==4.57.3` or `>=5.0` — the Engine panel checks this
 explicitly because it is the usual cause of IMPORT FAILED. MOSS asks only for
@@ -612,6 +652,14 @@ them in step with it, not with the node's README, which lists fewer.
 whatever the model picker says, because the picker offers 0.6B for cloning.
 
 ## Stitching
+
+Current ComfyUI saves flac, mp3 or opus — never wav — and publishes the choice
+as a DynamicCombo (`["COMFY_DYNAMICCOMBO_V3", {"options": [{"key": …}]}]`),
+which `_enum` reads by its keys. Flac is chosen, and `to_wav` turns the clips
+back into wav **in the engine's own interpreter** with PyAV: the interpreter
+that wrote the flac can always read it, and this app still imports nothing
+beyond `wave`. Where that interpreter is unknown (someone else's ComfyUI) the
+clips stay as they are and the take is zipped.
 
 `stitch_wavs` joins clips with `wave` only — no ffmpeg. It refuses when channel
 count, sample width or rate differ between clips, and the caller falls back to a

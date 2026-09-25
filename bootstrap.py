@@ -168,7 +168,11 @@ DEFAULT_CONFIG = {
     "hf_repo": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
     "want_clone": True,
     "want_17b": False,
-    "want_voicedesign": False,
+    # On by default for the same reason as MOSS's below: the Voices card
+    # offers "Described" on the primary engine, and with the folder absent
+    # the node fetched ~4 GB in the middle of someone's first designed take —
+    # or, offline, failed it. At 1.7B it fits the same 8 GB card.
+    "want_voicedesign": True,
     "want_moss": True,
     "want_moss_8b": False,
     # On by default: MOSS has no preset speakers, so describing a voice is one
@@ -429,8 +433,34 @@ class Progress:
 # --------------------------------------------------------------------------- #
 # interpreters
 # --------------------------------------------------------------------------- #
+# Every Python this app starts talks UTF-8 on its pipes, both ends. Windows
+# gives a piped child the ANSI code page with strict errors, ComfyUI's log
+# interceptor keeps it, and the Qwen pack prints "✅ … loaded" as it imports —
+# so on a cp1252 machine the pack died with UnicodeEncodeError, IMPORT FAILED,
+# only when this app started ComfyUI. And the reader here decoded with the same
+# code page, which raises on bytes UTF-8 uses: the pump thread died, the pipe
+# filled, and ComfyUI stalled on its next print.
+PY_TEXT = {"text": True, "encoding": "utf-8", "errors": "replace"}
+
+
+def py_env(env: dict | None = None) -> dict:
+    out = dict(os.environ if env is None else env)
+    out.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+    return out
+
+
+def _runs_python(cmd: list[str]) -> bool:
+    return len(cmd) > 1 and cmd[1] in ("-c", "-m")
+
+
 def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+    if _runs_python(cmd):
+        kw["env"] = py_env(kw.get("env"))
+        return subprocess.run(cmd, capture_output=True, **PY_TEXT, **kw)
+    # Other tools answer in the console's code page; a byte it cannot map is
+    # a character lost, never an exception.
+    return subprocess.run(cmd, capture_output=True, text=True,
+                          errors="replace", **kw)
 
 
 def find_python(prog: Progress | None = None) -> str:
@@ -514,7 +544,24 @@ def _interpreters(comfy_dir: Path) -> list[Path]:
     else:
         cands += [comfy_dir.parent / "python_standalone" / "bin" / "python"]
     cands += [venv_python(comfy_dir)]
-    return cands
+    # Never this app's own environment. A managed install sits beside the
+    # launcher, so comfy_dir.parent/.venv *is* Script Builder's Flask venv —
+    # and with torch missing from the engine's (a download cut off, a failed
+    # Reinstall) it won as the first interpreter that ran: ComfyUI was
+    # launched on it, and Install put torch into it. Rule 4.
+    ours = (APP_DIR / ".venv").resolve()
+    return [c for c in cands if _env_root(c) != ours]
+
+
+def _env_root(python: Path) -> Path:
+    # <env>/bin/python, <env>/Scripts/python.exe, <env>/python.exe
+    up = python.parent
+    if up.name.lower() in ("bin", "scripts"):
+        up = up.parent
+    try:
+        return up.resolve()
+    except OSError:
+        return up
 
 
 def existing_python(comfy_dir: Path) -> str:
@@ -666,9 +713,13 @@ def model_installed(models_dir: Path, repo: str, engine: str = "") -> bool:
     # and fail on every line until the folder is whole.
     if partial_download(d):
         return False
-    weights = [f for f in d.rglob("*") if f.suffix in WEIGHT_SUFFIXES]
-    has_config = (d / "config.json").exists()
-    return bool(weights) or has_config
+    # And a config is not a model. download_repo fetches the small files
+    # first, so a request for the weights that fails before its .part is
+    # opened — a 503, a dropped DNS lookup — left config.json alone in the
+    # folder, which counted as installed: setup never fetched it again, and
+    # the first take failed inside the node. Every repo either engine uses
+    # carries its weights as one of these files.
+    return any(f.suffix in WEIGHT_SUFFIXES for f in d.rglob("*"))
 
 
 def folder_whole(d: Path) -> bool:
@@ -961,6 +1012,7 @@ class ComfyProcess:
     def __init__(self) -> None:
         self.proc: subprocess.Popen | None = None
         self.lines: list[str] = []
+        self.written = 0
         self._lock = threading.Lock()
 
     def note(self, msg: str) -> None:
@@ -972,9 +1024,23 @@ class ComfyProcess:
         reads as two unrelated stories.
         """
         with self._lock:
-            self.lines.append(f"[Script Builder] {msg}")
-            if len(self.lines) > 2000:
-                del self.lines[:1000]
+            self._append(f"[Script Builder] {msg}")
+
+    def _append(self, line: str) -> None:
+        # Caller holds the lock. `written` never shrinks, so a reader can mark
+        # where it started and ask for what came after, which an index into a
+        # buffer that trims itself cannot answer.
+        self.lines.append(line)
+        self.written += 1
+        if len(self.lines) > 2000:
+            del self.lines[:1000]
+
+    def since(self, mark: int) -> list[str]:
+        """Lines written after `mark` (a value of `written`), as many as the
+        buffer still holds."""
+        with self._lock:
+            n = min(self.written - mark, len(self.lines))
+            return self.lines[-n:] if n > 0 else []
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -1010,7 +1076,10 @@ class ComfyProcess:
             self.note("This environment's PyTorch has no GPU support in it — "
                       "starting ComfyUI on the CPU (--cpu). Speech will be "
                       "slow.")
-        cmd = [python, "main.py", "--listen", "127.0.0.1", "--port", str(port),
+        # main.py by its full path, so /system_stats reports where this
+        # engine runs from (rule 18e); run as a bare "main.py" it cannot say.
+        cmd = [python, str(comfy_dir / "main.py"), "--listen", "127.0.0.1",
+               "--port", str(port),
                "--disable-auto-launch"] + (extra or [])
         prog.log("Launching ComfyUI: " + " ".join(cmd))
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) \
@@ -1018,8 +1087,9 @@ class ComfyProcess:
         try:
             self.proc = subprocess.Popen(cmd, cwd=str(comfy_dir),
                                          stdout=subprocess.PIPE,
-                                         stderr=subprocess.STDOUT, text=True,
-                                         bufsize=1, creationflags=flags)
+                                         stderr=subprocess.STDOUT, **PY_TEXT,
+                                         env=py_env(), bufsize=1,
+                                         creationflags=flags)
         except OSError as exc:
             raise RuntimeError(
                 f"ComfyUI could not be started with {python} — {exc}. "
@@ -1037,9 +1107,7 @@ class ComfyProcess:
             for line in proc.stdout:
                 line = line.rstrip()
                 with self._lock:
-                    self.lines.append(line)
-                    if len(self.lines) > 2000:
-                        del self.lines[:1000]
+                    self._append(line)
                 if any(k in line for k in ("Error", "Traceback", "error:",
                                            "Qwen", "Starting server",
                                            "IMPORT FAILED")):
@@ -1253,6 +1321,16 @@ def pid_cmdline(pid: int) -> str:
     """The command line of a process, or "" when it cannot be read."""
     try:
         if platform.system() == "Windows":
+            # WMIC is off by default from Windows 11 24H2 and gone in 25H2,
+            # and an empty answer here waved the not-a-ComfyUI guard through.
+            # CIM through PowerShell is the supported way; WMIC stays as the
+            # fallback for machines old enough to lack Get-CimInstance.
+            out = _run(["powershell", "-NoProfile", "-Command",
+                        "(Get-CimInstance Win32_Process -Filter "
+                        f"'ProcessId={int(pid)}').CommandLine"],
+                       timeout=25).stdout.strip()
+            if out:
+                return out.splitlines()[0].strip()
             out = _run(["wmic", "process", "where", f"processid={pid}",
                         "get", "commandline"], timeout=25).stdout
             lines = [ln.strip() for ln in out.splitlines()
@@ -1561,7 +1639,7 @@ def pip_install(python: str, args: list[str], log, on_detail=None) -> None:
     # The context manager closes the pipe and reaps the child even if reading
     # its output raises, which a bare Popen left to garbage collection did not.
     with subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT, text=True,
+                          stderr=subprocess.STDOUT, **PY_TEXT, env=py_env(),
                           bufsize=0) as proc:
         assert proc.stdout
         if on_detail:
@@ -2428,6 +2506,15 @@ def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
             target = vpy
             pip_install(str(target), ["--upgrade", "pip", "wheel"],
                         prog.log, say)
+            # The build asked for goes in first, so ComfyUI's requirements find
+            # torch already satisfied. Left to them, pip fetched PyPI's torch —
+            # the CPU wheel on Windows, 3 GB of CUDA wheels on a Linux machine
+            # with no NVIDIA card — only for the pass below to uninstall it and
+            # download the right one. That pass stays: a requirement that pins
+            # torch can still replace it, and it is what checks the result.
+            prog.detail("deps", f"Installing PyTorch for {label} — the long "
+                                "one…")
+            install_requested_torch(str(target), cfg, prog.log, say)
             prog.detail("deps", f"Installing {label}'s ComfyUI requirements…")
             pip_install(str(target), ["-r", str(comfy_dir / "requirements.txt")],
                         prog.log, say)
@@ -2439,8 +2526,8 @@ def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
         else:
             prog.log(f"No requirements.txt in {eng['node_dir']} — skipping.")
         if slot.get("managed") and not portable_python(comfy_dir):
-            prog.detail("deps", f"Installing PyTorch for {label} — the long "
-                                "one…")
+            prog.detail("deps", f"Checking {label}'s PyTorch is still the "
+                                "build asked for…")
             install_requested_torch(str(target), cfg, prog.log, say)
         return
 

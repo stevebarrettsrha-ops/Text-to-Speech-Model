@@ -6,6 +6,7 @@ Run:  python server.py        (opens http://127.0.0.1:7799)
 
 from __future__ import annotations
 
+import hashlib
 import json
 import mimetypes
 import os
@@ -32,6 +33,8 @@ from comfy import ComfyClient, ComfyError, root_from_argv
 # SCRIPT_BUILDER_DATA moves both.
 TAKES_DIR = DATA_DIR / "takes"
 TAKES_PATH = DATA_DIR / "takes.json"
+REFS_DIR = DATA_DIR / "references"
+REFS_KEEP = 100
 WEB_DIR = APP_DIR / "web"
 PORT = int(os.environ.get("SCRIPT_BUILDER_PORT", "7799"))
 
@@ -174,8 +177,17 @@ def take_over_port(url: str, port: int, engine: str):
             # Never close something that is not a ComfyUI. The port is only
             # this engine's by convention, and a database or another app's
             # dev server on it is a settings mistake, not an orphan.
-            if cmd and not any(k in cmd.lower()
-                               for k in ("python", "main.py", "comfy")):
+            # And a command line that cannot be read is not evidence that it
+            # is one: rule 33a is "nothing is closed unless it looks like a
+            # ComfyUI", and an empty answer used to count as looking like one.
+            if not cmd:
+                return None, (f"Port {port} is held by pid {pid}, and its "
+                              "command line cannot be read, so it is not "
+                              "certain that it is a ComfyUI. Close it "
+                              "yourself (Task Manager, or `kill " f"{pid}`), "
+                              "then press Start ComfyUI.")
+            if not any(k in cmd.lower()
+                       for k in ("python", "main.py", "comfy")):
                 return None, (f"Port {port} is held by something that does not "
                               f"look like ComfyUI ({cmd[:90]}). Close it "
                               "yourself, or give this engine a different "
@@ -212,6 +224,22 @@ def take_over_port(url: str, port: int, engine: str):
                   "ComfyUI.")
 
 
+def busy_elsewhere(engine: str) -> str:
+    """Why another engine cannot be stopped for this one right now, or ""."""
+    if cfg.get("run_both_engines"):
+        return ""
+    with jobs_lock:
+        running = [j for j in jobs.values() if j.get("status") == "running"
+                   and j.get("engine") and j.get("engine") != engine]
+    if not running:
+        return ""
+    other = bootstrap.ENGINES[running[0]["engine"]]["label"]
+    return (f"{other} is still reading “{running[0].get('title') or 'a take'}”"
+            f" — let it finish or press Stop, then switch to "
+            f"{bootstrap.ENGINES[engine]['label']}. Only one engine holds "
+            "the card at a time.")
+
+
 def activate(engine: str, prog=None, wait: bool = True) -> str:
     """Make this the engine that is running, and the only one.
 
@@ -233,6 +261,12 @@ def activate(engine: str, prog=None, wait: bool = True) -> str:
 
     with engine_lock:
         url = bootstrap.engine_url(cfg, engine)
+        # Asked first, because the answer does not depend on anything below:
+        # switching engines on the Create page mid-take stopped the engine the
+        # take was on, and it failed with "ComfyUI stopped answering".
+        busy = busy_elsewhere(engine)
+        if busy:
+            return busy
         if comfy_online(url):
             stop_others()
             return ""
@@ -382,6 +416,70 @@ def zip_clips(paths: list[Path], dest: Path) -> None:
             z.write(p, p.name)
 
 
+# Run in the engine's own interpreter. Current ComfyUI saves audio as flac,
+# mp3 or opus and never wav, so without this every take became a zip of flac
+# clips: no joined file, no duration, a download that has to be unpacked. The
+# interpreter that wrote the flac through PyAV can always read it back, and
+# this app still needs nothing beyond `wave` (see Stitching in CLAUDE.md).
+FLAC_TO_WAV = r"""
+import sys, wave
+import av
+for src in sys.argv[1:]:
+    dst = src.rsplit(".", 1)[0] + ".wav"
+    with av.open(src) as f:
+        stream = f.streams.audio[0]
+        rate = stream.codec_context.sample_rate
+        to16 = None
+        pcm = []
+        channels = 0
+        for frame in f.decode(stream):
+            if to16 is None:
+                to16 = av.AudioResampler(format="s16", layout=frame.layout,
+                                         rate=rate)
+            for out in to16.resample(frame):
+                channels = channels or len(out.layout.channels)
+                pcm.append(out.to_ndarray().astype("<i2").tobytes())
+        if to16 is not None:
+            for out in to16.resample(None):
+                pcm.append(out.to_ndarray().astype("<i2").tobytes())
+    with wave.open(dst, "wb") as w:
+        w.setnchannels(channels or 1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(pcm))
+    print(dst)
+"""
+
+
+def to_wav(clips: list[Path], engine: str) -> list[Path]:
+    """The clips as wav, converted in the engine's interpreter where needed.
+
+    Gives back the clips unchanged when that cannot be done — a ComfyUI
+    someone else started, whose interpreter this app does not know — and the
+    caller then zips them as before.
+    """
+    todo = [c for c in clips if c.suffix.lower() != ".wav"]
+    if not todo:
+        return clips
+    python = bootstrap.comfy_python(cfg, engine)
+    if not python or not Path(python).exists():
+        return clips
+    try:
+        out = bootstrap._run([python, "-c", FLAC_TO_WAV]
+                             + [str(c) for c in todo], timeout=300)
+    except Exception:  # noqa: BLE001
+        return clips
+    wavs = [c.with_suffix(".wav") for c in clips]
+    if out.returncode != 0 or not all(w.exists() for w in wavs):
+        for w, c in zip(wavs, clips):
+            if w != c:
+                w.unlink(missing_ok=True)
+        return clips
+    for c in todo:
+        c.unlink(missing_ok=True)
+    return wavs
+
+
 # --------------------------------------------------------------------------- #
 # generation job
 # --------------------------------------------------------------------------- #
@@ -394,16 +492,20 @@ def wait_for_prompt(prompt_id: str, job_id: str, engine: str,
     engines mid-take.
     """
     started = time.time()
+    # A short line on a warm model is back in well under a second, and a
+    # whole second of polling latency per line was most of the gap between
+    # lines. The wait backs off to a second once a line is clearly working.
+    wait = 0.2
     while True:
-        time.sleep(1.0)
+        time.sleep(wait)
+        wait = min(wait * 1.5, 1.0)
         with jobs_lock:
             if jobs[job_id].get("cancelled"):
-                for_engine(engine).interrupt()
+                for_engine(engine).interrupt(prompt_id)
                 raise ComfyError("Cancelled")
-        err = for_engine(engine).failed(prompt_id)
+        outs, err = for_engine(engine).result(prompt_id)
         if err:
             raise ComfyError(err)
-        outs = for_engine(engine).outputs(prompt_id)
         if outs:
             return outs
         if time.time() - started > timeout:
@@ -442,6 +544,22 @@ def moss_dirs() -> dict:
     return out
 
 
+def generation_order(voices: list[dict], opts: dict) -> list[int]:
+    """The order to speak the lines in, so each checkpoint loads once a take.
+
+    Each engine holds one model at a time, so a preset speaker answering a
+    cloned one swapped weights on every line — seconds of disk read apiece,
+    and on an 8 GB card most of the take. Lines are grouped by the weights
+    they need, in the order each is first needed, and kept in script order
+    within a group; the take is still joined in script order.
+    """
+    groups: dict[tuple, list[int]] = {}
+    for i, voice in enumerate(voices):
+        groups.setdefault(ComfyClient.line_weights(voice, opts),
+                          []).append(i)
+    return [i for group in groups.values() for i in group]
+
+
 def run_job(job_id: str, payload: dict) -> None:
     def set_state(**kw):
         with jobs_lock:
@@ -470,12 +588,13 @@ def run_job(job_id: str, payload: dict) -> None:
         if engine == "moss":
             opts["moss_model"] = payload.get("moss_model") or ""
             opts["moss_dirs"] = moss_dirs()
-        pause = float(payload.get("pause") or 0.5)
+        # The slider goes down to 0, and `or 0.5` read that as "not given".
+        pause = payload.get("pause")
+        pause = 0.5 if pause in (None, "") else max(float(pause), 0.0)
         folder.mkdir(parents=True, exist_ok=True)
-        clips: list[Path] = []
-        meta_lines: list[dict] = []
 
-        for i, line in enumerate(lines):
+        keys, voices = [], []
+        for line in lines:
             key = str(line.get("speaker", 1))
             # JSON object keys are strings, but a take loaded back can carry
             # integer ones. A key that is neither is a speaker we do not have,
@@ -483,13 +602,30 @@ def run_job(job_id: str, payload: dict) -> None:
             voice = speakers.get(key) or {}
             if not voice and key.isdigit():
                 voice = speakers.get(int(key)) or {}
+            keys.append(key)
+            voices.append(voice)
+        for voice in voices:
+            if voice.get("kind") == "clone" and voice.get("ref_audio"):
+                ensure_reference(engine, voice["ref_audio"])
+        order = generation_order(voices, opts)
+        # Asked for once per take, on its last line. Sent with every line it
+        # made the node drop its weights after each one and read them back
+        # from disk for the next: a take paid a model load per line for a
+        # switch that says "after each run".
+        unload = opts["unload"]
+        made: dict[int, Path] = {}
+
+        for done, i in enumerate(order):
+            line, key, voice = lines[i], keys[i], voices[i]
             set_state(stage=f"Line {i + 1} of {len(lines)} · "
                             f"{voice.get('name') or 'Speaker ' + key}",
-                      pct=round(i / max(len(lines), 1) * 100, 1),
+                      pct=round(done / max(len(lines), 1) * 100, 1),
                       line_index=i)
 
+            opts["unload"] = unload and done == len(order) - 1
             built = for_engine(engine).build_line(line, voice, opts)
             prompt_id = for_engine(engine).queue(built["prompt"])
+            set_state(engine=engine, prompt_id=prompt_id)
             outs = wait_for_prompt(prompt_id, job_id, engine)
             item = outs[0]
             ext = Path(item["filename"]).suffix or ".wav"
@@ -499,14 +635,21 @@ def run_job(job_id: str, payload: dict) -> None:
                 with open(dest, "wb") as fh:
                     for chunk in resp.iter_content(1024 * 256):
                         fh.write(chunk)
-            clips.append(dest)
-            meta_lines.append({"index": i, "speaker": int(key) if key.isdigit() else 1,
-                               "text": line.get("text", ""), "file": dest.name})
+            made[i] = dest
+
+        if made:
+            set_state(stage="Joining the lines", pct=97)
+        order = sorted(made)
+        made = dict(zip(order, to_wav([made[i] for i in order], engine)))
+        clips = [made[i] for i in order]
+        meta_lines = [{"index": i,
+                       "speaker": int(keys[i]) if keys[i].isdigit() else 1,
+                       "text": lines[i].get("text", ""),
+                       "file": made[i].name} for i in order]
 
         if not clips:
             raise ComfyError("There is nothing in the script to say.")
 
-        set_state(stage="Joining the lines", pct=97)
         joined = folder / "take.wav"
         single = clips[0].suffix == ".wav" and stitch_wavs(clips, joined, pause)
         bundle = ""
@@ -1023,10 +1166,10 @@ def api_selftest(engine: str):
     why = activate(engine)
     if why:
         return jsonify({"error": why}), 400
-    tail = PROCS[engine].tail if PROCS[engine].alive() else None
+    console = PROCS[engine] if PROCS[engine].alive() else None
 
     def run(task: manager.Task) -> None:
-        manager.selftest(cfg, for_engine(engine), engine, task, tail)
+        manager.selftest(cfg, for_engine(engine), engine, task, console)
 
     label = bootstrap.ENGINES[engine]["label"]
     return jsonify({"ok": True,
@@ -1255,14 +1398,8 @@ def api_speak():
     want = payload.get("engine") or current_engine()
     if want not in bootstrap.ENGINES:
         want = bootstrap.DEFAULT_ENGINE
-    # Bring this engine up and put the other one down before a single line is
-    # queued. Two ComfyUIs that have both generated each hold their models in
-    # their own VRAM and neither can free the other's, so on 8 GB the second
-    # take is the one that fails to allocate.
-    why = activate(want)
-    if why:
-        return jsonify({"error": why}), 503
     payload["lines"] = lines
+    payload["engine"] = want
     job_id = uuid.uuid4().hex[:12]
     with jobs_lock:
         # Every other buffer in this app is capped; this one was not. A
@@ -1275,8 +1412,19 @@ def api_speak():
             jobs.pop(old_job["id"], None)
         jobs[job_id] = {"id": job_id, "status": "running", "pct": 0,
                         "stage": "Starting", "created": time.time(),
+                        "engine": want,
                         "total": len(lines),
                         "title": payload.get("title") or take_title(lines)}
+    # Bring this engine up and put the other one down before a single line is
+    # queued. Two ComfyUIs that have both generated each hold their models in
+    # their own VRAM and neither can free the other's, so on 8 GB the second
+    # take is the one that fails to allocate. The job is registered first, so
+    # a switch pressed while this one starts sees it and leaves it alone.
+    why = activate(want)
+    if why:
+        with jobs_lock:
+            jobs.pop(job_id, None)
+        return jsonify({"error": why}), 503
     threading.Thread(target=run_job, args=(job_id, payload), daemon=True).start()
     return jsonify({"job": job_id})
 
@@ -1291,23 +1439,69 @@ def api_jobs():
 
 @app.post("/api/jobs/<job_id>/cancel")
 def api_job_cancel(job_id: str):
+    # Only a job that is running, and only on the engine it is running on.
+    # This used to interrupt whatever the selected engine was doing whether or
+    # not the job was alive — and the player's Stop sends the last job's id,
+    # so stopping playback killed a self-test or a preview mid-line.
     with jobs_lock:
-        if job_id in jobs:
-            jobs[job_id]["cancelled"] = True
-    for_engine().interrupt()
-    return jsonify({"ok": True})
+        job = jobs.get(job_id)
+        if not job or job.get("status") != "running":
+            return jsonify({"ok": True, "running": False})
+        job["cancelled"] = True
+        engine, prompt_id = job.get("engine"), job.get("prompt_id")
+    if engine and prompt_id:
+        for_engine(engine).interrupt(prompt_id)
+    return jsonify({"ok": True, "running": True})
 
 
 @app.post("/api/upload-reference")
 def api_upload_reference():
+    """Keep the clip here, under a name taken from its contents.
+
+    Each engine is its own ComfyUI with its own input folder (rule 30), and
+    the clip used to go only to the one showing: switch engines and every
+    cloned line failed "Invalid audio file". And uploads overwrote by file
+    name, so two speakers' "recording.wav" became one voice. The copy here is
+    what `ensure_reference` hands to whichever engine speaks the line.
+    """
     if "file" not in request.files:
         return jsonify({"error": "No file received."}), 400
+    f = request.files["file"]
+    data = f.read()
+    if not data:
+        return jsonify({"error": "That file is empty."}), 400
+    ext = Path(f.filename or "").suffix.lower()
+    if not ext or len(ext) > 6 or not ext[1:].isalnum():
+        ext = ".wav"
+    name = f"sb-ref-{hashlib.sha1(data).hexdigest()[:16]}{ext}"
+    REFS_DIR.mkdir(parents=True, exist_ok=True)
+    (REFS_DIR / name).write_bytes(data)
+    # Rule 14. Newest kept; a speaker still pointing at a pruned clip keeps
+    # working on any engine that already has it.
+    kept = sorted(REFS_DIR.glob("sb-ref-*"), key=lambda p: p.stat().st_mtime)
+    for old in kept[:-REFS_KEEP]:
+        old.unlink(missing_ok=True)
     try:
-        return jsonify({"ok": True,
-                        "name": for_engine().upload_audio(
-                            request.files["file"])})
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"error": str(exc)}), 500
+        if engine_online():
+            ensure_reference(current_engine(), name)
+    except Exception:  # noqa: BLE001
+        pass            # the take sends it again; the copy here is what counts
+    return jsonify({"ok": True, "name": name})
+
+
+def ensure_reference(engine: str, name: str) -> None:
+    """Put a kept reference clip in that engine's ComfyUI before a take.
+
+    Sent every take: a clip is a few megabytes, and a copy remembered as sent
+    is wrong the day that ComfyUI's input folder is not the one it was. A name
+    this app did not keep (one from before the copy existed) is left as it
+    is — it may already be there.
+    """
+    local = REFS_DIR / Path(name).name
+    if not local.is_file():
+        return
+    mime = mimetypes.guess_type(local.name)[0] or "audio/wav"
+    for_engine(engine).upload_bytes(local.name, local.read_bytes(), mime)
 
 
 # --------------------------------------------------------------------------- #

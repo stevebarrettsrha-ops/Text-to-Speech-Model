@@ -494,7 +494,7 @@
               <span class="v" id="temp-v">0.90</span></div></div></div>
           <div class="orow" id="rowAttn"><span class="lab">Attention <i class="hint">i</i></span>
             <div class="ctl"><select id="attn-sel"><option value="auto">auto</option></select></div></div>
-          <div class="orow"><span class="lab">Free GPU memory after each run <i class="hint">i</i></span>
+          <div class="orow" id="rowUnload"><span class="lab">Free GPU memory after each run <i class="hint">i</i></span>
             <div class="ctl"><div class="segmented" id="segUnload">
               <button data-v="on">On</button><button class="on" data-v="off">Off</button>
             </div></div></div>
@@ -668,7 +668,7 @@
         <div class="switch"><label for="opt-clone">Voice cloning from a clip</label>
           <input type="checkbox" id="opt-clone" checked></div>
         <div class="switch"><label for="opt-design">Voice design from a description</label>
-          <input type="checkbox" id="opt-design"></div>
+          <input type="checkbox" id="opt-design" checked></div>
         <div class="switch"><label for="opt-17b">1.7B versions (better, slower)</label>
           <input type="checkbox" id="opt-17b"></div>
         <div class="switch"><label for="opt-moss">MOSS-TTS as a second engine</label>
@@ -1145,6 +1145,10 @@ async function loadVoices() {
     // attention itself from the card. An empty select reading "auto" is fine;
     // a stale Qwen list next to a MOSS take is not.
     $("rowAttn").hidden = isMoss();
+    // MOSS's loader keeps its model in a module global that nothing in a
+    // graph can release, so the switch would promise memory it cannot free.
+    // Qwen's node honours it — once, after a take's last line.
+    $("rowUnload").hidden = isMoss();
     renderSpeakers();
   } catch (e) { renderSpeakers(); }
 }
@@ -1292,7 +1296,13 @@ async function runScript() {
   }
 }
 async function previewVoice(n) {
-  if (!S.status || !S.status.ready) { openSetup(); return; }
+  // The same blocker the Run button names: an engine that is merely offline
+  // or missing a model was sent to the install dialog, which clears neither.
+  if (!S.status || !S.status.ready) {
+    var bl = blocker(S.status);
+    if (bl.go) bl.go();
+    return;
+  }
   try {
     var b = body([{ speaker: 1, text: "This is how I sound when I read your script." }],
                  "Voice sample — " + spkName(n));
@@ -1317,7 +1327,9 @@ async function pollJob(isPreview) {
   var job = jobs.filter(function (j) { return j.id === S.job; })[0];
   if (!job) { jobTimer = setTimeout(function () { pollJob(isPreview); }, 1500); return; }
   if (job.status === "running") {
-    highlight(typeof job.line_index === "number" ? job.line_index : -1);
+    // A voice sample is one line of its own, not a line of the script.
+    highlight(!isPreview && typeof job.line_index === "number"
+      ? job.line_index : -1);
     jobTimer = setTimeout(function () { pollJob(isPreview); }, 1200);
     return;
   }
@@ -1350,10 +1362,16 @@ function renderJobs() {
     b.addEventListener("click", function () { stopAll(); });
   });
 }
+/* `index` counts spoken lines, as the server and a take do — empty blocks
+   are never sent — so it is the index-th block with text in it, not block
+   number index. Counting blocks lit the one above after an empty block. */
 function highlight(index) {
+  var n = -1;
   S.blocks.forEach(function (b, i) {
+    if (b.text && b.text.trim()) n++;
     var el = $("blk-" + i);
-    if (el) el.classList.toggle("speaking", i === index);
+    if (el) el.classList.toggle("speaking",
+      index >= 0 && n === index && !!(b.text && b.text.trim()));
   });
 }
 
@@ -1978,6 +1996,15 @@ async function pollTasks() {
   S.tasks = list;
   paintDepTasks(list);
   var dls = list.filter(function (t) { return t.kind === "download"; });
+  // A download that has just finished leaves its model row reading
+  // "Starting…" and disabled unless the lists are read again.
+  var wasRunning = S.dlRunning || {}, landed = false;
+  S.dlRunning = {};
+  dls.forEach(function (t) {
+    if (t.state === "running") S.dlRunning[t.id] = true;
+    else if (wasRunning[t.id]) landed = true;
+  });
+  if (landed) { loadHf(); loadLocal(); refreshStatus(); }
   var box = $("dl-list");
   if (box) {
     box.innerHTML = dls.length ? "" : '<div class="empty">No downloads running.</div>';
@@ -2173,9 +2200,22 @@ async function deleteModel(repo) {
 /* ========================= setup ========================= */
 function openSetup() {
   $("veil-setup").hidden = false;
+  // Opened over a setup that is already running — the "Setting up…" button,
+  // or a reload during first-run setup — it offered the choice again, Start
+  // got a 409, and the progress panel stayed blank. Show the run instead.
+  if (S.status && S.status.setup_running) { watchSetup(); return; }
   $("setup-choice").hidden = false;
   $("setup-progress").hidden = true;
   renderPicks();
+}
+function watchSetup() {
+  $("setup-choice").hidden = true;
+  $("setup-progress").hidden = false;
+  $("setup-done").hidden = true;
+  $("setup-retry").hidden = true;
+  $("setup-log").textContent = "";
+  S.setupCursor = 0;
+  pollSetup();
 }
 function renderPicks() {
   var box = $("pick-list");
@@ -2221,7 +2261,10 @@ async function runSetup() {
         want_moss_8b: $("opt-moss-8b").checked,
         want_moss_design: $("opt-moss-design").checked }) });
     pollSetup();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    toast(e.message, true);
+    if (/already running/i.test(e.message)) watchSetup();
+  }
 }
 var setupTimer = null;
 async function pollSetup() {
@@ -2297,10 +2340,14 @@ async function refreshStatus() {
   var mine = (st.installs || {})[S.engine];
   $("cfg-url").placeholder = mine ? mine.comfy_url : "http://127.0.0.1:8188";
   var c = st.config || {};
-  $("cfg-url").value = c.comfy_url || "";
-  $("cfg-dir").value = c.comfy_dir || "";
-  $("cfg-models").value = c.models_dir || "";
-  $("cfg-auto").checked = !!c.auto_start_comfy;
+  // Not while Settings is open: this runs every six seconds, and it put the
+  // saved values back over whatever was being typed — then Save saved them.
+  if ($("veil-settings").hidden) {
+    $("cfg-url").value = c.comfy_url || "";
+    $("cfg-dir").value = c.comfy_dir || "";
+    $("cfg-models").value = c.models_dir || "";
+    $("cfg-auto").checked = !!c.auto_start_comfy;
+  }
   $("cfg-note").textContent = st.schema_error || "";
   if ((st.ready && !was) || (wasEngine && wasEngine !== st.engine)) loadVoices();
   if (!st.setup_complete && !S.setupSeen) { S.setupSeen = true; openSetup(); }

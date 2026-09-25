@@ -85,8 +85,11 @@ pulled into `ComfyUI/models/qwen-tts/`:
 | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | 2B | Voice from a written description |
 
 Setup downloads only what you tick: the tokenizer and 0.6B CustomVoice always,
-cloning and voice design if you want them, and the 1.7B versions of whichever of
-those you chose. The rest are one button each on the Models page.
+cloning and voice design unless you untick them, and the 1.7B versions of
+whichever of those you chose. The rest are one button each on the Models page.
+Voice design is ticked by default because the Voices card offers it on Qwen, and
+without the folder the node would fetch 4 GB in the middle of your first
+designed take.
 
 Which checkpoint feeds which node is worth knowing: **CustomVoice** carries the
 preset speakers, **Base** does zero-shot cloning, **VoiceDesign** builds a voice
@@ -260,16 +263,29 @@ sources change, since the two engines do not offer the same ones.
   every MOSS checkpoint exactly as OpenMOSS tuned it.
 - **Attention** — leave on `auto`. Installing `sageattention` or `flash_attn`
   makes generation two to three times faster.
-- **Free GPU memory after each run** — for cards under 8 GB. Slower, because the
-  model reloads each time.
+- **Free GPU memory after each run** — Qwen only. The model is released once,
+  after the take's last line, so the card is free for something else between
+  takes; the next take loads it again. MOSS's loader keeps its model in a way no
+  graph can release, so the switch is hidden there.
 
 ### Takes and playback
 
 Every run becomes a take. Lines are generated one at a time and joined into a
-single wav with your pause between them, so the workspace shows progress line by
-line and the block being spoken lights up as it plays. The player's ⏮ ⏭ skip
-between lines rather than between takes. Download gives you the joined file, or a
-zip of the clips if the format could not be joined.
+single wav with your pause between them. Each engine holds one model at a time,
+so lines are grouped by the model they need — a preset speaker answering a
+cloned one loads each model once per take instead of swapping on every line —
+and joined back in script order. The workspace shows progress line by line,
+and the block being spoken lights up as it plays. The player's ⏮ ⏭ skip
+between lines rather than between takes. Download gives you the joined file.
+Current ComfyUI saves audio as flac, never wav, so each clip is turned back into
+wav with the engine's own Python (which already has the decoder) before joining;
+only a ComfyUI you started yourself, whose Python Script Builder cannot see,
+gives you a zip of the clips instead.
+
+Reference clips for cloning are kept in `data/references`, named by their
+contents, and handed to whichever engine speaks the line — so a clip uploaded
+on Qwen works after switching to MOSS, and two files both called
+`recording.wav` stay two voices.
 
 ## Engine and Models panels
 
@@ -346,7 +362,8 @@ swap in the CUDA build. Machines with no NVIDIA card run on the CPU instead.
 each run.
 
 **A line takes forever** — the first line after a restart loads the model, which
-is slow. Later lines are much quicker unless memory freeing is on.
+is slow. Later lines reuse it, and so does the first line of the next take unless
+memory freeing is on.
 
 ---
 

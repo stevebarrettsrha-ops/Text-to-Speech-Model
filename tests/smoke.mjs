@@ -350,6 +350,8 @@ try {
      'and says why rather than showing an empty picker');
   is(await page.$eval('#rowAttn', e => e.hidden),
      'the attention picker is hidden on MOSS, which has none');
+  is(await page.$eval('#rowUnload', e => e.hidden),
+     'so is the free-memory switch, which MOSS cannot honour');
   const mossModels = await page.$$eval('#model-sel option',
     e => e.map(x => ({ v: x.value, t: x.textContent, off: x.disabled })));
   is(mossModels.some(m => m.v.startsWith('OpenMOSS-Team/')),
@@ -781,6 +783,50 @@ try {
   is(overflow <= 2, 'no horizontal overflow at 420px', `${overflow}px`);
   await page.setViewportSize({ width: 1440, height: 900 });
   await sleep(500);
+
+  /* ------------------------------------- small things that each misled */
+  // The status poll runs every six seconds and put the saved values back over
+  // whatever was being typed into Settings — then Save saved the old ones.
+  await page.click('#navSettings');
+  await sleep(300);
+  await page.fill('#cfg-url', 'http://127.0.0.1:9999');
+  await page.evaluate(() => refreshStatus());
+  await sleep(500);
+  is(await page.inputValue('#cfg-url') === 'http://127.0.0.1:9999',
+     'a Settings field being edited is not overwritten by the status poll');
+  await page.evaluate(() => { $("veil-settings").hidden = true; });
+
+  // The server counts spoken lines; an empty block is never sent. Counting
+  // blocks lit the empty one above the line being read.
+  const lit = await page.evaluate(() => {
+    const keep = S.blocks;
+    S.blocks = [{ spk: 1, text: '' }, { spk: 1, text: 'alpha' },
+                { spk: 2, text: 'beta' }];
+    renderBlocks();
+    highlight(0);
+    const on = S.blocks.map((b, i) =>
+      $('blk-' + i).classList.contains('speaking'));
+    S.blocks = keep; renderBlocks(); resizeAll();
+    return on;
+  });
+  is(JSON.stringify(lit) === '[false,true,false]',
+     'line 0 lights the first block with text in it', JSON.stringify(lit));
+
+  // Opened over a setup already running, the dialog offered the choice again
+  // and its progress panel stayed blank.
+  const setupView = await page.evaluate(() => {
+    const keep = S.status.setup_running;
+    S.status.setup_running = true;
+    openSetup();
+    clearTimeout(setupTimer);
+    const r = { choice: $('setup-choice').hidden, prog: $('setup-progress').hidden };
+    S.status.setup_running = keep;
+    $('veil-setup').hidden = true;
+    return r;
+  });
+  is(setupView.choice && !setupView.prog,
+     'the setup dialog shows a running setup rather than the choice again',
+     JSON.stringify(setupView));
 
   /* ------------------------------------------------- faults are surfaced */
   await page.evaluate(() => { setTimeout(() => { throw new Error('planted'); }, 0); });

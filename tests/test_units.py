@@ -231,6 +231,14 @@ class ModelInstalled(unittest.TestCase):
     def test_a_missing_folder_is_not_installed(self):
         self.assertFalse(bootstrap.model_installed(self.models, "Qwen/Nope"))
 
+    def test_a_config_whose_weights_never_came_is_not_installed(self):
+        # The weights request failed before its .part was opened — a 503, a
+        # DNS blip — and the config alone counted as installed, so setup
+        # never fetched the model again.
+        d = self._folder("Qwen/C")
+        (d / "config.json").write_text("{}")
+        self.assertFalse(bootstrap.model_installed(self.models, "Qwen/C"))
+
 
 class PipProgress(unittest.TestCase):
     """CLAUDE.md rule 16: the percentage behind the setup panel's bar."""
@@ -624,6 +632,492 @@ class DeadEngine(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("stopped answering", message)
         self.assertNotIn("HTTPConnectionPool", message)
+
+
+class OneModelLoadPerTake(unittest.TestCase):
+    """Both node packs hold one checkpoint at a time, so on an 8 GB card the
+    order lines are spoken in decides how many times a model is read from
+    disk, and the unload switch decides whether it happens on every line."""
+
+    class Recorder:
+        """Stands in for a ComfyClient: builds nothing, remembers everything."""
+
+        def __init__(self, root: Path):
+            self.root, self.calls, self.n = root, [], 0
+
+        def build_line(self, line, voice, opts):
+            self.calls.append({"text": line["text"],
+                               "weights": comfy.ComfyClient.line_weights(
+                                   voice, opts),
+                               "unload": opts["unload"]})
+            return {"prompt": {}}
+
+        def queue(self, prompt):
+            self.n += 1
+            return f"p{self.n}"
+
+        def result(self, prompt_id):
+            clip = make_clip(self.root / f"{prompt_id}.wav")
+            return [{"filename": clip.name}], None
+
+        def view(self, item):
+            resp = mock.MagicMock()
+            resp.__enter__.return_value = resp
+            resp.iter_content.return_value = [
+                (self.root / item["filename"]).read_bytes()]
+            return resp
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.client = self.Recorder(self.dir)
+        for target, value in (("for_engine", lambda *_: self.client),
+                              ("TAKES_DIR", self.dir / "takes"),
+                              ("TAKES_PATH", self.dir / "takes.json")):
+            patcher = mock.patch.object(server, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_take(self, speakers, lines, **extra):
+        job = f"job{len(server.jobs)}"
+        server.jobs[job] = {"status": "running"}
+        self.addCleanup(server.jobs.pop, job, None)
+        server.run_job(job, dict({"engine": "qwen", "model": "0.6B",
+                                  "pause": 0.1, "speakers": speakers,
+                                  "lines": [{"speaker": k, "text": t}
+                                            for k, t in lines]}, **extra))
+        return server.jobs[job]
+
+    DIALOGUE = [("1", "a1"), ("2", "b1"), ("1", "a2"), ("2", "b2"),
+                ("1", "a3")]
+    MIXED = {"1": {"name": "Ann", "kind": "preset", "speaker": "Aiden"},
+             "2": {"name": "Bo", "kind": "clone", "ref_audio": "bo.wav"}}
+
+    def test_a_preset_answering_a_clone_loads_each_model_once(self):
+        # Spoken in script order this swapped CustomVoice for Base on every
+        # line: five lines, five loads from disk.
+        job = self.run_take(self.MIXED, self.DIALOGUE)
+        self.assertEqual(job["status"], "done", job.get("error"))
+        weights = [c["weights"] for c in self.client.calls]
+        swaps = sum(1 for a, b in zip(weights, weights[1:]) if a != b)
+        self.assertEqual(swaps, 1)
+        self.assertEqual([c["text"] for c in self.client.calls],
+                         ["a1", "a2", "a3", "b1", "b2"])
+
+    def test_the_take_is_still_joined_in_script_order(self):
+        job = self.run_take(self.MIXED, self.DIALOGUE)
+        lines = job["take"]["lines"]
+        self.assertEqual([ln["text"] for ln in lines],
+                         [t for _, t in self.DIALOGUE])
+        self.assertEqual([ln["index"] for ln in lines], list(range(5)))
+        self.assertEqual(lines[1]["file"], "line_001.wav")
+
+    def test_free_memory_is_asked_for_once_after_the_last_line(self):
+        # Sent with every line it unloaded the model after each one, and the
+        # next line read it back from disk.
+        self.run_take(self.MIXED, self.DIALOGUE, unload=True)
+        self.assertEqual([c["unload"] for c in self.client.calls],
+                         [False] * 4 + [True])
+
+    def test_with_the_switch_off_nothing_is_unloaded(self):
+        self.run_take(self.MIXED, self.DIALOGUE, unload=False)
+        self.assertFalse(any(c["unload"] for c in self.client.calls))
+
+    def test_one_voice_keeps_script_order(self):
+        both = {"1": self.MIXED["1"], "2": dict(self.MIXED["1"], name="Cy")}
+        self.run_take(both, self.DIALOGUE)
+        self.assertEqual([c["text"] for c in self.client.calls],
+                         [t for _, t in self.DIALOGUE])
+
+    def test_the_weights_follow_what_each_builder_loads(self):
+        w = comfy.ComfyClient.line_weights
+        qwen = {"engine": "qwen", "model": "0.6B"}
+        self.assertNotEqual(w({"kind": "preset"}, qwen),
+                            w({"kind": "clone"}, qwen))
+        # A designed voice is always the 1.7B, whatever the picker says.
+        self.assertEqual(w({"kind": "design"}, qwen),
+                         w({"kind": "design"}, dict(qwen, model="1.7B")))
+        moss = {"engine": "moss", "moss_model": comfy.MOSS_DEFAULT_MODEL}
+        # MOSS clones and speaks in its own voice on one loader.
+        self.assertEqual(w({"kind": "preset"}, moss),
+                         w({"kind": "clone"}, moss))
+        self.assertEqual(w({"kind": "design"}, moss),
+                         ("moss", comfy.MOSS_VOICE_GENERATOR))
+
+
+class TheNamesComfyUIKnowsTheNodesBy(unittest.TestCase):
+    """ComfyUI registers a node under its NODE_CLASS_MAPPINGS key, and the
+    Qwen pack keys them FB_Qwen3TTS*. Asking for the Python class names found
+    no Qwen node on any real install, so the engine never read as ready."""
+
+    REAL = {"FB_Qwen3TTSCustomVoice": custom_voice(), **SAVE}
+
+    def test_the_registered_name_is_found(self):
+        c = client_for(self.REAL)
+        self.assertTrue(c.engine_ready("qwen"))
+        self.assertEqual(c.speakers(), ["Aiden", "Serena"])
+        self.assertTrue(c.capabilities("qwen")["preset"])
+
+    def test_the_graph_names_the_node_as_ComfyUI_registered_it(self):
+        g = client_for(self.REAL).build_line(
+            {"text": "hi"}, {"kind": "preset", "speaker": "Aiden"}, OPTS)
+        self.assertEqual(g["prompt"]["2"]["class_type"],
+                         "FB_Qwen3TTSCustomVoice")
+
+    def test_an_older_pack_s_names_still_work(self):
+        for name in ("Qwen3TTSCustomVoice", "CustomVoiceNode"):
+            c = client_for({name: custom_voice(), **SAVE})
+            self.assertTrue(c.engine_ready("qwen"), name)
+            g = c.build_line({"text": "hi"}, {"kind": "preset"}, OPTS)
+            self.assertEqual(g["prompt"]["2"]["class_type"], name)
+
+    def test_the_stand_in_uses_the_real_names(self):
+        # The suite passed for months against a mock that used the class
+        # names, which is how the fault shipped.
+        src = (REPO / "tests" / "mock_comfy.py").read_text(encoding="utf-8")
+        self.assertIn('"FB_Qwen3TTSCustomVoice": _node(', src)
+        self.assertNotIn('"CustomVoiceNode": _node(', src)
+
+
+class PipesAreUtf8(unittest.TestCase):
+    """Windows hands a piped Python the ANSI code page with strict errors, and
+    the Qwen pack prints an emoji as it imports: IMPORT FAILED, but only when
+    this app started ComfyUI."""
+
+    def test_a_child_on_a_cp1252_console_can_still_print_an_emoji(self):
+        env = dict(os.environ, PYTHONIOENCODING="cp1252")
+        env.pop("PYTHONUTF8", None)
+        out = bootstrap._run([sys.executable, "-c",
+                              "print('\u2705 ComfyUI-Qwen-TTS loaded')"],
+                             env=env, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("\u2705", out.stdout)
+
+    def test_the_engine_is_launched_with_utf8(self):
+        env = bootstrap.py_env({"PYTHONIOENCODING": "cp1252"})
+        self.assertEqual(env["PYTHONIOENCODING"], "utf-8")
+        self.assertEqual(env["PYTHONUTF8"], "1")
+
+
+class TakesJoinFromFlac(unittest.TestCase):
+    """Current ComfyUI's SaveAudioAdvanced offers flac, mp3 and opus as a
+    DynamicCombo and never wav, so every take used to arrive as a zip."""
+
+    V3_SAVE = {"SaveAudioAdvanced": {"input": {"required": {
+        "audio": ["AUDIO"],
+        "filename_prefix": ["STRING", {"default": "audio/ComfyUI"}],
+        "format": ["COMFY_DYNAMICCOMBO_V3", {"options": [
+            {"key": "flac", "inputs": {}},
+            {"key": "mp3", "inputs": {"required": {"quality": [
+                ["V0", "128k", "320k"], {"default": "V0"}]}}},
+            {"key": "opus", "inputs": {}}]}]}}}}
+
+    def test_a_dynamic_combo_is_read_as_its_keys(self):
+        c = client_for(self.V3_SAVE)
+        self.assertEqual(c._enum("SaveAudioAdvanced", "format"),
+                         ["flac", "mp3", "opus"])
+        self.assertEqual(c.save_node(), ("SaveAudioAdvanced", "flac"))
+
+    def test_lossless_is_picked_over_whatever_comes_first(self):
+        schema = copy.deepcopy(self.V3_SAVE)
+        opts = schema["SaveAudioAdvanced"]["input"]["required"]["format"][1]
+        opts["options"].reverse()
+        self.assertEqual(client_for(schema).save_node()[1], "flac")
+
+    def test_no_interpreter_leaves_the_clips_for_the_zip(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        clip = d / "line_000.flac"
+        clip.write_bytes(b"fLaC")
+        with mock.patch.object(bootstrap, "comfy_python", lambda *_: ""):
+            self.assertEqual(server.to_wav([clip], "qwen"), [clip])
+        self.assertTrue(clip.exists())
+
+    def test_a_failed_conversion_leaves_nothing_half_done(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        clip = d / "line_000.flac"
+        clip.write_bytes(b"not audio")
+        with mock.patch.object(bootstrap, "comfy_python",
+                               lambda *_: sys.executable):
+            self.assertEqual(server.to_wav([clip], "qwen"), [clip])
+        self.assertEqual(sorted(p.name for p in d.iterdir()),
+                         ["line_000.flac"])
+
+    def test_flac_as_ComfyUI_writes_it_comes_back_frame_exact(self):
+        try:
+            import av  # noqa: F401
+            import numpy as np
+        except ImportError:
+            self.skipTest("PyAV is ComfyUI's, not this app's")
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        clips = []
+        for i, (rate, chans) in enumerate([(24000, 1), (24000, 1)]):
+            # AudioSaveHelper.save_audio, as ComfyUI does it: float frames in.
+            wav = np.sin(np.arange(rate) * 0.05)[None].repeat(chans, 0) * 0.5
+            buf = io.BytesIO()
+            with av.open(buf, mode="w", format="flac") as out:
+                stream = out.add_stream("flac", rate=rate, layout="mono")
+                frame = av.AudioFrame.from_ndarray(
+                    wav.T.reshape(1, -1).astype(np.float32), format="flt",
+                    layout="mono")
+                frame.sample_rate, frame.pts = rate, 0
+                out.mux(stream.encode(frame))
+                out.mux(stream.encode(None))
+            clip = d / f"line_{i:03d}.flac"
+            clip.write_bytes(buf.getvalue())
+            clips.append(clip)
+        with mock.patch.object(bootstrap, "comfy_python",
+                               lambda *_: sys.executable):
+            wavs = server.to_wav(clips, "qwen")
+        self.assertEqual([w.suffix for w in wavs], [".wav", ".wav"])
+        self.assertFalse(any(c.exists() for c in clips))
+        with wave.open(str(wavs[0]), "rb") as w:
+            self.assertEqual((w.getnchannels(), w.getframerate(),
+                              w.getnframes()), (1, 24000, 24000))
+        self.assertTrue(server.stitch_wavs(wavs, d / "take.wav", 0.5))
+
+
+class JobsKeepToThemselves(unittest.TestCase):
+    """A take, a Stop and an engine switch each touched more than their own."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.client = mock.MagicMock()
+        for target, value in (("for_engine", lambda *_: self.client),
+                              ("REFS_DIR", self.dir / "refs"),
+                              ("engine_online", lambda *_: True)):
+            patcher = mock.patch.object(server, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.saved_jobs = dict(server.jobs)
+        server.jobs.clear()
+        self.addCleanup(lambda: (server.jobs.clear(),
+                                 server.jobs.update(self.saved_jobs)))
+        self.app = server.app.test_client()
+
+    def test_stop_after_a_take_has_finished_interrupts_nothing(self):
+        # The player's Stop sends the last job's id, and this used to stop
+        # whatever the engine was doing — a self-test, a preview — regardless.
+        server.jobs["old"] = {"id": "old", "status": "done", "engine": "qwen",
+                              "prompt_id": "p1"}
+        r = self.app.post("/api/jobs/old/cancel")
+        self.assertFalse(r.get_json()["running"])
+        self.client.interrupt.assert_not_called()
+
+    def test_stop_on_a_running_take_interrupts_its_own_prompt(self):
+        server.jobs["now"] = {"id": "now", "status": "running",
+                              "engine": "moss", "prompt_id": "p9"}
+        self.app.post("/api/jobs/now/cancel")
+        self.client.interrupt.assert_called_once_with("p9")
+        self.assertTrue(server.jobs["now"]["cancelled"])
+
+    def test_switching_engines_mid_take_leaves_the_take_s_engine_running(self):
+        server.jobs["t"] = {"id": "t", "status": "running", "engine": "qwen",
+                            "title": "Chapter one"}
+        with mock.patch.dict(server.cfg, {"run_both_engines": False}), \
+                mock.patch.object(server.PROCS["qwen"], "stop") as stop:
+            why = server.activate("moss")
+        self.assertIn("Chapter one", why)
+        stop.assert_not_called()
+
+    def test_with_room_for_both_a_take_does_not_block_a_switch(self):
+        server.jobs["t"] = {"id": "t", "status": "running", "engine": "qwen"}
+        with mock.patch.dict(server.cfg, {"run_both_engines": True}):
+            self.assertEqual(server.busy_elsewhere("moss"), "")
+
+    def test_a_reference_is_kept_by_its_contents(self):
+        # Uploaded by file name with overwrite on, two speakers' own
+        # "recording.wav" became one voice.
+        names = []
+        for body in (b"RIFF-one", b"RIFF-two"):
+            r = self.app.post("/api/upload-reference", data={
+                "file": (io.BytesIO(body), "recording.wav")},
+                content_type="multipart/form-data")
+            names.append(r.get_json()["name"])
+        self.assertNotEqual(names[0], names[1])
+        self.assertTrue(all(n.endswith(".wav") for n in names))
+        self.assertTrue((self.dir / "refs" / names[0]).is_file())
+
+    def test_the_engine_that_speaks_the_line_is_sent_the_clip(self):
+        # Each engine is its own ComfyUI with its own input folder: a clip
+        # uploaded while Qwen was showing did not exist for MOSS.
+        r = self.app.post("/api/upload-reference", data={
+            "file": (io.BytesIO(b"RIFF-voice"), "me.wav")},
+            content_type="multipart/form-data")
+        name = r.get_json()["name"]
+        self.client.reset_mock()
+        server.ensure_reference("moss", name)
+        self.client.upload_bytes.assert_called_once()
+        self.assertEqual(self.client.upload_bytes.call_args[0][:2],
+                         (name, b"RIFF-voice"))
+
+    def test_a_pause_of_nothing_is_nothing(self):
+        clip = self.dir / "c.wav"
+        make_clip(clip)
+        self.client.build_line.return_value = {"prompt": {}}
+        self.client.queue.return_value = "p"
+        self.client.result.return_value = ([{"filename": "c.wav"}], None)
+        resp = mock.MagicMock()
+        resp.__enter__.return_value = resp
+        resp.iter_content.return_value = [clip.read_bytes()]
+        self.client.view.return_value = resp
+        server.jobs["z"] = {"id": "z", "status": "running"}
+        with mock.patch.object(server, "TAKES_DIR", self.dir / "takes"), \
+                mock.patch.object(server, "TAKES_PATH",
+                                  self.dir / "takes.json"):
+            server.run_job("z", {"engine": "qwen", "pause": 0,
+                                 "speakers": {"1": {"kind": "preset"}},
+                                 "lines": [{"speaker": 1, "text": "a"},
+                                           {"speaker": 1, "text": "b"}]})
+        take = server.jobs["z"]["take"]
+        self.assertEqual(take["pause"], 0.0)
+        with wave.open(str(self.dir / "takes" / take["id"] / "take.wav")) as w:
+            self.assertEqual(w.getnframes(), 4000)
+
+
+class EngineHousekeeping(unittest.TestCase):
+    """Small readings of the engine that were each wrong on a real machine."""
+
+    def test_a_relative_main_py_names_no_folder(self):
+        # Started as "python main.py" from its own folder, or "ComfyUI\\main.py"
+        # by a portable .bat: resolved against this app's folder, either named
+        # a ComfyUI that does not exist, and our own engine read as foreign.
+        self.assertEqual(comfy.root_from_argv(["main.py", "--port", "8188"]),
+                         "")
+        self.assertEqual(comfy.root_from_argv(["ComfyUI\\main.py"]), "")
+        self.assertEqual(comfy.root_from_argv(["/opt/ComfyUI/main.py"]),
+                         "/opt/ComfyUI")
+        self.assertEqual(comfy.root_from_argv(["D:\\AI\\ComfyUI\\main.py"]),
+                         "D:\\AI\\ComfyUI")
+
+    def test_this_app_s_own_environment_is_never_an_engine_s(self):
+        # A managed install sits beside the launcher, so <parent>/.venv is
+        # Script Builder's Flask venv — which won whenever the engine's own
+        # environment had no torch in it.
+        comfy_dir = bootstrap.APP_DIR / "ComfyUI-Qwen3-TTS"
+        cands = [bootstrap._env_root(c)
+                 for c in bootstrap._interpreters(comfy_dir)]
+        self.assertNotIn((bootstrap.APP_DIR / ".venv").resolve(), cands)
+        self.assertIn(bootstrap._env_root(bootstrap.venv_python(comfy_dir)),
+                      cands)
+
+    def test_windows_reads_a_command_line_without_wmic(self):
+        # WMIC is gone from Windows 11 25H2; an empty answer waved the
+        # not-a-ComfyUI guard through.
+        calls = []
+
+        def run(cmd, **_):
+            calls.append(cmd[0])
+            return subprocess.CompletedProcess(
+                cmd, 0, "C:\\py\\python.exe main.py --port 8188\r\n", "")
+        with mock.patch.object(bootstrap.platform, "system",
+                               return_value="Windows"), \
+                mock.patch.object(bootstrap, "_run", side_effect=run):
+            self.assertIn("main.py", bootstrap.pid_cmdline(42))
+        self.assertEqual(calls, ["powershell"])
+
+    def test_an_unreadable_command_line_is_not_closed(self):
+        no_manager = mock.Mock(status_code=404)
+        with mock.patch.object(server.requests, "post",
+                               return_value=no_manager), \
+                mock.patch.object(server, "comfy_online", return_value=True), \
+                mock.patch.object(bootstrap, "port_pids", return_value=[77]), \
+                mock.patch.object(bootstrap, "pid_cmdline", return_value=""), \
+                mock.patch.object(bootstrap, "kill_pid") as kill, \
+                mock.patch.object(server.time, "sleep"):
+            how, advice = server.take_over_port("http://127.0.0.1:1", 1,
+                                                "qwen")
+        self.assertIsNone(how)
+        self.assertIn("cannot be read", advice)
+        kill.assert_not_called()
+
+    def test_versions_compare_as_numbers(self):
+        v = manager.version_tuple
+        self.assertLess(v("4.9.0"), (4, 40))       # "4.9" >= "4.40" as text
+        self.assertGreaterEqual(v("4.57.3"), (4, 40))
+        self.assertEqual(v("5.0.0rc1"), (5, 0, 0))
+        self.assertEqual(v("4.57.3.dev0")[:3], (4, 57, 3))
+
+    def test_the_console_answers_since_a_mark_after_it_trims_itself(self):
+        # The self-test sliced the buffer by its old length; once it trimmed,
+        # nothing was "new", and a run that downloaded passed as offline.
+        proc = bootstrap.ComfyProcess()
+        for i in range(1500):
+            proc.note(f"old {i}")
+        mark = proc.written
+        for i in range(599):
+            proc.note(f"new {i}")
+        proc.note("Downloading model.safetensors from huggingface")
+        fresh = proc.since(mark)
+        self.assertEqual(len(fresh), 600)
+        self.assertIn("huggingface", fresh[-1])
+        self.assertTrue(all("new" in l or "huggingface" in l for l in fresh))
+
+
+class TorchIsDownloadedOnce(unittest.TestCase):
+    """ComfyUI's requirements name torch. Installed before the build asked
+    for, pip fetched PyPI's — the CPU wheel on Windows, 3 GB of CUDA wheels on
+    a Linux box with no NVIDIA card — only to swap it out straight after."""
+
+    def test_the_requested_build_goes_in_before_the_requirements(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        cfg = split_cfg(root)
+        slot = bootstrap.engine_cfg(cfg, "qwen")
+        slot["managed"] = True
+        comfy_dir = Path(slot["comfy_dir"])
+        (comfy_dir / "requirements.txt").write_text("torch\n")
+        vpy = bootstrap.venv_python(comfy_dir)
+        vpy.parent.mkdir(parents=True)
+        vpy.write_text("")
+        order = []
+        with mock.patch.object(bootstrap, "pip_install",
+                               side_effect=lambda py, args, *a, **k:
+                               order.append(" ".join(args))), \
+                mock.patch.object(bootstrap, "install_requested_torch",
+                                  side_effect=lambda *a, **k:
+                                  order.append("TORCH")), \
+                mock.patch.object(bootstrap, "portable_python",
+                                  return_value=None):
+            bootstrap._setup_one(cfg, bootstrap.Progress(), "qwen", "deps",
+                                 {}, sys.executable, "managed", {})
+        reqs = next(i for i, o in enumerate(order)
+                    if o.endswith(str(comfy_dir / "requirements.txt")))
+        self.assertIn("TORCH", order[:reqs])
+        self.assertEqual(order[-1], "TORCH")   # and still checked last
+
+
+class ALineThatSavedNothing(unittest.TestCase):
+    """A prompt ComfyUI finished with no audio was waited on for the whole
+    fifteen-minute timeout, because nothing was ever going to arrive."""
+
+    def client_with(self, hist):
+        c = comfy.ComfyClient()
+        c.history = lambda _pid: hist
+        return c
+
+    def test_finished_without_audio_is_an_error(self):
+        outs, err = self.client_with({
+            "status": {"status_str": "success", "completed": True},
+            "outputs": {}}).result("p")
+        self.assertEqual(outs, [])
+        self.assertIn("saved no audio", err)
+
+    def test_still_running_is_not(self):
+        self.assertEqual(self.client_with({
+            "status": {"status_str": "running", "completed": False},
+            "outputs": {}}).result("p"), ([], None))
+
+    def test_the_node_s_own_error_comes_first(self):
+        _, err = self.client_with({"status": {
+            "status_str": "error", "completed": False,
+            "messages": [["execution_error", {
+                "node_type": "VoiceCloneNode",
+                "exception_message": "CUDA out of memory"}]]}}).result("p")
+        self.assertEqual(err, "VoiceCloneNode: CUDA out of memory")
 
 
 class WhyTheNodesDidNotLoad(unittest.TestCase):
@@ -2358,6 +2852,7 @@ class BothEnginesOnDisk(unittest.TestCase):
                 bootstrap.engine_models_dir(self.cfg, eid), repo, eid)
             d.mkdir(parents=True)
             (d / "config.json").write_text("{}")
+            (d / "model.safetensors").write_bytes(b"\0" * 32)
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)

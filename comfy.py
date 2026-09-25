@@ -13,6 +13,8 @@ is set up:
   cloned voice   LoadAudio ─► VoiceCloneNode(ref_audio, ref_text, target_text) ─► Save
   designed voice VoiceDesignNode(text, instruct) ─► Save
 
+  (Python class names — ComfyUI knows them as FB_Qwen3TTSCustomVoice etc.)
+
 Lines are generated one at a time and stitched afterwards, which is what lets
 the pause between lines, per-speaker voices and per-line retries work.
 
@@ -42,6 +44,23 @@ CLONE = "VoiceCloneNode"
 DESIGN = "VoiceDesignNode"
 CLONE_PROMPT = "VoiceClonePromptNode"
 DIALOGUE = "DialogueInferenceNode"
+
+# The names above are roles, not what ComfyUI calls the nodes. ComfyUI
+# registers a node under its NODE_CLASS_MAPPINGS key, and flybirdxx's pack
+# keys them "FB_Qwen3TTSCustomVoice" and so on — the Python class names above
+# never reach /object_info. Asking for them directly found no Qwen node on any
+# real install, so the engine never read as ready. Each role is resolved
+# against the schema through these lists, newest name first; rule 2's
+# candidate lists, one level up.
+QWEN_CLASS_NAMES = {
+    CUSTOM: ["FB_Qwen3TTSCustomVoice", "Qwen3TTSCustomVoice", CUSTOM],
+    CLONE: ["FB_Qwen3TTSVoiceClone", "Qwen3TTSVoiceClone", CLONE],
+    DESIGN: ["FB_Qwen3TTSVoiceDesign", "Qwen3TTSVoiceDesign", DESIGN],
+    CLONE_PROMPT: ["FB_Qwen3TTSVoiceClonePrompt", "Qwen3TTSVoiceClonePrompt",
+                   CLONE_PROMPT],
+    DIALOGUE: ["FB_Qwen3TTSDialogueInference", "Qwen3TTSDialogueInference",
+               DIALOGUE],
+}
 
 MOSS_LOADER = "MossTTSModelLoader"
 MOSS_GEN = "MossTTSGenerate"
@@ -111,6 +130,14 @@ def root_from_argv(argv) -> str:
     """
     for arg in argv or []:
         if isinstance(arg, str) and arg.lower().endswith("main.py"):
+            # Only an absolute path says where: "main.py" (how a launcher
+            # that cd's first starts it) or "ComfyUI\\main.py" (a portable
+            # .bat) is relative to a folder the process never reports, and
+            # resolved against this app's own folder it named a ComfyUI that
+            # does not exist — a mismatch warning over our own engine.
+            if not (arg.startswith(("/", "\\\\"))
+                    or (len(arg) > 2 and arg[1] == ":" and arg[2] in "/\\")):
+                return ""
             # Both separators appear: a Windows path read on any platform.
             cut = max(arg.rfind("/"), arg.rfind("\\"))
             return arg[:cut] if cut > 0 else ""
@@ -151,8 +178,16 @@ class ComfyClient:
                 self._schema_at = time.time()
             return self._schema
 
+    def real(self, class_type: str) -> str:
+        """The name this ComfyUI registered a role under (see QWEN_CLASS_NAMES)."""
+        names = QWEN_CLASS_NAMES.get(class_type)
+        if not names:
+            return class_type
+        schema = self.schema()
+        return next((n for n in names if n in schema), class_type)
+
     def has(self, class_type: str) -> bool:
-        return class_type in self.schema()
+        return self.real(class_type) in self.schema()
 
     def vram_mb(self) -> int:
         """What ComfyUI says the card has, as a second opinion to nvidia-smi.
@@ -198,7 +233,7 @@ class ComfyClient:
         return root_from_argv(argv)
 
     def node_inputs(self, class_type: str) -> dict:
-        info = self.schema().get(class_type)
+        info = self.schema().get(self.real(class_type))
         if not info:
             kit = "MOSS-TTS" if class_type.startswith("Moss") else "Qwen-TTS"
             raise ComfyError(
@@ -240,6 +275,14 @@ class ComfyClient:
             return []
         if spec and isinstance(spec[0], list):
             return [str(v) for v in spec[0]]
+        # ComfyUI's V3 nodes publish some choices as a DynamicCombo:
+        # ["COMFY_DYNAMICCOMBO_V3", {"options": [{"key": "flac", ...}]}], and
+        # the prompt takes the key as a plain string. SaveAudioAdvanced's
+        # format is one, so reading only plain lists found no formats at all.
+        if spec and len(spec) > 1 and isinstance(spec[1], dict) \
+                and isinstance(spec[1].get("options"), list):
+            return [str(o.get("key")) for o in spec[1]["options"]
+                    if isinstance(o, dict) and o.get("key")]
         return []
 
     def speakers(self) -> list[str]:
@@ -318,7 +361,12 @@ class ComfyClient:
             fmts = self._enum("SaveAudioAdvanced", "format")
             if prefer_wav and "wav" in fmts:
                 return "SaveAudioAdvanced", "wav"
-            return "SaveAudioAdvanced", (fmts[0] if fmts else "flac")
+            # Current ComfyUI offers no wav at all — flac, mp3 and opus. Flac
+            # is lossless, so the server can turn it back into wav and join
+            # the take (see server.flac_to_wav).
+            if "flac" in fmts or not fmts:
+                return "SaveAudioAdvanced", "flac"
+            return "SaveAudioAdvanced", fmts[0]
         if self.has("SaveAudio"):
             return "SaveAudio", "flac"
         raise ComfyError("ComfyUI has no audio save node. Update ComfyUI.")
@@ -369,7 +417,7 @@ class ComfyClient:
                     inputs[name] = opts["default"]
                 elif kind == "STRING":
                     inputs[name] = ""
-        return {"class_type": class_type, "inputs": inputs}
+        return {"class_type": self.real(class_type), "inputs": inputs}
 
     def _save(self, g: dict, source: str, opts: dict) -> str:
         save_class, fmt = self.save_node(prefer_wav=opts.get("prefer_wav", True))
@@ -382,6 +430,27 @@ class ComfyClient:
             wanted["format"] = {"names": ["format"], "value": fmt}
         g["3"] = self._node(save_class, wanted)
         return fmt
+
+    @staticmethod
+    def line_weights(voice: dict, opts: dict) -> tuple:
+        """Which checkpoint a line makes the engine hold.
+
+        Both node packs keep exactly one model resident: Qwen's
+        `load_qwen_model` clears its cache before loading a different one, and
+        MOSS's loader moves the last model off the card first. So a script
+        alternating a preset speaker with a cloned one reloads a checkpoint
+        from disk on every line. `run_job` groups lines by this key, and this
+        mirrors the choices the two builders below make.
+        """
+        kind = voice.get("kind") or "preset"
+        if (opts.get("engine") or "qwen") == "moss":
+            if kind == "design":
+                return ("moss", MOSS_VOICE_GENERATOR)
+            return ("moss", opts.get("moss_model") or MOSS_DEFAULT_MODEL)
+        if kind == "design":
+            return ("qwen", DESIGN, "1.7B")
+        node = CLONE if kind == "clone" else CUSTOM
+        return ("qwen", node, opts.get("model") or "")
 
     def build_line(self, line: dict, voice: dict, opts: dict) -> dict:
         """One line of dialogue → one prompt graph, on whichever engine."""
@@ -601,9 +670,18 @@ class ComfyClient:
                 raise ComfyError(r.text[:400])
         return r.json()["prompt_id"]
 
-    def interrupt(self) -> None:
+    def interrupt(self, prompt_id: str = "") -> None:
+        """Stop a prompt. Given its id, only that one — ComfyUI skips the
+        interrupt when something else is running — and it is also taken out
+        of the queue if it had not started. Without an id, whatever runs."""
         try:
-            requests.post(f"{self.url}/interrupt", timeout=10)
+            if prompt_id:
+                requests.post(f"{self.url}/interrupt",
+                              json={"prompt_id": prompt_id}, timeout=10)
+                requests.post(f"{self.url}/queue",
+                              json={"delete": [prompt_id]}, timeout=10)
+            else:
+                requests.post(f"{self.url}/interrupt", timeout=10)
         except Exception:
             pass
 
@@ -613,8 +691,8 @@ class ComfyClient:
         r.raise_for_status()
         return r.json().get(prompt_id) or {}
 
-    def outputs(self, prompt_id: str) -> list[dict]:
-        hist = self.history(prompt_id)
+    @staticmethod
+    def _audio(hist: dict) -> list[dict]:
         found = []
         for node_out in (hist.get("outputs") or {}).values():
             for key in ("audio", "audios", "result"):
@@ -623,8 +701,9 @@ class ComfyClient:
                         found.append(item)
         return found
 
-    def failed(self, prompt_id: str) -> str | None:
-        status = (self.history(prompt_id).get("status") or {})
+    @staticmethod
+    def _error(hist: dict) -> str | None:
+        status = (hist.get("status") or {})
         if status.get("status_str") == "error":
             for kind, data in status.get("messages", []):
                 if kind == "execution_error":
@@ -633,12 +712,47 @@ class ComfyClient:
             return "ComfyUI reported an error while generating."
         return None
 
+    def outputs(self, prompt_id: str) -> list[dict]:
+        return self._audio(self.history(prompt_id))
+
+    def failed(self, prompt_id: str) -> str | None:
+        return self._error(self.history(prompt_id))
+
+    def result(self, prompt_id: str) -> tuple[list[dict], str | None]:
+        """(audio, error) from one read of the history.
+
+        A prompt ComfyUI calls finished with no audio in it is an error now:
+        it used to be waited on for the full fifteen minutes, since nothing
+        was ever going to arrive.
+        """
+        hist = self.history(prompt_id)
+        err = self._error(hist)
+        if err:
+            return [], err
+        outs = self._audio(hist)
+        if not outs and (hist.get("status") or {}).get("completed"):
+            return [], ("ComfyUI finished the line but saved no audio. "
+                        "Check the engine's console for a warning.")
+        return outs, None
+
     def view(self, item: dict):
         params = {"filename": item.get("filename", ""),
                   "subfolder": item.get("subfolder", ""),
                   "type": item.get("type", "output")}
         return _reach(lambda: requests.get(f"{self.url}/view", params=params,
                                           stream=True, timeout=180), self.url)
+
+    def upload_bytes(self, name: str, data: bytes, mimetype: str) -> str:
+        files = {"image": (name, data, mimetype or "audio/wav")}
+        r = _reach(lambda: requests.post(
+            f"{self.url}/upload/image", files=files,
+            data={"type": "input", "overwrite": "true"}, timeout=180),
+            self.url)
+        r.raise_for_status()
+        data = r.json()
+        got = data.get("name") or name
+        sub = data.get("subfolder") or ""
+        return f"{sub}/{got}" if sub else got
 
     def upload_audio(self, file_storage) -> str:
         files = {"image": (file_storage.filename, file_storage.stream,
