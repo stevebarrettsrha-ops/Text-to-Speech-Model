@@ -125,7 +125,7 @@ def stream(cmd: list[str], task: Task, keep: tuple[str, ...] = ()) -> int:
                             env=bootstrap.py_env(), bufsize=1)
     assert proc.stdout
     for line in proc.stdout:
-        line = line.rstrip()
+        line = bootstrap.plain(line).rstrip()
         if not line:
             continue
         if not keep or line.startswith(keep):

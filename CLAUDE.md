@@ -272,6 +272,11 @@
    missing or `repair`) each used to set it alone, and the poll runs every six
    seconds, so it put the badge down over a PyTorch the list had just marked
    for repair whenever any engine answered. `paintEngineTag` combines them.
+18k. **The engine console is plain text.** ComfyUI colours its log even
+   into a pipe, so every line arrived wrapped in `\x1b[32m…\x1b[0m` and the
+   page printed the escapes. `plain()` strips them where lines are read —
+   `ComfyProcess._pump` and `manager.stream` — so `crash_reason` and the
+   Activity log see the same text a person does.
 18d. **`already` is not `started`.** `/api/comfy/start` returns `already` when
    something answers the address, and the page used to toast "Starting…"
    regardless: pressed, claims to work, changes nothing. It now says what is
@@ -585,7 +590,7 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 286 unit tests, standard library only
+npm run test:units       # 288 unit tests, standard library only
 npm test                 # 112 checks driving the real page in headless Chromium
 ```
 

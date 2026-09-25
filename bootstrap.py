@@ -1008,6 +1008,18 @@ def download_repo(cfg: dict, repo: str, models_dir: Path,
 # --------------------------------------------------------------------------- #
 # ComfyUI process
 # --------------------------------------------------------------------------- #
+# ComfyUI colours its log whether or not anything is reading it as a
+# terminal, so a piped line arrives as "\x1b[32m[INFO]\x1b[0m ..." and the
+# engine console printed the escapes as boxes and brackets around every
+# line. Colour sequences (CSI), title sequences (OSC) and a stray ESC go.
+ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|.?)")
+
+
+def plain(line: str) -> str:
+    """A console line without its terminal colour codes."""
+    return ANSI.sub("", line) if "\x1b" in line else line
+
+
 class ComfyProcess:
     def __init__(self) -> None:
         self.proc: subprocess.Popen | None = None
@@ -1105,7 +1117,7 @@ class ComfyProcess:
         assert proc.stdout
         try:
             for line in proc.stdout:
-                line = line.rstrip()
+                line = plain(line).rstrip()
                 with self._lock:
                     self._append(line)
                 if any(k in line for k in ("Error", "Traceback", "error:",

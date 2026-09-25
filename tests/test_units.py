@@ -2337,6 +2337,32 @@ class NodeImportDiagnosis(unittest.TestCase):
                       bootstrap.node_import_error(sys.executable, self.root))
 
 
+class TheEngineConsoleIsPlainText(unittest.TestCase):
+    """ComfyUI colours its log even into a pipe, and the engine console
+    printed "\x1b[32m[INFO]\x1b[0m" as boxes and brackets on every line."""
+
+    def test_what_the_engine_prints_arrives_without_its_colour_codes(self):
+        said = ("\x1b[32m[INFO]\x1b[0m comfy-kitchen version: 0.2.35",
+                "\x1b[1m\x1b[33m[WARNING]\x1b[0m ****** User settings ******",
+                "\x1b]0;ComfyUI\x07Starting server")
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys\nfor l in sys.argv[1:]: print(l)", *said],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            **bootstrap.PY_TEXT)
+        engine = bootstrap.ComfyProcess()
+        engine._pump(child, bootstrap.Progress())
+        child.wait()
+        self.assertEqual(engine.lines, [
+            "[INFO] comfy-kitchen version: 0.2.35",
+            "[WARNING] ****** User settings ******",
+            "Starting server"])
+
+    def test_a_line_with_no_codes_is_left_exactly_as_it_was(self):
+        line = "Traceback (most recent call last): [x] ~ \\ ok"
+        self.assertEqual(bootstrap.plain(line), line)
+
+
 class NodesNotLoaded(unittest.TestCase):
     """ComfyUI reads custom_nodes once, at startup, so installing them into a
     running engine leaves it running without them."""
