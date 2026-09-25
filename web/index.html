@@ -90,7 +90,7 @@
   .btn.go{background:linear-gradient(100deg,var(--accent),var(--accent-2));color:#fff}
   .btn.thin{padding:7px 13px;font-size:12.5px}
   .btn:disabled{opacity:.45;cursor:not-allowed}
-  .btn .spin{display:inline-block;width:12px;height:12px;border:2px solid currentColor;
+  .btn .spin,.empty .spin{display:inline-block;width:12px;height:12px;border:2px solid currentColor;
     border-right-color:transparent;border-radius:50%;margin-right:7px;
     vertical-align:-2px;animation:rot .8s linear infinite}
   @keyframes rot{to{transform:rotate(360deg)}}
@@ -1577,10 +1577,33 @@ async function removeTake(t) {
 }
 
 /* ========================= engine page ========================= */
+/* One /api/deps at a time. Opening the Engine page and pressing Install
+   everything missing each asked for the whole report, so a check that already
+   takes seconds per engine ran twice over. A caller that arrives while one is
+   out waits for that one — unless it wants a fresh read and the one out is
+   not. */
+var depsAsk = null;
+function fetchDeps(fresh) {
+  if (depsAsk && (depsAsk.fresh || !fresh)) return depsAsk.promise;
+  var ask = { fresh: !!fresh };
+  ask.promise = api("/api/deps" + (fresh ? "?fresh=1" : ""));
+  depsAsk = ask;
+  var clear = function () { if (depsAsk === ask) depsAsk = null; };
+  ask.promise.then(clear, clear);
+  return ask.promise;
+}
 async function loadDeps(fresh) {
   var box = $("dep-list");
+  // An empty list under a spinner read as a page that had stopped — and the
+  // engine console above it was pointing at a Reinstall button in this list.
+  // Rows already drawn stay up while they are checked again.
+  if (!box.querySelector(".fitem")) {
+    box.innerHTML = '<div class="empty"><span class="spin"></span>Checking '
+      + "each engine's install — PyTorch's files are read one by one, which "
+      + "takes a few seconds…</div>";
+  }
   try {
-    var d = await api("/api/deps" + (fresh ? "?fresh=1" : ""));
+    var d = await fetchDeps(fresh);
     $("torch-index").value = d.torch_index || "";
     // Say what Automatic picked. "Automatic" on its own is what let a machine
     // with an RTX 4060 in it quietly take the CPU build.
@@ -1623,7 +1646,8 @@ async function loadDeps(fresh) {
       }
       box.appendChild(el);
     });
-    $("engineTag").hidden = bad === 0;
+    S.depsBad = bad;
+    paintEngineTag();
     paintDepTasks(S.tasks || []);
   } catch (e) {
     box.innerHTML = '<div class="empty bad-text">' + esc(e.message) + "</div>";
@@ -1726,7 +1750,7 @@ async function installAllMissing() {
   });
   var b = busy($("btnInstallAll"), "Checking what is missing…");
   try {
-    var d = await api("/api/deps");
+    var d = await fetchDeps();
     var missing = order.filter(function (id) {
       return d.items.some(function (i) {
         return i.id === id && (i.state === "missing" || i.repair); });
@@ -1979,7 +2003,7 @@ async function startEngine(ev) {
    error — so an engine that failed for any other reason is offered nothing. */
 async function offerRepair(engine) {
   var d;
-  try { d = await api("/api/deps"); } catch (e) { return; }
+  try { d = await fetchDeps(); } catch (e) { return; }
   var row = (d.items || []).filter(function (i) {
     return i.id === "torch_" + engine && i.repair; })[0];
   if (row && confirm(row.detail + "\n\nReinstall PyTorch now? It downloads "
@@ -2310,6 +2334,17 @@ async function pollSetup() {
 }
 
 /* ========================= status ========================= */
+/* The Engine badge has two witnesses — the status poll (is the engine up with
+   its nodes) and the dependency list (is anything missing or in need of
+   repair) — and each used to set it alone. The poll runs every six seconds,
+   so it put the badge down over a PyTorch the list had just marked for
+   repair whenever any engine answered. Either one raises it now. */
+function paintEngineTag() {
+  var st = S.status;
+  var down = !!st && !(st.comfy_online && st.nodes_ready);
+  $("engineTag").hidden = !(down || S.depsBad > 0);
+}
+/* ========================= status ========================= */
 async function refreshStatus() {
   var st;
   try { st = await api("/api/status"); } catch (e) { return; }
@@ -2330,7 +2365,7 @@ async function refreshStatus() {
     : st.missing_models.length ? "Models missing"
     : st.models_known === false ? "No models folder" : "Engine loading";
   $("modelsTag").hidden = !(st.missing_models && st.missing_models.length);
-  $("engineTag").hidden = !!(st.comfy_online && st.nodes_ready);
+  paintEngineTag();
   $("runLabel").textContent = blocker(st).label;
   $("gpuMetric").querySelector("span").textContent =
     st.ready ? "ready" : st.comfy_online ? "loading" : "offline";

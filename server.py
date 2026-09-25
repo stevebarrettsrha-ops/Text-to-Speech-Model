@@ -1248,12 +1248,17 @@ def api_deps():
     # The GPU answer is cached — it costs a PowerShell query on Windows and
     # cannot change without a reboot. Recheck asks again anyway, because
     # installing the driver is exactly what someone does between two presses.
-    gpu = dict(bootstrap.nvidia_gpu(refresh=request.args.get("fresh") == "1"))
+    fresh = request.args.get("fresh") == "1"
+    gpu = dict(bootstrap.nvidia_gpu(refresh=fresh))
     if not gpu.get("vram_mb") and any_live:
         # nvidia-smi missing but ComfyUI running: it carries its own CUDA and
         # knows the card, which is exactly the gap rule 5b is about.
         gpu["vram_mb"] = any_live.vram_mb()
-    return jsonify({"items": manager.dependencies(cfg, live, current_engine()),
+    # Recheck also reads torch's files again rather than trusting the copy
+    # kept since pip last touched them: it is pressed because something is
+    # suspected, and that is the one time a kept answer is the wrong one.
+    return jsonify({"items": manager.dependencies(cfg, live, current_engine(),
+                                                  fresh),
                     "torch_index": cfg.get("torch_index", ""),
                     "gpu": gpu,
                     "torch_auto": bootstrap.torch_index({})})

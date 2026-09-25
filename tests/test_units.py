@@ -1935,6 +1935,54 @@ class ADamagedTorch(unittest.TestCase):
         self.assertTrue(row.get("repair"))
         self.assertIn("damaged", row["detail"])
 
+    def test_the_engine_page_reads_torch_again_only_once_pip_has_changed_it(self):
+        # The Engine page's list sat empty under "Checking what is missing…"
+        # while every torch .py file was hashed, for both engines, on every
+        # visit — long enough that the Reinstall button the console pointed
+        # at never appeared. The answer is kept until pip touches torch.
+        bootstrap.forget_torch_health()
+        self.addCleanup(bootstrap.forget_torch_health)
+        fake_torch_site(self.site)
+        with mock.patch.object(bootstrap, "torch_damage",
+                               wraps=bootstrap.torch_damage) as probe:
+            first = bootstrap.torch_damage_cached(sys.executable)
+            again = bootstrap.torch_damage_cached(sys.executable)
+            self.assertEqual(probe.call_count, 1,
+                             "torch was read again with nothing changed")
+            self.assertEqual(first, again)
+            # pip installing a second torch over the first: a new dist-info.
+            fake_torch_site(self.site, "2.14.0+cpu")
+            said = bootstrap.torch_damage_summary(
+                bootstrap.torch_damage_cached(sys.executable))
+            self.assertEqual(probe.call_count, 2)
+            self.assertIn("two versions of torch", said)
+            # Recheck reads it afresh whatever the folders say.
+            bootstrap.torch_damage_cached(sys.executable, fresh=True)
+            self.assertEqual(probe.call_count, 3)
+
+    def test_an_answer_that_names_no_folder_is_not_kept(self):
+        # Nothing to tell a changed install by, so nothing to trust later.
+        bootstrap.forget_torch_health()
+        self.addCleanup(bootstrap.forget_torch_health)
+        with mock.patch.object(bootstrap, "torch_damage",
+                               return_value={"dists": {}}) as probe:
+            bootstrap.torch_damage_cached("py")
+            bootstrap.torch_damage_cached("py")
+        self.assertEqual(probe.call_count, 2)
+
+    def test_an_install_forgets_what_torch_looked_like(self):
+        # Finished, failed or cut off, pip has run: the kept answer is gone.
+        bootstrap._TORCH_HEALTH["py"] = (("x",), {"root": "/nowhere"})
+        self.addCleanup(bootstrap.forget_torch_health)
+        with mock.patch.object(manager, "_install_torch",
+                               side_effect=RuntimeError("cut off")):
+            task = manager.install_dependency("torch_qwen", {}, {})
+            deadline = time.time() + 10
+            while task.state == "running" and time.time() < deadline:
+                time.sleep(0.02)
+        self.assertEqual(task.state, "error")
+        self.assertEqual(bootstrap._TORCH_HEALTH, {})
+
     def test_a_torch_that_will_not_import_is_not_called_missing(self):
         with mock.patch.object(manager, "_probe", return_value=(
                 1, "Traceback …\nImportError: DLL load failed")), \
@@ -2367,6 +2415,26 @@ class NodesNotLoaded(unittest.TestCase):
         rows = {i["id"]: i for i in items
                 if i["id"] in ("node_qwen", "node_moss")}
         self.assertEqual({r["state"] for r in rows.values()}, {"missing"})
+
+    def test_the_engines_are_checked_side_by_side(self):
+        # Each engine costs a torch import, a transformers import and a read
+        # of torch's files. One after the other, the Engine page's list stayed
+        # empty for the length of both. Each engine's check here waits for
+        # the other's to start, which only a side-by-side run gets past.
+        both = threading.Barrier(len(bootstrap.ENGINES), timeout=10)
+
+        def row(_py, suffix, label, _cfg=None, _fresh=False):
+            both.wait()
+            return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
+                    "state": "ok", "detail": "", "action": "reinstall"}
+
+        with mock.patch.object(manager, "_torch_row", side_effect=row):
+            items = manager.dependencies(
+                self.cfg, {e: self.Engine(True) for e in bootstrap.ENGINES})
+        ids = [i["id"] for i in items]
+        # And the list still reads in engine order, whichever finished first.
+        self.assertEqual(ids[:3], ["python", "git", "comfyui_qwen"])
+        self.assertLess(ids.index("engine_qwen"), ids.index("comfyui_moss"))
 
     def test_an_engine_turned_off_is_not_reported_as_missing(self):
         items = manager.dependencies(dict(self.cfg, want_moss=False),

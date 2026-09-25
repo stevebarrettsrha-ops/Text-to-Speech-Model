@@ -2024,6 +2024,68 @@ def torch_damage(python: str) -> dict:
     return found if isinstance(found, dict) else {}
 
 
+# The dependency report's copy of torch_damage, per interpreter. The probe
+# hashes every .py file torch ships — thousands, twice over when two versions
+# are installed over each other — and the Engine page asked for it on every
+# visit, both engines one after the other, so the list sat empty under a
+# spinner long enough to read as a page that had stopped. The answer only
+# changes when pip changes torch, and pip cannot do that without touching
+# what the fingerprint below reads: site-packages itself (a new dist-info, or
+# the ~orch folder an uninstall stashes into), the torch folders at its top,
+# and each torch RECORD. Launch, Reinstall and Recheck still read afresh.
+_TORCH_HEALTH: dict[str, tuple[tuple, dict]] = {}
+_TORCH_HEALTH_LOCK = threading.Lock()
+# "~" is how pip names what it stashes while it uninstalls ("~orch").
+TORCH_TOPS = ("torch", "functorch", "~")
+
+
+def _torch_fingerprint(root: str) -> tuple:
+    """What pip cannot change torch in `root` without changing."""
+    marks = []
+    try:
+        marks.append(("", os.stat(root).st_mtime_ns))
+        for entry in sorted(os.scandir(root), key=lambda e: e.name):
+            if not entry.name.lower().startswith(TORCH_TOPS):
+                continue
+            st = entry.stat()
+            marks.append((entry.name, st.st_mtime_ns))
+            if entry.name.endswith(".dist-info"):
+                rec = os.stat(os.path.join(entry.path, "RECORD"))
+                marks.append(("RECORD", rec.st_mtime_ns, rec.st_size))
+    except OSError:
+        return ()
+    return tuple(marks)
+
+
+def torch_damage_cached(python: str, fresh: bool = False) -> dict:
+    """torch_damage, read again only when pip has changed torch since.
+
+    Only an answer that names where torch lives is kept — without the folder
+    there is nothing to tell a changed install by — and `fresh` always asks.
+    """
+    key = str(python)
+    with _TORCH_HEALTH_LOCK:
+        held = None if fresh else _TORCH_HEALTH.get(key)
+    if held:
+        mark, found = held
+        if mark and mark == _torch_fingerprint(found["root"]):
+            return found
+    found = torch_damage(python)
+    mark = _torch_fingerprint(found["root"]) if found.get("root") else ()
+    with _TORCH_HEALTH_LOCK:
+        if mark:
+            _TORCH_HEALTH[key] = (mark, found)
+        else:
+            _TORCH_HEALTH.pop(key, None)
+    return found
+
+
+def forget_torch_health() -> None:
+    """Drop every kept answer — called when an install has run pip."""
+    with _TORCH_HEALTH_LOCK:
+        _TORCH_HEALTH.clear()
+
+
 def torch_damage_summary(found: dict) -> str:
     """The damage in words, or "" when there is none."""
     if not found:

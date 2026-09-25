@@ -99,6 +99,21 @@
    the torch folders it left behind, in the one directory the interpreter
    loads torch from — never before `index_lacks_torch` says a replacement
    exists.
+5f. **The Engine page reads torch's files only when pip has changed them.**
+   `torch_damage` hashes every `.py` torch ships, twice over when two versions
+   are installed over each other, and the report used to run it on every visit,
+   engine after engine. The dependency list sat empty under "Checking what is
+   missing…" for all of that, while the engine console above it pointed at a
+   Reinstall button in that same list. `torch_damage_cached` keeps the answer
+   until `_torch_fingerprint` changes: site-packages itself, the torch folders
+   at its top (pip's `~orch` stash included) and each torch RECORD, all of
+   which pip touches when it installs or uninstalls torch. An answer that
+   names no folder is never kept. Recheck (`fresh`), Start
+   (`torch_launch`) and Reinstall still read afresh, and any pip install task
+   clears the cache however it ends. The two engines are checked side by side
+   (`_engine_rows` on a thread each), the page says it is checking instead of
+   showing an empty list, and callers that ask at the same moment share one
+   request (`fetchDeps`).
 5d. **ComfyUI is never launched on a torch it will die on.** It asks CUDA for
    a device while it imports, so a CPU-only torch without `--cpu` stops as it
    starts — "AssertionError: Torch not compiled with CUDA enabled", a stack
@@ -252,6 +267,11 @@
    5e), no driver, a taken port, out of memory — each with the control that
    clears it, and anything else is its own last exception line, never
    nothing. `/api/status` and `/api/comfy/log` carry it as `stopped`.
+18j. **The Engine badge has two witnesses, and either raises it.** The
+   status poll (engine up, nodes loaded) and the dependency list (anything
+   missing or `repair`) each used to set it alone, and the poll runs every six
+   seconds, so it put the badge down over a PyTorch the list had just marked
+   for repair whenever any engine answered. `paintEngineTag` combines them.
 18d. **`already` is not `started`.** `/api/comfy/start` returns `already` when
    something answers the address, and the page used to toast "Starting…"
    regardless: pressed, claims to work, changes nothing. It now says what is
@@ -565,8 +585,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 282 unit tests, standard library only
-npm test                 # 108 checks driving the real page in headless Chromium
+npm run test:units       # 286 unit tests, standard library only
+npm test                 # 112 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script

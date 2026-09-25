@@ -521,6 +521,31 @@ try {
   // it started, every time. The server marks that row `repair`; the page has
   // to raise the badge for it and repair it with everything else. No machine
   // here has the card, so the report is the one thing faked.
+  // The list sat empty under "Checking what is missing…" for as long as the
+  // report took, while the engine console above it pointed at a Reinstall
+  // button in that list. It says it is checking now, and opening the page
+  // and pressing Install everything missing share one report between them.
+  {
+    const held = await app.api('/api/deps');
+    let asked = 0, release;
+    const gate = new Promise(r => { release = r; });
+    await page.route(u => u.pathname === '/api/deps', async r => {
+      asked++; await gate; return r.fulfill({ json: held });
+    });
+    await page.evaluate(() => { document.getElementById('dep-list').innerHTML = '';
+                                loadDeps(); loadDeps(); });
+    await sleep(300);
+    const waiting = (await page.textContent('#dep-list')).trim();
+    is(/Checking each engine/.test(waiting),
+       'an Engine list still being checked says so instead of sitting empty',
+       waiting);
+    release();
+    await sleep(400);
+    is(asked === 1, 'and two callers at once share one report', String(asked));
+    is((await page.$$('#dep-list .fitem')).length > 0,
+       'and the rows replace the notice when it lands');
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+  }
   const realDeps = await app.api('/api/deps');
   const repairDeps = { ...realDeps, items: realDeps.items.map(i =>
     i.id === 'torch_qwen'
@@ -545,6 +570,12 @@ try {
   await sleep(400);
   is(await page.$eval('#engineTag', e => !e.hidden),
      'a PyTorch that cannot start raises the Engine badge');
+  // The status poll runs every six seconds and used to put the badge back
+  // down whenever an engine answered, whatever the list had found.
+  await page.evaluate(() => refreshStatus());
+  await sleep(300);
+  is(await page.$eval('#engineTag', e => !e.hidden),
+     'and the status poll does not put it back down');
   const repairBtn = await page.$$eval('#dep-list .fitem', rows => {
     const row = rows.find(x => x.textContent.includes('PyTorch · Qwen3-TTS'));
     const btn = row && row.querySelector('button');
