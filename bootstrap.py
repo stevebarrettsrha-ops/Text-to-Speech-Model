@@ -2506,6 +2506,15 @@ def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
             target = vpy
             pip_install(str(target), ["--upgrade", "pip", "wheel"],
                         prog.log, say)
+            # The build asked for goes in first, so ComfyUI's requirements find
+            # torch already satisfied. Left to them, pip fetched PyPI's torch —
+            # the CPU wheel on Windows, 3 GB of CUDA wheels on a Linux machine
+            # with no NVIDIA card — only for the pass below to uninstall it and
+            # download the right one. That pass stays: a requirement that pins
+            # torch can still replace it, and it is what checks the result.
+            prog.detail("deps", f"Installing PyTorch for {label} — the long "
+                                "one…")
+            install_requested_torch(str(target), cfg, prog.log, say)
             prog.detail("deps", f"Installing {label}'s ComfyUI requirements…")
             pip_install(str(target), ["-r", str(comfy_dir / "requirements.txt")],
                         prog.log, say)
@@ -2517,8 +2526,8 @@ def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
         else:
             prog.log(f"No requirements.txt in {eng['node_dir']} — skipping.")
         if slot.get("managed") and not portable_python(comfy_dir):
-            prog.detail("deps", f"Installing PyTorch for {label} — the long "
-                                "one…")
+            prog.detail("deps", f"Checking {label}'s PyTorch is still the "
+                                "build asked for…")
             install_requested_torch(str(target), cfg, prog.log, say)
         return
 

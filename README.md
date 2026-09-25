@@ -276,8 +276,16 @@ so lines are grouped by the model they need — a preset speaker answering a
 cloned one loads each model once per take instead of swapping on every line —
 and joined back in script order. The workspace shows progress line by line,
 and the block being spoken lights up as it plays. The player's ⏮ ⏭ skip
-between lines rather than between takes. Download gives you the joined file, or a
-zip of the clips if the format could not be joined.
+between lines rather than between takes. Download gives you the joined file.
+Current ComfyUI saves audio as flac, never wav, so each clip is turned back into
+wav with the engine's own Python (which already has the decoder) before joining;
+only a ComfyUI you started yourself, whose Python Script Builder cannot see,
+gives you a zip of the clips instead.
+
+Reference clips for cloning are kept in `data/references`, named by their
+contents, and handed to whichever engine speaks the line — so a clip uploaded
+on Qwen works after switching to MOSS, and two files both called
+`recording.wav` stay two voices.
 
 ## Engine and Models panels
 

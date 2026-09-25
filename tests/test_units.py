@@ -1057,6 +1057,39 @@ class EngineHousekeeping(unittest.TestCase):
         self.assertTrue(all("new" in l or "huggingface" in l for l in fresh))
 
 
+class TorchIsDownloadedOnce(unittest.TestCase):
+    """ComfyUI's requirements name torch. Installed before the build asked
+    for, pip fetched PyPI's — the CPU wheel on Windows, 3 GB of CUDA wheels on
+    a Linux box with no NVIDIA card — only to swap it out straight after."""
+
+    def test_the_requested_build_goes_in_before_the_requirements(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        cfg = split_cfg(root)
+        slot = bootstrap.engine_cfg(cfg, "qwen")
+        slot["managed"] = True
+        comfy_dir = Path(slot["comfy_dir"])
+        (comfy_dir / "requirements.txt").write_text("torch\n")
+        vpy = bootstrap.venv_python(comfy_dir)
+        vpy.parent.mkdir(parents=True)
+        vpy.write_text("")
+        order = []
+        with mock.patch.object(bootstrap, "pip_install",
+                               side_effect=lambda py, args, *a, **k:
+                               order.append(" ".join(args))), \
+                mock.patch.object(bootstrap, "install_requested_torch",
+                                  side_effect=lambda *a, **k:
+                                  order.append("TORCH")), \
+                mock.patch.object(bootstrap, "portable_python",
+                                  return_value=None):
+            bootstrap._setup_one(cfg, bootstrap.Progress(), "qwen", "deps",
+                                 {}, sys.executable, "managed", {})
+        reqs = next(i for i, o in enumerate(order)
+                    if o.endswith(str(comfy_dir / "requirements.txt")))
+        self.assertIn("TORCH", order[:reqs])
+        self.assertEqual(order[-1], "TORCH")   # and still checked last
+
+
 class ALineThatSavedNothing(unittest.TestCase):
     """A prompt ComfyUI finished with no audio was waited on for the whole
     fifteen-minute timeout, because nothing was ever going to arrive."""
