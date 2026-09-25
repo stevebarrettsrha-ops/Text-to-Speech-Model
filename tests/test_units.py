@@ -231,6 +231,14 @@ class ModelInstalled(unittest.TestCase):
     def test_a_missing_folder_is_not_installed(self):
         self.assertFalse(bootstrap.model_installed(self.models, "Qwen/Nope"))
 
+    def test_a_config_whose_weights_never_came_is_not_installed(self):
+        # The weights request failed before its .part was opened — a 503, a
+        # DNS blip — and the config alone counted as installed, so setup
+        # never fetched the model again.
+        d = self._folder("Qwen/C")
+        (d / "config.json").write_text("{}")
+        self.assertFalse(bootstrap.model_installed(self.models, "Qwen/C"))
+
 
 class PipProgress(unittest.TestCase):
     """CLAUDE.md rule 16: the percentage behind the setup panel's bar."""
@@ -968,6 +976,85 @@ class JobsKeepToThemselves(unittest.TestCase):
         self.assertEqual(take["pause"], 0.0)
         with wave.open(str(self.dir / "takes" / take["id"] / "take.wav")) as w:
             self.assertEqual(w.getnframes(), 4000)
+
+
+class EngineHousekeeping(unittest.TestCase):
+    """Small readings of the engine that were each wrong on a real machine."""
+
+    def test_a_relative_main_py_names_no_folder(self):
+        # Started as "python main.py" from its own folder, or "ComfyUI\\main.py"
+        # by a portable .bat: resolved against this app's folder, either named
+        # a ComfyUI that does not exist, and our own engine read as foreign.
+        self.assertEqual(comfy.root_from_argv(["main.py", "--port", "8188"]),
+                         "")
+        self.assertEqual(comfy.root_from_argv(["ComfyUI\\main.py"]), "")
+        self.assertEqual(comfy.root_from_argv(["/opt/ComfyUI/main.py"]),
+                         "/opt/ComfyUI")
+        self.assertEqual(comfy.root_from_argv(["D:\\AI\\ComfyUI\\main.py"]),
+                         "D:\\AI\\ComfyUI")
+
+    def test_this_app_s_own_environment_is_never_an_engine_s(self):
+        # A managed install sits beside the launcher, so <parent>/.venv is
+        # Script Builder's Flask venv — which won whenever the engine's own
+        # environment had no torch in it.
+        comfy_dir = bootstrap.APP_DIR / "ComfyUI-Qwen3-TTS"
+        cands = [bootstrap._env_root(c)
+                 for c in bootstrap._interpreters(comfy_dir)]
+        self.assertNotIn((bootstrap.APP_DIR / ".venv").resolve(), cands)
+        self.assertIn(bootstrap._env_root(bootstrap.venv_python(comfy_dir)),
+                      cands)
+
+    def test_windows_reads_a_command_line_without_wmic(self):
+        # WMIC is gone from Windows 11 25H2; an empty answer waved the
+        # not-a-ComfyUI guard through.
+        calls = []
+
+        def run(cmd, **_):
+            calls.append(cmd[0])
+            return subprocess.CompletedProcess(
+                cmd, 0, "C:\\py\\python.exe main.py --port 8188\r\n", "")
+        with mock.patch.object(bootstrap.platform, "system",
+                               return_value="Windows"), \
+                mock.patch.object(bootstrap, "_run", side_effect=run):
+            self.assertIn("main.py", bootstrap.pid_cmdline(42))
+        self.assertEqual(calls, ["powershell"])
+
+    def test_an_unreadable_command_line_is_not_closed(self):
+        no_manager = mock.Mock(status_code=404)
+        with mock.patch.object(server.requests, "post",
+                               return_value=no_manager), \
+                mock.patch.object(server, "comfy_online", return_value=True), \
+                mock.patch.object(bootstrap, "port_pids", return_value=[77]), \
+                mock.patch.object(bootstrap, "pid_cmdline", return_value=""), \
+                mock.patch.object(bootstrap, "kill_pid") as kill, \
+                mock.patch.object(server.time, "sleep"):
+            how, advice = server.take_over_port("http://127.0.0.1:1", 1,
+                                                "qwen")
+        self.assertIsNone(how)
+        self.assertIn("cannot be read", advice)
+        kill.assert_not_called()
+
+    def test_versions_compare_as_numbers(self):
+        v = manager.version_tuple
+        self.assertLess(v("4.9.0"), (4, 40))       # "4.9" >= "4.40" as text
+        self.assertGreaterEqual(v("4.57.3"), (4, 40))
+        self.assertEqual(v("5.0.0rc1"), (5, 0, 0))
+        self.assertEqual(v("4.57.3.dev0")[:3], (4, 57, 3))
+
+    def test_the_console_answers_since_a_mark_after_it_trims_itself(self):
+        # The self-test sliced the buffer by its old length; once it trimmed,
+        # nothing was "new", and a run that downloaded passed as offline.
+        proc = bootstrap.ComfyProcess()
+        for i in range(1500):
+            proc.note(f"old {i}")
+        mark = proc.written
+        for i in range(599):
+            proc.note(f"new {i}")
+        proc.note("Downloading model.safetensors from huggingface")
+        fresh = proc.since(mark)
+        self.assertEqual(len(fresh), 600)
+        self.assertIn("huggingface", fresh[-1])
+        self.assertTrue(all("new" in l or "huggingface" in l for l in fresh))
 
 
 class ALineThatSavedNothing(unittest.TestCase):
@@ -2732,6 +2819,7 @@ class BothEnginesOnDisk(unittest.TestCase):
                 bootstrap.engine_models_dir(self.cfg, eid), repo, eid)
             d.mkdir(parents=True)
             (d / "config.json").write_text("{}")
+            (d / "model.safetensors").write_bytes(b"\0" * 32)
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)

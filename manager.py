@@ -254,6 +254,22 @@ def _torch_row(py_comfy: str, suffix: str, label: str,
     return row
 
 
+def version_tuple(ver: str) -> tuple:
+    """ "4.57.3" -> (4, 57, 3); "5.0.0rc1" -> (5, 0, 0). Stops at the first
+    part that does not start with a digit."""
+    out = []
+    for part in ver.strip().split("."):
+        digits = ""
+        for ch in part:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if not digits:
+            break
+        out.append(int(digits))
+    return tuple(out)
+
+
 def same_install(comfy_dir: str, engine_root: str) -> bool:
     """Is the ComfyUI answering the address the one we are managing?"""
     if not comfy_dir or not engine_root:
@@ -397,18 +413,23 @@ def dependencies(cfg: dict, clients=None, engine: str = "") -> list[dict]:
                               "action": "install"})
             else:
                 ver = out.splitlines()[-1].strip()
-                major = int(ver.split(".")[0]) if ver[:1].isdigit() else 0
+                have = version_tuple(ver)
                 # Qwen3-TTS is the strict one: 4.57.3, or 5.0 and up. MOSS asks
                 # only for 4.40+, and now that they no longer share an
-                # environment each is judged on its own floor.
-                good = (ver.startswith("4.57.3") or major >= 5) if eid == "qwen" \
-                    else (major >= 5 or ver >= "4.40")
+                # environment each is judged on its own floor. Compared as
+                # numbers: as text, "4.9" passed a floor of "4.40".
+                if eid == "qwen":
+                    good = have[:3] == (4, 57, 3) or have >= (5,)
+                    need = "Qwen3-TTS needs 4.57.3, or 5.0 and up."
+                else:
+                    good = have >= (4, 40)
+                    need = f"{ENGINES[eid]['label']} needs 4.40 or later."
                 items.append({
                     "id": "node_reqs" + suffix,
                     "label": f"Speech packages · {label}",
                     "state": "ok" if good else "warn",
                     "detail": f"transformers {ver}" + ("" if good else
-                              " — Qwen3-TTS needs 4.57.3, or 5.0 and up."),
+                              f" — {need}"),
                     "action": "install"})
         else:
             items.append({"id": "node_reqs" + suffix,
@@ -754,17 +775,21 @@ class _Steps:
         return self.add(sid, label, "skip", detail)
 
 
-def selftest(cfg: dict, client, engine: str, task: Task, tail=None) -> None:
+def selftest(cfg: dict, client, engine: str, task: Task,
+             console=None) -> None:
     """Prove an engine end to end, or say exactly where it stops.
 
-    `tail` returns the last lines of ComfyUI's console when we are the ones who
-    started it; None when someone else's ComfyUI is in front of us and its
-    output is theirs to read.
+    `console` is the ComfyProcess whose output we can read when we are the
+    ones who started it; None when someone else's ComfyUI is in front of us
+    and its output is theirs to read.
     """
     eng = ENGINES[engine]
     steps = _Steps(task)
     task.set(meta={**task.meta, "engine": engine, "steps": []})
-    started_lines = len(tail(4000)) if tail else 0
+    # A count of lines written, not the buffer's length: the buffer trims
+    # itself, and slicing it by where it used to end found nothing new —
+    # "ran without reaching for the network" over a run that downloaded.
+    started_lines = console.written if console else 0
 
     # 1. is anything there ---------------------------------------------- #
     here = bootstrap.engine_cfg(cfg, engine)
@@ -805,28 +830,28 @@ def selftest(cfg: dict, client, engine: str, task: Task, tail=None) -> None:
         steps.fail("models", "Model folders are on disk",
                    "No models folder is set — run setup, or set it in Settings.")
         raise RuntimeError("No models folder.")
-    missing = bootstrap.missing_models(models_dir, cfg, engine)
-    if missing:
-        steps.fail("models", "Model folders are on disk",
-                   "Missing: " + ", ".join(m["repo"] for m in missing))
-        raise RuntimeError("Models are missing.")
     sizes = []
     for m in bootstrap.wanted_models(cfg, engine):
         folder = bootstrap.model_dir(models_dir, m["repo"], engine)
         sizes.append(f"{m['repo'].split('/')[-1]} "
                      f"{bootstrap.human_size(bootstrap.dir_size(folder))}")
-        # model_installed() accepts a folder with only a config.json in it,
-        # deliberately — a repo whose config landed first is still arriving.
-        # By the time anyone presses Test, a folder with no weights in it is a
-        # download that stopped, and it fails at load rather than here. Weight
-        # files, not a byte count: the right floor for a tokenizer is not the
-        # right floor for an 8B, and picking one number gets both wrong.
-        if not any(f.suffix in WEIGHT_SUFFIXES for f in folder.rglob("*")):
+        # Named before the plain "missing" below, because it says more: a
+        # folder that is there with no weights in it is a download that
+        # stopped, and the cure is to fetch it again. Weight files, not a
+        # byte count: the right floor for a tokenizer is not the right floor
+        # for an 8B, and picking one number gets both wrong.
+        if folder.is_dir() and not bootstrap.partial_download(folder) and \
+                not any(f.suffix in WEIGHT_SUFFIXES for f in folder.rglob("*")):
             steps.fail("models", "Model folders are on disk",
                        f"{m['repo']} has no weights in it, only "
                        f"{', '.join(sorted({f.suffix or f.name for f in folder.rglob('*') if f.is_file()}))[:80]}"
                        " — delete it on the Models page and fetch it again.")
             raise RuntimeError("A model folder has no weights in it.")
+    missing = bootstrap.missing_models(models_dir, cfg, engine)
+    if missing:
+        steps.fail("models", "Model folders are on disk",
+                   "Missing: " + ", ".join(m["repo"] for m in missing))
+        raise RuntimeError("Models are missing.")
     steps.ok("models", "Model folders are on disk", " · ".join(sizes))
 
     # 4. can we build a graph for it ------------------------------------- #
@@ -910,14 +935,14 @@ def selftest(cfg: dict, client, engine: str, task: Task, tail=None) -> None:
         if peak >= 0:
             detail += f" · peak {peak * 100:.0f}%"
     except wave.Error:
-        # Not a wav: SaveAudioAdvanced fell back to flac or opus, which is not
-        # a failure — only a take that will be zipped rather than joined.
-        detail += " (not wav — takes will be zipped instead of joined)"
+        # Not a wav: current ComfyUI saves flac, which takes convert back to
+        # wav in the engine's own interpreter before joining.
+        detail += f" ({Path(outs[0].get('filename', '')).suffix[1:] or 'not wav'})"
     steps.ok("audio", "Speech comes back", detail)
 
     # 7. what ComfyUI said while it worked -------------------------------- #
-    if tail:
-        fresh = tail(4000)[started_lines:]
+    if console:
+        fresh = console.since(started_lines)
         pulled = [l for l in fresh
                   if "huggingface" in l.lower() or "Downloading" in l
                   or "%|" in l]

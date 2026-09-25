@@ -177,8 +177,17 @@ def take_over_port(url: str, port: int, engine: str):
             # Never close something that is not a ComfyUI. The port is only
             # this engine's by convention, and a database or another app's
             # dev server on it is a settings mistake, not an orphan.
-            if cmd and not any(k in cmd.lower()
-                               for k in ("python", "main.py", "comfy")):
+            # And a command line that cannot be read is not evidence that it
+            # is one: rule 33a is "nothing is closed unless it looks like a
+            # ComfyUI", and an empty answer used to count as looking like one.
+            if not cmd:
+                return None, (f"Port {port} is held by pid {pid}, and its "
+                              "command line cannot be read, so it is not "
+                              "certain that it is a ComfyUI. Close it "
+                              "yourself (Task Manager, or `kill " f"{pid}`), "
+                              "then press Start ComfyUI.")
+            if not any(k in cmd.lower()
+                       for k in ("python", "main.py", "comfy")):
                 return None, (f"Port {port} is held by something that does not "
                               f"look like ComfyUI ({cmd[:90]}). Close it "
                               "yourself, or give this engine a different "
@@ -1157,10 +1166,10 @@ def api_selftest(engine: str):
     why = activate(engine)
     if why:
         return jsonify({"error": why}), 400
-    tail = PROCS[engine].tail if PROCS[engine].alive() else None
+    console = PROCS[engine] if PROCS[engine].alive() else None
 
     def run(task: manager.Task) -> None:
-        manager.selftest(cfg, for_engine(engine), engine, task, tail)
+        manager.selftest(cfg, for_engine(engine), engine, task, console)
 
     label = bootstrap.ENGINES[engine]["label"]
     return jsonify({"ok": True,

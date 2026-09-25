@@ -544,7 +544,24 @@ def _interpreters(comfy_dir: Path) -> list[Path]:
     else:
         cands += [comfy_dir.parent / "python_standalone" / "bin" / "python"]
     cands += [venv_python(comfy_dir)]
-    return cands
+    # Never this app's own environment. A managed install sits beside the
+    # launcher, so comfy_dir.parent/.venv *is* Script Builder's Flask venv —
+    # and with torch missing from the engine's (a download cut off, a failed
+    # Reinstall) it won as the first interpreter that ran: ComfyUI was
+    # launched on it, and Install put torch into it. Rule 4.
+    ours = (APP_DIR / ".venv").resolve()
+    return [c for c in cands if _env_root(c) != ours]
+
+
+def _env_root(python: Path) -> Path:
+    # <env>/bin/python, <env>/Scripts/python.exe, <env>/python.exe
+    up = python.parent
+    if up.name.lower() in ("bin", "scripts"):
+        up = up.parent
+    try:
+        return up.resolve()
+    except OSError:
+        return up
 
 
 def existing_python(comfy_dir: Path) -> str:
@@ -696,9 +713,13 @@ def model_installed(models_dir: Path, repo: str, engine: str = "") -> bool:
     # and fail on every line until the folder is whole.
     if partial_download(d):
         return False
-    weights = [f for f in d.rglob("*") if f.suffix in WEIGHT_SUFFIXES]
-    has_config = (d / "config.json").exists()
-    return bool(weights) or has_config
+    # And a config is not a model. download_repo fetches the small files
+    # first, so a request for the weights that fails before its .part is
+    # opened — a 503, a dropped DNS lookup — left config.json alone in the
+    # folder, which counted as installed: setup never fetched it again, and
+    # the first take failed inside the node. Every repo either engine uses
+    # carries its weights as one of these files.
+    return any(f.suffix in WEIGHT_SUFFIXES for f in d.rglob("*"))
 
 
 def folder_whole(d: Path) -> bool:
@@ -991,6 +1012,7 @@ class ComfyProcess:
     def __init__(self) -> None:
         self.proc: subprocess.Popen | None = None
         self.lines: list[str] = []
+        self.written = 0
         self._lock = threading.Lock()
 
     def note(self, msg: str) -> None:
@@ -1002,9 +1024,23 @@ class ComfyProcess:
         reads as two unrelated stories.
         """
         with self._lock:
-            self.lines.append(f"[Script Builder] {msg}")
-            if len(self.lines) > 2000:
-                del self.lines[:1000]
+            self._append(f"[Script Builder] {msg}")
+
+    def _append(self, line: str) -> None:
+        # Caller holds the lock. `written` never shrinks, so a reader can mark
+        # where it started and ask for what came after, which an index into a
+        # buffer that trims itself cannot answer.
+        self.lines.append(line)
+        self.written += 1
+        if len(self.lines) > 2000:
+            del self.lines[:1000]
+
+    def since(self, mark: int) -> list[str]:
+        """Lines written after `mark` (a value of `written`), as many as the
+        buffer still holds."""
+        with self._lock:
+            n = min(self.written - mark, len(self.lines))
+            return self.lines[-n:] if n > 0 else []
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -1040,7 +1076,10 @@ class ComfyProcess:
             self.note("This environment's PyTorch has no GPU support in it — "
                       "starting ComfyUI on the CPU (--cpu). Speech will be "
                       "slow.")
-        cmd = [python, "main.py", "--listen", "127.0.0.1", "--port", str(port),
+        # main.py by its full path, so /system_stats reports where this
+        # engine runs from (rule 18e); run as a bare "main.py" it cannot say.
+        cmd = [python, str(comfy_dir / "main.py"), "--listen", "127.0.0.1",
+               "--port", str(port),
                "--disable-auto-launch"] + (extra or [])
         prog.log("Launching ComfyUI: " + " ".join(cmd))
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) \
@@ -1068,9 +1107,7 @@ class ComfyProcess:
             for line in proc.stdout:
                 line = line.rstrip()
                 with self._lock:
-                    self.lines.append(line)
-                    if len(self.lines) > 2000:
-                        del self.lines[:1000]
+                    self._append(line)
                 if any(k in line for k in ("Error", "Traceback", "error:",
                                            "Qwen", "Starting server",
                                            "IMPORT FAILED")):
@@ -1284,6 +1321,16 @@ def pid_cmdline(pid: int) -> str:
     """The command line of a process, or "" when it cannot be read."""
     try:
         if platform.system() == "Windows":
+            # WMIC is off by default from Windows 11 24H2 and gone in 25H2,
+            # and an empty answer here waved the not-a-ComfyUI guard through.
+            # CIM through PowerShell is the supported way; WMIC stays as the
+            # fallback for machines old enough to lack Get-CimInstance.
+            out = _run(["powershell", "-NoProfile", "-Command",
+                        "(Get-CimInstance Win32_Process -Filter "
+                        f"'ProcessId={int(pid)}').CommandLine"],
+                       timeout=25).stdout.strip()
+            if out:
+                return out.splitlines()[0].strip()
             out = _run(["wmic", "process", "where", f"processid={pid}",
                         "get", "commandline"], timeout=25).stdout
             lines = [ln.strip() for ln in out.splitlines()

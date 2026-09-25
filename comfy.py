@@ -130,6 +130,14 @@ def root_from_argv(argv) -> str:
     """
     for arg in argv or []:
         if isinstance(arg, str) and arg.lower().endswith("main.py"):
+            # Only an absolute path says where: "main.py" (how a launcher
+            # that cd's first starts it) or "ComfyUI\\main.py" (a portable
+            # .bat) is relative to a folder the process never reports, and
+            # resolved against this app's own folder it named a ComfyUI that
+            # does not exist — a mismatch warning over our own engine.
+            if not (arg.startswith(("/", "\\\\"))
+                    or (len(arg) > 2 and arg[1] == ":" and arg[2] in "/\\")):
+                return ""
             # Both separators appear: a Windows path read on any platform.
             cut = max(arg.rfind("/"), arg.rfind("\\"))
             return arg[:cut] if cut > 0 else ""
