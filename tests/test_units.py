@@ -737,6 +737,140 @@ class OneModelLoadPerTake(unittest.TestCase):
                          ("moss", comfy.MOSS_VOICE_GENERATOR))
 
 
+class TheNamesComfyUIKnowsTheNodesBy(unittest.TestCase):
+    """ComfyUI registers a node under its NODE_CLASS_MAPPINGS key, and the
+    Qwen pack keys them FB_Qwen3TTS*. Asking for the Python class names found
+    no Qwen node on any real install, so the engine never read as ready."""
+
+    REAL = {"FB_Qwen3TTSCustomVoice": custom_voice(), **SAVE}
+
+    def test_the_registered_name_is_found(self):
+        c = client_for(self.REAL)
+        self.assertTrue(c.engine_ready("qwen"))
+        self.assertEqual(c.speakers(), ["Aiden", "Serena"])
+        self.assertTrue(c.capabilities("qwen")["preset"])
+
+    def test_the_graph_names_the_node_as_ComfyUI_registered_it(self):
+        g = client_for(self.REAL).build_line(
+            {"text": "hi"}, {"kind": "preset", "speaker": "Aiden"}, OPTS)
+        self.assertEqual(g["prompt"]["2"]["class_type"],
+                         "FB_Qwen3TTSCustomVoice")
+
+    def test_an_older_pack_s_names_still_work(self):
+        for name in ("Qwen3TTSCustomVoice", "CustomVoiceNode"):
+            c = client_for({name: custom_voice(), **SAVE})
+            self.assertTrue(c.engine_ready("qwen"), name)
+            g = c.build_line({"text": "hi"}, {"kind": "preset"}, OPTS)
+            self.assertEqual(g["prompt"]["2"]["class_type"], name)
+
+    def test_the_stand_in_uses_the_real_names(self):
+        # The suite passed for months against a mock that used the class
+        # names, which is how the fault shipped.
+        src = (REPO / "tests" / "mock_comfy.py").read_text(encoding="utf-8")
+        self.assertIn('"FB_Qwen3TTSCustomVoice": _node(', src)
+        self.assertNotIn('"CustomVoiceNode": _node(', src)
+
+
+class PipesAreUtf8(unittest.TestCase):
+    """Windows hands a piped Python the ANSI code page with strict errors, and
+    the Qwen pack prints an emoji as it imports: IMPORT FAILED, but only when
+    this app started ComfyUI."""
+
+    def test_a_child_on_a_cp1252_console_can_still_print_an_emoji(self):
+        env = dict(os.environ, PYTHONIOENCODING="cp1252")
+        env.pop("PYTHONUTF8", None)
+        out = bootstrap._run([sys.executable, "-c",
+                              "print('\u2705 ComfyUI-Qwen-TTS loaded')"],
+                             env=env, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("\u2705", out.stdout)
+
+    def test_the_engine_is_launched_with_utf8(self):
+        env = bootstrap.py_env({"PYTHONIOENCODING": "cp1252"})
+        self.assertEqual(env["PYTHONIOENCODING"], "utf-8")
+        self.assertEqual(env["PYTHONUTF8"], "1")
+
+
+class TakesJoinFromFlac(unittest.TestCase):
+    """Current ComfyUI's SaveAudioAdvanced offers flac, mp3 and opus as a
+    DynamicCombo and never wav, so every take used to arrive as a zip."""
+
+    V3_SAVE = {"SaveAudioAdvanced": {"input": {"required": {
+        "audio": ["AUDIO"],
+        "filename_prefix": ["STRING", {"default": "audio/ComfyUI"}],
+        "format": ["COMFY_DYNAMICCOMBO_V3", {"options": [
+            {"key": "flac", "inputs": {}},
+            {"key": "mp3", "inputs": {"required": {"quality": [
+                ["V0", "128k", "320k"], {"default": "V0"}]}}},
+            {"key": "opus", "inputs": {}}]}]}}}}
+
+    def test_a_dynamic_combo_is_read_as_its_keys(self):
+        c = client_for(self.V3_SAVE)
+        self.assertEqual(c._enum("SaveAudioAdvanced", "format"),
+                         ["flac", "mp3", "opus"])
+        self.assertEqual(c.save_node(), ("SaveAudioAdvanced", "flac"))
+
+    def test_lossless_is_picked_over_whatever_comes_first(self):
+        schema = copy.deepcopy(self.V3_SAVE)
+        opts = schema["SaveAudioAdvanced"]["input"]["required"]["format"][1]
+        opts["options"].reverse()
+        self.assertEqual(client_for(schema).save_node()[1], "flac")
+
+    def test_no_interpreter_leaves_the_clips_for_the_zip(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        clip = d / "line_000.flac"
+        clip.write_bytes(b"fLaC")
+        with mock.patch.object(bootstrap, "comfy_python", lambda *_: ""):
+            self.assertEqual(server.to_wav([clip], "qwen"), [clip])
+        self.assertTrue(clip.exists())
+
+    def test_a_failed_conversion_leaves_nothing_half_done(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        clip = d / "line_000.flac"
+        clip.write_bytes(b"not audio")
+        with mock.patch.object(bootstrap, "comfy_python",
+                               lambda *_: sys.executable):
+            self.assertEqual(server.to_wav([clip], "qwen"), [clip])
+        self.assertEqual(sorted(p.name for p in d.iterdir()),
+                         ["line_000.flac"])
+
+    def test_flac_as_ComfyUI_writes_it_comes_back_frame_exact(self):
+        try:
+            import av  # noqa: F401
+            import numpy as np
+        except ImportError:
+            self.skipTest("PyAV is ComfyUI's, not this app's")
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        clips = []
+        for i, (rate, chans) in enumerate([(24000, 1), (24000, 1)]):
+            # AudioSaveHelper.save_audio, as ComfyUI does it: float frames in.
+            wav = np.sin(np.arange(rate) * 0.05)[None].repeat(chans, 0) * 0.5
+            buf = io.BytesIO()
+            with av.open(buf, mode="w", format="flac") as out:
+                stream = out.add_stream("flac", rate=rate, layout="mono")
+                frame = av.AudioFrame.from_ndarray(
+                    wav.T.reshape(1, -1).astype(np.float32), format="flt",
+                    layout="mono")
+                frame.sample_rate, frame.pts = rate, 0
+                out.mux(stream.encode(frame))
+                out.mux(stream.encode(None))
+            clip = d / f"line_{i:03d}.flac"
+            clip.write_bytes(buf.getvalue())
+            clips.append(clip)
+        with mock.patch.object(bootstrap, "comfy_python",
+                               lambda *_: sys.executable):
+            wavs = server.to_wav(clips, "qwen")
+        self.assertEqual([w.suffix for w in wavs], [".wav", ".wav"])
+        self.assertFalse(any(c.exists() for c in clips))
+        with wave.open(str(wavs[0]), "rb") as w:
+            self.assertEqual((w.getnchannels(), w.getframerate(),
+                              w.getnframes()), (1, 24000, 24000))
+        self.assertTrue(server.stitch_wavs(wavs, d / "take.wav", 0.5))
+
+
 class ALineThatSavedNothing(unittest.TestCase):
     """A prompt ComfyUI finished with no audio was waited on for the whole
     fifteen-minute timeout, because nothing was ever going to arrive."""

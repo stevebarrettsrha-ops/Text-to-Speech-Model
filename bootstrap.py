@@ -433,8 +433,34 @@ class Progress:
 # --------------------------------------------------------------------------- #
 # interpreters
 # --------------------------------------------------------------------------- #
+# Every Python this app starts talks UTF-8 on its pipes, both ends. Windows
+# gives a piped child the ANSI code page with strict errors, ComfyUI's log
+# interceptor keeps it, and the Qwen pack prints "✅ … loaded" as it imports —
+# so on a cp1252 machine the pack died with UnicodeEncodeError, IMPORT FAILED,
+# only when this app started ComfyUI. And the reader here decoded with the same
+# code page, which raises on bytes UTF-8 uses: the pump thread died, the pipe
+# filled, and ComfyUI stalled on its next print.
+PY_TEXT = {"text": True, "encoding": "utf-8", "errors": "replace"}
+
+
+def py_env(env: dict | None = None) -> dict:
+    out = dict(os.environ if env is None else env)
+    out.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+    return out
+
+
+def _runs_python(cmd: list[str]) -> bool:
+    return len(cmd) > 1 and cmd[1] in ("-c", "-m")
+
+
 def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+    if _runs_python(cmd):
+        kw["env"] = py_env(kw.get("env"))
+        return subprocess.run(cmd, capture_output=True, **PY_TEXT, **kw)
+    # Other tools answer in the console's code page; a byte it cannot map is
+    # a character lost, never an exception.
+    return subprocess.run(cmd, capture_output=True, text=True,
+                          errors="replace", **kw)
 
 
 def find_python(prog: Progress | None = None) -> str:
@@ -1022,8 +1048,9 @@ class ComfyProcess:
         try:
             self.proc = subprocess.Popen(cmd, cwd=str(comfy_dir),
                                          stdout=subprocess.PIPE,
-                                         stderr=subprocess.STDOUT, text=True,
-                                         bufsize=1, creationflags=flags)
+                                         stderr=subprocess.STDOUT, **PY_TEXT,
+                                         env=py_env(), bufsize=1,
+                                         creationflags=flags)
         except OSError as exc:
             raise RuntimeError(
                 f"ComfyUI could not be started with {python} — {exc}. "
@@ -1565,7 +1592,7 @@ def pip_install(python: str, args: list[str], log, on_detail=None) -> None:
     # The context manager closes the pipe and reaps the child even if reading
     # its output raises, which a bare Popen left to garbage collection did not.
     with subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT, text=True,
+                          stderr=subprocess.STDOUT, **PY_TEXT, env=py_env(),
                           bufsize=0) as proc:
         assert proc.stdout
         if on_detail:

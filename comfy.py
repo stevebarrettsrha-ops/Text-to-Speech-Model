@@ -13,6 +13,8 @@ is set up:
   cloned voice   LoadAudio ─► VoiceCloneNode(ref_audio, ref_text, target_text) ─► Save
   designed voice VoiceDesignNode(text, instruct) ─► Save
 
+  (Python class names — ComfyUI knows them as FB_Qwen3TTSCustomVoice etc.)
+
 Lines are generated one at a time and stitched afterwards, which is what lets
 the pause between lines, per-speaker voices and per-line retries work.
 
@@ -42,6 +44,23 @@ CLONE = "VoiceCloneNode"
 DESIGN = "VoiceDesignNode"
 CLONE_PROMPT = "VoiceClonePromptNode"
 DIALOGUE = "DialogueInferenceNode"
+
+# The names above are roles, not what ComfyUI calls the nodes. ComfyUI
+# registers a node under its NODE_CLASS_MAPPINGS key, and flybirdxx's pack
+# keys them "FB_Qwen3TTSCustomVoice" and so on — the Python class names above
+# never reach /object_info. Asking for them directly found no Qwen node on any
+# real install, so the engine never read as ready. Each role is resolved
+# against the schema through these lists, newest name first; rule 2's
+# candidate lists, one level up.
+QWEN_CLASS_NAMES = {
+    CUSTOM: ["FB_Qwen3TTSCustomVoice", "Qwen3TTSCustomVoice", CUSTOM],
+    CLONE: ["FB_Qwen3TTSVoiceClone", "Qwen3TTSVoiceClone", CLONE],
+    DESIGN: ["FB_Qwen3TTSVoiceDesign", "Qwen3TTSVoiceDesign", DESIGN],
+    CLONE_PROMPT: ["FB_Qwen3TTSVoiceClonePrompt", "Qwen3TTSVoiceClonePrompt",
+                   CLONE_PROMPT],
+    DIALOGUE: ["FB_Qwen3TTSDialogueInference", "Qwen3TTSDialogueInference",
+               DIALOGUE],
+}
 
 MOSS_LOADER = "MossTTSModelLoader"
 MOSS_GEN = "MossTTSGenerate"
@@ -151,8 +170,16 @@ class ComfyClient:
                 self._schema_at = time.time()
             return self._schema
 
+    def real(self, class_type: str) -> str:
+        """The name this ComfyUI registered a role under (see QWEN_CLASS_NAMES)."""
+        names = QWEN_CLASS_NAMES.get(class_type)
+        if not names:
+            return class_type
+        schema = self.schema()
+        return next((n for n in names if n in schema), class_type)
+
     def has(self, class_type: str) -> bool:
-        return class_type in self.schema()
+        return self.real(class_type) in self.schema()
 
     def vram_mb(self) -> int:
         """What ComfyUI says the card has, as a second opinion to nvidia-smi.
@@ -198,7 +225,7 @@ class ComfyClient:
         return root_from_argv(argv)
 
     def node_inputs(self, class_type: str) -> dict:
-        info = self.schema().get(class_type)
+        info = self.schema().get(self.real(class_type))
         if not info:
             kit = "MOSS-TTS" if class_type.startswith("Moss") else "Qwen-TTS"
             raise ComfyError(
@@ -240,6 +267,14 @@ class ComfyClient:
             return []
         if spec and isinstance(spec[0], list):
             return [str(v) for v in spec[0]]
+        # ComfyUI's V3 nodes publish some choices as a DynamicCombo:
+        # ["COMFY_DYNAMICCOMBO_V3", {"options": [{"key": "flac", ...}]}], and
+        # the prompt takes the key as a plain string. SaveAudioAdvanced's
+        # format is one, so reading only plain lists found no formats at all.
+        if spec and len(spec) > 1 and isinstance(spec[1], dict) \
+                and isinstance(spec[1].get("options"), list):
+            return [str(o.get("key")) for o in spec[1]["options"]
+                    if isinstance(o, dict) and o.get("key")]
         return []
 
     def speakers(self) -> list[str]:
@@ -318,7 +353,12 @@ class ComfyClient:
             fmts = self._enum("SaveAudioAdvanced", "format")
             if prefer_wav and "wav" in fmts:
                 return "SaveAudioAdvanced", "wav"
-            return "SaveAudioAdvanced", (fmts[0] if fmts else "flac")
+            # Current ComfyUI offers no wav at all — flac, mp3 and opus. Flac
+            # is lossless, so the server can turn it back into wav and join
+            # the take (see server.flac_to_wav).
+            if "flac" in fmts or not fmts:
+                return "SaveAudioAdvanced", "flac"
+            return "SaveAudioAdvanced", fmts[0]
         if self.has("SaveAudio"):
             return "SaveAudio", "flac"
         raise ComfyError("ComfyUI has no audio save node. Update ComfyUI.")
@@ -369,7 +409,7 @@ class ComfyClient:
                     inputs[name] = opts["default"]
                 elif kind == "STRING":
                     inputs[name] = ""
-        return {"class_type": class_type, "inputs": inputs}
+        return {"class_type": self.real(class_type), "inputs": inputs}
 
     def _save(self, g: dict, source: str, opts: dict) -> str:
         save_class, fmt = self.save_node(prefer_wav=opts.get("prefer_wav", True))

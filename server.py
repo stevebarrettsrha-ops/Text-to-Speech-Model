@@ -382,6 +382,70 @@ def zip_clips(paths: list[Path], dest: Path) -> None:
             z.write(p, p.name)
 
 
+# Run in the engine's own interpreter. Current ComfyUI saves audio as flac,
+# mp3 or opus and never wav, so without this every take became a zip of flac
+# clips: no joined file, no duration, a download that has to be unpacked. The
+# interpreter that wrote the flac through PyAV can always read it back, and
+# this app still needs nothing beyond `wave` (see Stitching in CLAUDE.md).
+FLAC_TO_WAV = r"""
+import sys, wave
+import av
+for src in sys.argv[1:]:
+    dst = src.rsplit(".", 1)[0] + ".wav"
+    with av.open(src) as f:
+        stream = f.streams.audio[0]
+        rate = stream.codec_context.sample_rate
+        to16 = None
+        pcm = []
+        channels = 0
+        for frame in f.decode(stream):
+            if to16 is None:
+                to16 = av.AudioResampler(format="s16", layout=frame.layout,
+                                         rate=rate)
+            for out in to16.resample(frame):
+                channels = channels or len(out.layout.channels)
+                pcm.append(out.to_ndarray().astype("<i2").tobytes())
+        if to16 is not None:
+            for out in to16.resample(None):
+                pcm.append(out.to_ndarray().astype("<i2").tobytes())
+    with wave.open(dst, "wb") as w:
+        w.setnchannels(channels or 1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(pcm))
+    print(dst)
+"""
+
+
+def to_wav(clips: list[Path], engine: str) -> list[Path]:
+    """The clips as wav, converted in the engine's interpreter where needed.
+
+    Gives back the clips unchanged when that cannot be done — a ComfyUI
+    someone else started, whose interpreter this app does not know — and the
+    caller then zips them as before.
+    """
+    todo = [c for c in clips if c.suffix.lower() != ".wav"]
+    if not todo:
+        return clips
+    python = bootstrap.comfy_python(cfg, engine)
+    if not python or not Path(python).exists():
+        return clips
+    try:
+        out = bootstrap._run([python, "-c", FLAC_TO_WAV]
+                             + [str(c) for c in todo], timeout=300)
+    except Exception:  # noqa: BLE001
+        return clips
+    wavs = [c.with_suffix(".wav") for c in clips]
+    if out.returncode != 0 or not all(w.exists() for w in wavs):
+        for w, c in zip(wavs, clips):
+            if w != c:
+                w.unlink(missing_ok=True)
+        return clips
+    for c in todo:
+        c.unlink(missing_ok=True)
+    return wavs
+
+
 # --------------------------------------------------------------------------- #
 # generation job
 # --------------------------------------------------------------------------- #
@@ -533,16 +597,19 @@ def run_job(job_id: str, payload: dict) -> None:
                         fh.write(chunk)
             made[i] = dest
 
-        clips = [made[i] for i in sorted(made)]
+        if made:
+            set_state(stage="Joining the lines", pct=97)
+        order = sorted(made)
+        made = dict(zip(order, to_wav([made[i] for i in order], engine)))
+        clips = [made[i] for i in order]
         meta_lines = [{"index": i,
                        "speaker": int(keys[i]) if keys[i].isdigit() else 1,
                        "text": lines[i].get("text", ""),
-                       "file": made[i].name} for i in sorted(made)]
+                       "file": made[i].name} for i in order]
 
         if not clips:
             raise ComfyError("There is nothing in the script to say.")
 
-        set_state(stage="Joining the lines", pct=97)
         joined = folder / "take.wav"
         single = clips[0].suffix == ".wav" and stitch_wavs(clips, joined, pause)
         bundle = ""

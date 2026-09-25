@@ -3,7 +3,9 @@ Builder end to end: /system_stats, /object_info, /prompt, /history, /view,
 /upload/image, /interrupt.
 
 The /object_info payload is transcribed from flybirdxx/ComfyUI-Qwen-TTS
-nodes.py and richservo/comfyui-moss-tts nodes/*.py at main, so the graphs
+nodes.py and richservo/comfyui-moss-tts nodes/*.py at main, under the keys each
+pack's NODE_CLASS_MAPPINGS registers — "FB_Qwen3TTSCustomVoice", not the Python
+class name CustomVoiceNode, which ComfyUI never shows anyone, so the graphs
 Script Builder builds are validated against the same input names, enums and
 defaults the real nodes declare.
 """
@@ -80,7 +82,7 @@ def _moss_sampling(temperature, top_p, top_k, penalty):
 
 
 OBJECT_INFO = {
-    "CustomVoiceNode": _node(
+    "FB_Qwen3TTSCustomVoice": _node(
         {"text": ["STRING", {"multiline": True, "default": "Hello world"}],
          "speaker": [SPEAKERS, {"default": "Ryan"}],
          "model_choice": [["0.6B", "1.7B"], {"default": "1.7B"}],
@@ -93,7 +95,7 @@ OBJECT_INFO = {
     # ref_audio and ref_text are optional upstream, beside a reusable
     # voice_clone_prompt — and an empty ref_text with x_vector_only off is
     # refused at generation time, which run_prompt reproduces below.
-    "VoiceCloneNode": _node(
+    "FB_Qwen3TTSVoiceClone": _node(
         {"target_text": ["STRING", {"multiline": True, "default": ""}],
          "model_choice": [["0.6B", "1.7B"], {"default": "0.6B"}],
          "device": [["auto", "cuda", "xpu", "mps", "cpu"], {"default": "auto"}],
@@ -106,7 +108,7 @@ OBJECT_INFO = {
              x_vector_only=["BOOLEAN", {"default": False}],
              instruct=["STRING", {"multiline": True, "default": ""}],
              custom_model_path=["STRING", {"default": ""}])),
-    "VoiceDesignNode": _node(
+    "FB_Qwen3TTSVoiceDesign": _node(
         {"text": ["STRING", {"multiline": True, "default": "Hello world"}],
          "instruct": ["STRING", {"multiline": True, "default": ""}],
          "model_choice": [["0.6B", "1.7B"], {"default": "1.7B"}],
@@ -114,7 +116,7 @@ OBJECT_INFO = {
          "precision": [["bf16", "fp32"], {"default": "bf16"}],
          "language": [LANG, {"default": "Auto"}]},
         dict(GEN)),
-    "VoiceClonePromptNode": _node(
+    "FB_Qwen3TTSVoiceClonePrompt": _node(
         {"ref_audio": ["AUDIO"], "ref_text": ["STRING", {"default": ""}],
          "model_choice": [["0.6B", "1.7B"], {"default": "0.6B"}],
          "device": [["auto", "cuda", "cpu"], {"default": "auto"}],
@@ -181,7 +183,7 @@ OBJECT_INFO = {
 # Which node sets /object_info admits to having, so a test can reproduce an
 # engine whose nodes ComfyUI never loaded.
 HIDDEN = set()
-PREFIXES = {"qwen": ("CustomVoice", "VoiceClone", "VoiceDesign"),
+PREFIXES = {"qwen": ("FB_Qwen3TTS",),
             "moss": ("Moss",)}
 
 
@@ -373,7 +375,7 @@ def prompt():
             bits += (f"(t={ins.get('temperature')},p={ins.get('top_p')},"
                      f"k={ins.get('top_k')},"
                      f"rp={ins.get('repetition_penalty')})")
-        if node["class_type"] == "VoiceCloneNode":
+        if node["class_type"] == "FB_Qwen3TTSVoiceClone":
             bits += f"(xvec={ins.get('x_vector_only')})"
         shape.append(bits)
     LOG.append(f"QUEUE {' -> '.join(shape)} fmt={save_fmt} text={text[:34]!r}")
@@ -392,13 +394,13 @@ def refusal(graph):
     """
     for node in graph.values():
         ins = node.get("inputs", {})
-        if node.get("class_type") == "VoiceCloneNode":
+        if node.get("class_type") == "FB_Qwen3TTSVoiceClone":
             if "ref_audio" not in ins and "voice_clone_prompt" not in ins:
-                return ("VoiceCloneNode", "Either reference audio or voice "
+                return ("FB_Qwen3TTSVoiceClone", "Either reference audio or voice "
                                           "clone prompt is required")
             if "ref_audio" in ins and not (ins.get("ref_text") or "").strip() \
                     and not ins.get("x_vector_only"):
-                return ("VoiceCloneNode",
+                return ("FB_Qwen3TTSVoiceClone",
                         "Generation failed: ref_text is required when "
                         "x_vector_only_mode=False (ICL mode). Bad index=0")
     return None
@@ -410,7 +412,7 @@ def run_prompt(pid, graph, text, fmt):
     if INTERRUPTED.is_set():
         HISTORY[pid]["status"] = {"status_str": "error", "completed": False,
                                   "messages": [["execution_interrupted",
-                                                {"node_type": "CustomVoiceNode",
+                                                {"node_type": "FB_Qwen3TTSCustomVoice",
                                                  "exception_message":
                                                      "Processing interrupted"}]]}
         return
@@ -426,7 +428,7 @@ def run_prompt(pid, graph, text, fmt):
         HISTORY[pid]["status"] = {
             "status_str": "error", "completed": False,
             "messages": [["execution_error",
-                          {"node_type": "CustomVoiceNode",
+                          {"node_type": "FB_Qwen3TTSCustomVoice",
                            "exception_message":
                                "CUDA out of memory (mock failure)"}]]}
         return

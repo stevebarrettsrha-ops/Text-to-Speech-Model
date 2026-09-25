@@ -120,7 +120,8 @@ def spawn(kind: str, title: str, fn, meta: dict | None = None) -> Task:
 def stream(cmd: list[str], task: Task, keep: tuple[str, ...] = ()) -> int:
     task.log("$ " + " ".join(cmd))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+                            stderr=subprocess.STDOUT, **bootstrap.PY_TEXT,
+                            env=bootstrap.py_env(), bufsize=1)
     assert proc.stdout
     for line in proc.stdout:
         line = line.rstrip()
@@ -140,7 +141,8 @@ def _probe(python: str, code: str, timeout: int = 90) -> tuple[int, str]:
         return 1, "no interpreter"
     try:
         out = subprocess.run([python, "-c", code], capture_output=True,
-                             text=True, timeout=timeout)
+                             **bootstrap.PY_TEXT, env=bootstrap.py_env(),
+                             timeout=timeout)
         return out.returncode, (out.stdout or out.stderr).strip()
     except Exception as exc:  # noqa: BLE001
         return 1, str(exc)
