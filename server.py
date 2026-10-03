@@ -21,6 +21,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
 import bootstrap
+import comfy
 import manager
 from bootstrap import (APP_DIR, DATA_DIR, ComfyProcess, Progress, clean_url,
                        comfy_online, comfy_port, detect_comfy_dirs,
@@ -298,6 +299,58 @@ def moss_dirs() -> dict:
     return out
 
 
+def free_the_card(engine: str) -> list[str]:
+    """Make every ComfyUI we can reach drop its models. Returns who answered.
+
+    Ours first, then the others. A ComfyUI someone else started cannot be
+    stopped from here — but /free is ComfyUI's own endpoint and it answers
+    whoever asks, so the engine that is sitting on the memory can still be
+    told to let go of it. That is the usual shape of this failure on a single
+    8 GB card with two engines installed.
+    """
+    freed: list[str] = []
+    for eid in bootstrap.ENGINES:
+        if eid != engine and not engine_online(eid):
+            continue
+        if for_engine(eid).free_memory():
+            freed.append(bootstrap.ENGINES[eid]["label"])
+    return freed
+
+
+def out_of_memory_advice(engine: str, freed: list[str], opts: dict) -> str:
+    """What to do about a card that is full, in the order worth trying.
+
+    The node's own message is a wall of allocator numbers — "Currently
+    allocated : 2.95 GiB ... Free (according to CUDA): 0 bytes" — which says
+    what happened but nothing about what to do, and buries the one fact that
+    matters: something else on this machine is holding the card.
+    """
+    label = bootstrap.ENGINES[engine]["label"]
+    vram = gpu_vram(for_engine(engine) if engine_online(engine) else None)
+    card = bootstrap.nvidia_gpu().get("name") or "the GPU"
+    size = f"{vram / 1024:.0f} GB" if vram else "its memory"
+    lines = [f"{label} ran out of video memory on {card} ({size}), and still "
+             "did after freeing what could be freed."
+             if freed else
+             f"{label} ran out of video memory on {card} ({size})."]
+    others = [bootstrap.ENGINES[e]["label"] for e in bootstrap.ENGINES
+              if e != engine and engine_online(e)]
+    if others:
+        lines.append("ComfyUI is also running for " + ", ".join(others)
+                     + ", and each one holds its own models on the card. "
+                       "Close it and try again.")
+    if not opts.get("unload"):
+        lines.append('Turn on "Free GPU memory after each run" in More '
+                     "options: a preset voice and a cloned one are different "
+                     "checkpoints, and both stay loaded without it.")
+    if (opts.get("model") or "").startswith("1.7"):
+        lines.append("The 1.7B model is about twice the 0.6B. Switching to "
+                     "0.6B leaves room for the clone.")
+    lines.append("Anything else using the card — a game, a browser playing "
+                 "video, another ComfyUI — is taking memory this needs.")
+    return " ".join(lines)
+
+
 def run_job(job_id: str, payload: dict) -> None:
     def set_state(**kw):
         with jobs_lock:
@@ -345,8 +398,27 @@ def run_job(job_id: str, payload: dict) -> None:
                       line_index=i)
 
             built = for_engine(engine).build_line(line, voice, opts)
-            prompt_id = for_engine(engine).queue(built["prompt"])
-            outs = wait_for_prompt(prompt_id, job_id, engine)
+            try:
+                prompt_id = for_engine(engine).queue(built["prompt"])
+                outs = wait_for_prompt(prompt_id, job_id, engine)
+            except Exception as exc:  # noqa: BLE001
+                if not comfy.is_out_of_memory(str(exc)):
+                    raise
+                # The card is full, which on 8 GB is routine rather than
+                # exceptional: a preset voice and a cloned one are different
+                # checkpoints, and ComfyUI keeps the last one resident. Clear
+                # what is held and try this line once more before giving up.
+                set_state(stage=f"Line {i + 1} of {len(lines)} · the card is "
+                                "full, freeing it and trying again")
+                freed = free_the_card(engine)
+                try:
+                    prompt_id = for_engine(engine).queue(built["prompt"])
+                    outs = wait_for_prompt(prompt_id, job_id, engine)
+                except Exception as second:  # noqa: BLE001
+                    if not comfy.is_out_of_memory(str(second)):
+                        raise
+                    raise ComfyError(out_of_memory_advice(engine, freed,
+                                                          opts)) from second
             item = outs[0]
             ext = Path(item["filename"]).suffix or ".wav"
             dest = folder / f"line_{i:03d}{ext}"
@@ -451,6 +523,11 @@ def api_status():
                      "enabled": bootstrap.engine_enabled(cfg, e["id"])}
                     for e in bootstrap.ENGINES.values()],
         "primary_engine": bootstrap.start_engine(cfg),
+        # Read from the cached nvidia-smi answer, never a live call: the page
+        # polls this every few seconds. It is here so the Create page can
+        # default "Free GPU memory after each run" on a card where keeping two
+        # checkpoints resident is what makes a clone fail.
+        "vram_mb": bootstrap.nvidia_gpu().get("vram_mb") or 0,
         "setup_complete": bool(cfg.get("setup_complete")),
         # So the Create page can say "Setting up…" rather than offer a setup
         # that is already running.

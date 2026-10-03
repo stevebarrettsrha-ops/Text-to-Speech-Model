@@ -218,6 +218,26 @@
    still installs both engines and downloads both sets of models, and
    `start_engine` never returns an engine that is turned off.
 
+15b. **A card that is full is a sentence and a retry, not an allocator dump.**
+   A clone on an 8 GB card reported "Allocation on device 0 would exceed
+   allowed memory ... Currently allocated : 2.95 GiB ... Free (according to
+   CUDA): 0 bytes" — true, unreadable, and silent about the one fact that
+   matters: something else is holding the card. `comfy.is_out_of_memory`
+   recognises it however the allocator words it, `run_job` frees what can be
+   freed and runs that line again, and only then does
+   `out_of_memory_advice` speak — naming the card, the other engine if it is
+   also up, the toggle if it is off, and the 1.7B if that is what is loaded.
+   **`free_memory()` goes to every engine that answers, not just ours**:
+   `/free` is ComfyUI's own endpoint and answers whoever asks, so the engine
+   sitting on the memory can be told to let go even though it is not one we
+   started and cannot stop (rule 31's gap, from the other side).
+15c. **"Free GPU memory after each run" defaults on where the card is small.**
+   ComfyUI keeps the last checkpoint resident, and a preset voice and a cloned
+   one are different checkpoints — so on 8 GB the second line of a script is
+   the allocation that fails. `defaultUnloadForCard` turns it on at 8.5 GB and
+   below, never overrides a choice made by hand, and Reset restores the
+   default for *this* card rather than "off".
+
 19. **Two engines, and everything that differs between them lives in
    `ENGINES`.** Node repo, node folder, the file that proves it is installed,
    the models sub-folder, the folder layout and the model list are one table
@@ -352,8 +372,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 155 unit tests, standard library only
-npm test                 # 90 checks driving the real page in headless Chromium
+npm run test:units       # 162 unit tests, standard library only
+npm test                 # 94 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script

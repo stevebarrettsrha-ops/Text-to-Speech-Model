@@ -580,6 +580,105 @@ class DeadEngine(unittest.TestCase):
         self.assertNotIn("HTTPConnectionPool", message)
 
 
+class WhenTheCardIsFull(unittest.TestCase):
+    """Reported from an 8 GB card mid-clone: "Allocation on device 0 would
+    exceed allowed memory ... Currently allocated : 2.95 GiB ... Free
+    (according to CUDA): 0 bytes". Allocator numbers say what happened and
+    nothing about what to do, and bury the one fact that matters — something
+    else on this machine is holding the card."""
+
+    REAL = ("FB_Qwen3TTSVoiceClone: Generation failed: Allocation on device 0 "
+            "would exceed allowed memory. (out of memory) Currently "
+            "allocated : 2.95 GiB Requested : 19.34 MiB Device limit : 8.00 "
+            "GiB Free (according to CUDA): 0 bytes")
+
+    def setUp(self):
+        self.saved = copy.deepcopy(server.cfg)
+
+    def tearDown(self):
+        server.cfg.clear()
+        server.cfg.update(self.saved)
+
+    def test_the_real_message_is_recognised(self):
+        self.assertTrue(comfy.is_out_of_memory(self.REAL))
+        for other in ("torch.OutOfMemoryError: CUDA out of memory.",
+                      "Allocation on device 0 would exceed allowed memory"):
+            with self.subTest(other=other):
+                self.assertTrue(comfy.is_out_of_memory(other))
+
+    def test_an_ordinary_failure_is_not_mistaken_for_it(self):
+        for other in ("Node type not found: VoiceCloneNode",
+                      "Prompt outputs failed validation", "", None):
+            with self.subTest(other=other):
+                self.assertFalse(comfy.is_out_of_memory(other))
+
+    def test_the_advice_names_the_other_engine_holding_the_card(self):
+        with mock.patch.object(server, "engine_online",
+                               side_effect=lambda e=None: e == "moss"), \
+             mock.patch.object(server, "gpu_vram", return_value=8188), \
+             mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "NVIDIA GeForce RTX 4060",
+                                             "driver": True, "vram_mb": 8188}):
+            text = server.out_of_memory_advice("qwen", ["Qwen3-TTS"],
+                                               {"unload": True, "model": "0.6B"})
+        self.assertIn("MOSS-TTS", text)
+        self.assertIn("RTX 4060", text)
+        self.assertNotIn("Currently allocated", text)
+
+    def test_it_offers_the_toggle_only_while_it_is_off(self):
+        with mock.patch.object(server, "engine_online", return_value=False), \
+             mock.patch.object(server, "gpu_vram", return_value=8188), \
+             mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "", "driver": False,
+                                             "vram_mb": 8188}):
+            off = server.out_of_memory_advice("qwen", [], {"unload": False,
+                                                           "model": "0.6B"})
+            on = server.out_of_memory_advice("qwen", [], {"unload": True,
+                                                          "model": "0.6B"})
+        self.assertIn("Free GPU memory after each run", off)
+        self.assertNotIn("Free GPU memory after each run", on)
+
+    def test_it_mentions_the_bigger_model_only_when_that_is_what_is_loaded(self):
+        with mock.patch.object(server, "engine_online", return_value=False), \
+             mock.patch.object(server, "gpu_vram", return_value=8188), \
+             mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "", "driver": False,
+                                             "vram_mb": 8188}):
+            big = server.out_of_memory_advice("qwen", [], {"unload": True,
+                                                           "model": "1.7B"})
+            small = server.out_of_memory_advice("qwen", [], {"unload": True,
+                                                             "model": "0.6B"})
+        self.assertIn("0.6B", big)
+        self.assertNotIn("1.7B", small)
+
+    def test_freeing_asks_every_engine_that_is_answering(self):
+        asked = []
+
+        class Client:
+            def __init__(self, eid): self.eid = eid
+            def free_memory(self, unload_models=True):
+                asked.append(self.eid)
+                return True
+
+        with mock.patch.object(server, "engine_online", return_value=True), \
+             mock.patch.object(server, "for_engine",
+                               side_effect=lambda e="": Client(e)):
+            freed = server.free_the_card("qwen")
+        # Ours, and every other one that is up — the one sitting on the memory
+        # is usually not the one being asked to generate.
+        self.assertEqual(set(asked), set(bootstrap.ENGINES))
+        self.assertIn("MOSS-TTS", freed)
+
+    def test_an_engine_that_will_not_answer_is_not_a_failure(self):
+        class Dead:
+            def free_memory(self, unload_models=True):
+                return False
+
+        with mock.patch.object(server, "engine_online", return_value=True), \
+             mock.patch.object(server, "for_engine", return_value=Dead()):
+            self.assertEqual(server.free_the_card("qwen"), [])
+
+
 class WhyTheNodesDidNotLoad(unittest.TestCase):
     """The probe exists to get the node pack's own exception out of ComfyUI's
     console, where nobody running from a launcher can read it. Reporting its

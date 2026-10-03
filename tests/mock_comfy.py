@@ -25,6 +25,18 @@ INTERRUPTED = threading.Event()
 # Empty means "this build does not report argv", which is a real
 # case: older ComfyUI does not, and it must not read as a mismatch.
 ARGV_ROOT = {"root": ""}
+# The card, as far as this stand-in is concerned. "until_free" fails every
+# generation until /free is called, which is what a real 8 GB card does when
+# the last checkpoint is still resident: the only thing that clears it is
+# something letting go. "always" never clears, which is the case where the
+# advice has to be good enough to act on.
+OOM = {"mode": "off"}
+# Verbatim in shape from a real report, allocator numbers and all — the point
+# of the test is that the person never has to read this.
+OOM_TEXT = ("FB_Qwen3TTSVoiceClone: Generation failed: Allocation on device 0 "
+            "would exceed allowed memory. (out of memory)\nCurrently "
+            "allocated : 2.95 GiB\nRequested : 19.34 MiB\nDevice limit : "
+            "8.00 GiB\nFree (according to CUDA): 0 bytes")
 
 ATT = ["auto", "sage_attn", "flash_attn", "sdpa", "eager"]
 LANG = ["Auto", "Chinese", "English", "Japanese", "Korean", "French", "German",
@@ -215,6 +227,26 @@ def stats():
                                  "vram_free": VRAM["total"] // 2}]})
 
 
+@app.post("/free")
+def free():
+    """ComfyUI's own endpoint for dropping what it holds on the card.
+
+    It answers whoever asks — which is the point: a ComfyUI nobody here
+    started cannot be stopped, but it can still be told to let go.
+    """
+    body = request.get_json(silent=True) or {}
+    LOG.append(f"FREE unload_models={bool(body.get('unload_models'))}")
+    if OOM["mode"] == "until_free" and body.get("unload_models"):
+        OOM["mode"] = "off"
+    return jsonify({"ok": True})
+
+
+@app.post("/mock/oom/<mode>")
+def mock_oom(mode):
+    OOM["mode"] = mode if mode in ("until_free", "always") else "off"
+    return jsonify({"oom": OOM["mode"]})
+
+
 @app.post("/mock/argv")
 def mock_argv():
     """Answer as the ComfyUI in some other folder, or stop saying at all."""
@@ -376,6 +408,13 @@ def run_prompt(pid, graph, text, fmt):
                                                 {"node_type": "CustomVoiceNode",
                                                  "exception_message":
                                                      "Processing interrupted"}]]}
+        return
+    if OOM["mode"] in ("until_free", "always"):
+        HISTORY[pid]["status"] = {
+            "status_str": "error", "completed": False,
+            "messages": [["execution_error",
+                          {"node_type": "VoiceCloneNode",
+                           "exception_message": OOM_TEXT}]]}
         return
     if MODE.get("fail_on") and MODE["fail_on"] in text:
         HISTORY[pid]["status"] = {
