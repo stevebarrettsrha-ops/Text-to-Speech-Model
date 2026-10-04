@@ -42,7 +42,7 @@ Setup does, in order, what the instructions you were given do by hand:
 1. `git clone https://github.com/flybirdxx/ComfyUI-Qwen-TTS.git` into
    `ComfyUI/custom_nodes/`
 2. `pip install -r ComfyUI/custom_nodes/ComfyUI-Qwen-TTS/requirements.txt`
-3. downloads the Qwen3-TTS weights into `ComfyUI/models/qwen-tts/Qwen/`
+3. downloads the Qwen3-TTS weights into `ComfyUI/models/qwen-tts/`
 
 Step 2 picks the interpreter ComfyUI actually runs on. On a portable install
 that is `python_embeded\python.exe` — the same one your instructions name — and
@@ -61,16 +61,19 @@ Nothing goes into your system Python.
 ### Model folders
 
 **The two engines do not share a folder shape**, and neither shape is a
-preference — each is where that node looks. Qwen nests by organisation,
-`models/qwen-tts/<Org>/<Name>`; MOSS flattens the slash,
-`models/moss-tts/<Org>--<Name>`, because its loader builds that path from
-`repo_id.replace("/", "--")`. Move a MOSS folder into the Qwen tree and the node
-cannot see it — it quietly downloads a second copy.
+preference — each is where that node looks. Qwen drops the organisation,
+`models/qwen-tts/<Name>`, because its node lists `models/qwen-tts` one level
+deep and downloads to `<Name>` (its README draws a `Qwen/` folder the code has
+never looked in); MOSS flattens the slash, `models/moss-tts/<Org>--<Name>`,
+because its loader builds that path from `repo_id.replace("/", "--")`. Put a
+folder anywhere else and that node cannot see it — it quietly downloads a
+second copy, or offline, fails the line. Folders an earlier version of Script
+Builder left in `models/qwen-tts/Qwen/` are moved into place at launch.
 
 #### Qwen3-TTS
 
 All six repos in the [Qwen3-TTS collection](https://huggingface.co/collections/Qwen/qwen3-tts),
-pulled into `ComfyUI/models/qwen-tts/Qwen/`:
+pulled into `ComfyUI/models/qwen-tts/`:
 
 | Folder | Size | What it does |
 |---|---|---|
@@ -82,8 +85,11 @@ pulled into `ComfyUI/models/qwen-tts/Qwen/`:
 | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | 2B | Voice from a written description |
 
 Setup downloads only what you tick: the tokenizer and 0.6B CustomVoice always,
-cloning and voice design if you want them, and the 1.7B versions of whichever of
-those you chose. The rest are one button each on the Models page.
+cloning and voice design unless you untick them, and the 1.7B versions of
+whichever of those you chose. The rest are one button each on the Models page.
+Voice design is ticked by default because the Voices card offers it on Qwen, and
+without the folder the node would fetch 4 GB in the middle of your first
+designed take.
 
 Which checkpoint feeds which node is worth knowing: **CustomVoice** carries the
 preset speakers, **Base** does zero-shot cloning, **VoiceDesign** builds a voice
@@ -252,19 +258,34 @@ sources change, since the two engines do not offer the same ones.
 ### More options
 
 - **Pause between lines** — silence inserted when the lines are joined.
-- **Expressiveness** — sampling temperature. Higher wanders more.
+- **Expressiveness** — sampling temperature. Higher wanders more. On MOSS it
+  scales each model's own tuned temperature, so the resting value of 0.90 runs
+  every MOSS checkpoint exactly as OpenMOSS tuned it.
 - **Attention** — leave on `auto`. Installing `sageattention` or `flash_attn`
   makes generation two to three times faster.
-- **Free GPU memory after each run** — for cards under 8 GB. Slower, because the
-  model reloads each time.
+- **Free GPU memory after each run** — Qwen only. The model is released once,
+  after the take's last line, so the card is free for something else between
+  takes; the next take loads it again. MOSS's loader keeps its model in a way no
+  graph can release, so the switch is hidden there.
 
 ### Takes and playback
 
 Every run becomes a take. Lines are generated one at a time and joined into a
-single wav with your pause between them, so the workspace shows progress line by
-line and the block being spoken lights up as it plays. The player's ⏮ ⏭ skip
-between lines rather than between takes. Download gives you the joined file, or a
-zip of the clips if the format could not be joined.
+single wav with your pause between them. Each engine holds one model at a time,
+so lines are grouped by the model they need — a preset speaker answering a
+cloned one loads each model once per take instead of swapping on every line —
+and joined back in script order. The workspace shows progress line by line,
+and the block being spoken lights up as it plays. The player's ⏮ ⏭ skip
+between lines rather than between takes. Download gives you the joined file.
+Current ComfyUI saves audio as flac, never wav, so each clip is turned back into
+wav with the engine's own Python (which already has the decoder) before joining;
+only a ComfyUI you started yourself, whose Python Script Builder cannot see,
+gives you a zip of the clips instead.
+
+Reference clips for cloning are kept in `data/references`, named by their
+contents, and handed to whichever engine speaks the line — so a clip uploaded
+on Qwen works after switching to MOSS, and two files both called
+`recording.wav` stay two voices.
 
 ## Engine and Models panels
 
@@ -282,6 +303,39 @@ the four recommended folders with a button each, browsing any repo to see its
 files and sizes before downloading, live progress with a Stop button, and
 deleting a folder from disk. Downloads resume where they stopped.
 
+### The engine console, Restart, and starting itself
+
+**Engine console** is the panel under the buttons: the engine's own output,
+live, with a line of app-side narration mixed into it for everything Script
+Builder does *to* that engine — which process was holding the port, what the
+system said when it was asked to stop, what started in its place. There is no
+terminal behind a launcher, so this panel is the ComfyUI console.
+
+The sentence above it names the state, including the two that otherwise look
+like a healthy app that simply does not work:
+
+- *a different ComfyUI is answering this address* — 8188 is the port every
+  ComfyUI picks, so the one holding it is often somebody else's, and its
+  missing nodes cannot be installed away;
+- *everything is on disk and this engine cannot reach it* — ComfyUI reads
+  `custom_nodes` once, at startup, so a node pack installed behind a running
+  engine leaves a complete install with no classes in it.
+
+**Restart ComfyUI** is the cure for both. It stops the engine it started and
+starts it again — and where the one answering is not ours, it takes the
+address over rather than giving up: ComfyUI-Manager's own reboot first, and
+failing that the process holding the port is found, confirmed to look like a
+ComfyUI, and closed, with one of this app's own started in its place. Anything
+that is not a ComfyUI is named and left alone. A refusal says which obstacle
+it hit — access denied, something supervising it, a process it could not
+identify — instead of sending you to hunt a windowless python in Task Manager.
+
+Launching the app does all of this by itself, with no button pressed: it
+starts the engine if the address is quiet, adopts the one already running if
+it is healthy, and replaces it through the same guard if it is not. A ComfyUI
+you run yourself (external mode in Settings) is never touched — the app says
+what is wrong with it and leaves it to you.
+
 ---
 
 ## Troubleshooting
@@ -298,11 +352,18 @@ node's own requirements file.
 **PyTorch will not install** — pick a build by hand in the Engine panel: CUDA
 12.8 for recent NVIDIA drivers, 12.1 for older ones, ROCm for AMD, or CPU.
 
+**"Torch not compiled with CUDA enabled"** — that engine's environment has the
+CPU-only PyTorch on a machine with an NVIDIA card, and ComfyUI stops as it
+starts on it. Script Builder now refuses to launch it and says so; press
+Reinstall on **PyTorch** for that engine (or Install everything missing) to
+swap in the CUDA build. Machines with no NVIDIA card run on the CPU instead.
+
 **Out of memory** — switch to the 0.6B model and turn on Free GPU memory after
 each run.
 
 **A line takes forever** — the first line after a restart loads the model, which
-is slow. Later lines are much quicker unless memory freeing is on.
+is slow. Later lines reuse it, and so does the first line of the next take unless
+memory freeing is on.
 
 ---
 

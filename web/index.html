@@ -90,7 +90,7 @@
   .btn.go{background:linear-gradient(100deg,var(--accent),var(--accent-2));color:#fff}
   .btn.thin{padding:7px 13px;font-size:12.5px}
   .btn:disabled{opacity:.45;cursor:not-allowed}
-  .btn .spin{display:inline-block;width:12px;height:12px;border:2px solid currentColor;
+  .btn .spin,.empty .spin{display:inline-block;width:12px;height:12px;border:2px solid currentColor;
     border-right-color:transparent;border-radius:50%;margin-right:7px;
     vertical-align:-2px;animation:rot .8s linear infinite}
   @keyframes rot{to{transform:rotate(360deg)}}
@@ -288,6 +288,7 @@
   .fitem .n{font-size:13px;min-width:0}
   .fitem .n b{font-weight:500;display:block;word-break:break-all}
   .fitem .n span{font-size:11.5px;color:var(--dim)}
+  .fitem .n .dep-err{display:block;color:#ff9a9a;margin-top:2px}
   .fitem .right{margin-left:auto;display:flex;align-items:center;gap:8px;flex:none}
   .state{font-size:11px;padding:3px 9px;border-radius:999px;border:1px solid var(--line);
          color:var(--muted);white-space:nowrap}
@@ -493,7 +494,7 @@
               <span class="v" id="temp-v">0.90</span></div></div></div>
           <div class="orow" id="rowAttn"><span class="lab">Attention <i class="hint">i</i></span>
             <div class="ctl"><select id="attn-sel"><option value="auto">auto</option></select></div></div>
-          <div class="orow"><span class="lab">Free GPU memory after each run <i class="hint">i</i></span>
+          <div class="orow" id="rowUnload"><span class="lab">Free GPU memory after each run <i class="hint">i</i></span>
             <div class="ctl"><div class="segmented" id="segUnload">
               <button data-v="on">On</button><button class="on" data-v="off">Off</button>
             </div></div></div>
@@ -575,8 +576,14 @@
           <button class="btn" id="btnTestQwen" title="Generate one line with Qwen3-TTS and report what happens">Test Qwen3-TTS</button>
           <button class="btn" id="btnTestMoss" title="Generate one line with MOSS-TTS and report what happens">Test MOSS-TTS</button>
           <button class="btn" id="btnStartEngine">Start ComfyUI</button>
+          <button class="btn" id="btnRestartEngine" title="Stop this engine's ComfyUI and start it again, so it loads newly installed nodes">Restart ComfyUI</button>
           <button class="btn" id="btnReRun">Run setup again</button>
         </div>
+      </div>
+      <div class="panel">
+        <h2>Engine console</h2>
+        <p class="sub" id="engine-state">Checking…</p>
+        <div class="log" id="engine-log">Nothing yet — start ComfyUI and its own output appears here.</div>
       </div>
       <div class="panel">
         <h2>PyTorch build</h2>
@@ -661,7 +668,7 @@
         <div class="switch"><label for="opt-clone">Voice cloning from a clip</label>
           <input type="checkbox" id="opt-clone" checked></div>
         <div class="switch"><label for="opt-design">Voice design from a description</label>
-          <input type="checkbox" id="opt-design"></div>
+          <input type="checkbox" id="opt-design" checked></div>
         <div class="switch"><label for="opt-17b">1.7B versions (better, slower)</label>
           <input type="checkbox" id="opt-17b"></div>
         <div class="switch"><label for="opt-moss">MOSS-TTS as a second engine</label>
@@ -843,7 +850,7 @@ function show(view) {
   document.body.classList.toggle("solo", view === "models" || view === "engine");
   $("mainCol").scrollTop = 0;
   if (view === "models") { loadHf(); loadLocal(); pollTasks(); }
-  if (view === "engine") { loadDeps(); pollTasks(); }
+  if (view === "engine") { loadDeps(); pollTasks(); pollEngineLog(); }
   if (view === "library") renderLib();
   if (view === "home") renderHome();
   if (view === "create") requestAnimationFrame(resizeAll);
@@ -1080,25 +1087,74 @@ function renderSpeakerBody(n) {
       '<label class="flab" style="margin-top:9px">What is said in the clip</label>' +
       '<input type="text" data-reftext="' + n + '" value="' + esc(s.ref_text) +
       '" placeholder="Type the words spoken in the clip">' +
-      '<div class="note">Matching this text to the clip makes a large difference.</div>';
+      '<div class="note">' + (isMoss()
+        ? "MOSS clones from the sound alone and does not use this."
+        : "Matching this text to the clip makes a large difference. Left empty, " +
+          "the voice is copied from its sound alone — less closely.") + "</div>";
     body.querySelector("[data-pick]").addEventListener("click", function () {
       body.querySelector("[data-file]").click(); });
     body.querySelector("[data-file]").addEventListener("change", function (e) {
       uploadRef(n, e.target); });
     body.querySelector("[data-reftext]").addEventListener("input", function (e) {
       S.speakers[n].ref_text = e.target.value; saveDraft(); });
+    body.appendChild(hearIt(n));
   } else {
+    // What the note says depends on whether the model is on disk. It used to
+    // say "Needs the 1.7B VoiceDesign model" to everyone and offer nothing to
+    // press, which read as something missing whether it was or not.
+    var dm = S.voices.design_model || {};
+    var need = isMoss() ? "MOSS-VoiceGenerator (1.7B)"
+                        : "the 1.7B VoiceDesign model";
     body.innerHTML = '<label class="flab">Describe the voice</label>' +
       '<textarea rows="3" data-instruct="' + n +
       '" placeholder="A gentle female voice with a high pitch, speaking slowly">' +
       esc(s.instruct) + "</textarea>" +
-      '<div class="note">' + (isMoss()
-        ? "Needs MOSS-VoiceGenerator — 1.7B, the same size as the base model. One button on the Models page."
-        : "Needs the 1.7B VoiceDesign model — one button on the Models page.") +
-      "</div>";
+      '<div class="note" data-dnote></div>';
+    var note = body.querySelector("[data-dnote]");
+    if (dm.installed === false) {
+      note.textContent = "Needs " + need + ", which is not downloaded yet"
+        + (dm.vram_gb ? " (about " + dm.vram_gb + " GB of graphics memory)" : "")
+        + ". ";
+      var get = mkBtn("Download it", function () {
+        if (dm.fits === false && !confirm(dm.repo + " wants about " + dm.vram_gb
+            + " GB of graphics memory, more than this card has. Download it "
+            + "anyway?")) return;
+        startDownload(dm.repo, get);
+      });
+      get.className = "btn thin go";
+      note.appendChild(get);
+    } else {
+      note.textContent = (dm.installed ? "Uses " + need + ". " : "Needs "
+        + need + " — on the Models page if you do not have it. ")
+        + "Say who is speaking: age, pitch, pace, accent, mood. Each line is "
+        + "designed afresh, so the voice can drift from line to line — Clone "
+        + "a sample you like to hold it steady.";
+    }
     body.querySelector("[data-instruct]").addEventListener("input", function (e) {
       S.speakers[n].instruct = e.target.value; saveDraft(); });
+    body.appendChild(hearIt(n));
   }
+}
+/* Every voice source can be heard before a whole script is spent on it —
+   only Preset could, so a designed voice had no way to begin at all short
+   of reading the script. Each one says what it is still missing. */
+function hearIt(n) {
+  var row = document.createElement("div");
+  row.style.cssText = "display:flex;justify-content:flex-end;margin-top:9px";
+  var b = mkBtn("Hear it", function () {
+    var s = S.speakers[n], dm = S.voices.design_model || {};
+    if (s.kind === "clone" && !s.ref_audio) {
+      toast("Choose a clip for " + spkName(n) + " first.", true); return; }
+    if (s.kind === "design" && !(s.instruct || "").trim()) {
+      toast("Describe " + spkName(n) + "'s voice first.", true); return; }
+    if (s.kind === "design" && dm.installed === false) {
+      toast("Download the voice design model first — the button is just "
+            + "above.", true); return; }
+    previewVoice(n);
+  });
+  b.dataset.preview = n;
+  row.appendChild(b);
+  return row;
 }
 function setSource(n, kind) {
   S.speakers[n].kind = kind;
@@ -1152,6 +1208,10 @@ async function loadVoices() {
     // attention itself from the card. An empty select reading "auto" is fine;
     // a stale Qwen list next to a MOSS take is not.
     $("rowAttn").hidden = isMoss();
+    // MOSS's loader keeps its model in a module global that nothing in a
+    // graph can release, so the switch would promise memory it cannot free.
+    // Qwen's node honours it — once, after a take's last line.
+    $("rowUnload").hidden = isMoss();
     renderSpeakers();
   } catch (e) { renderSpeakers(); }
 }
@@ -1198,6 +1258,13 @@ async function setEngine(id) {
   } catch (e) { /* the picker still works for this run */ }
   await refreshStatus();
   await loadVoices();
+  // Chosen to be used, so it is brought up now rather than at the first
+  // Read — and bringing it up stops the other one, which is what keeps one
+  // engine on the card (rule 31). An engine that cannot start says why, and
+  // the one that was running is left running.
+  var st = S.status || {};
+  if (st.setup_complete && !st.setup_running && !st.comfy_online
+      && !engineStarting) startEngine();
 }
 /* Values may be plain strings (Qwen's model_choice enum) or {value,label}
    pairs (MOSS repo ids, which want a readable name beside them). */
@@ -1250,6 +1317,9 @@ function blocker(st) {
   if (st.ready) return { label: "Read the script", go: null };
   if (st.setup_running) return { label: "Setting up…", go: openSetup };
   if (!st.setup_complete) return { label: "Set up the engine", go: openSetup };
+  if (!st.comfy_online && engineStarting) return {
+    label: "Starting " + (S.engineLabel || "the engine") + "…",
+    go: function () { show("engine"); } };
   if (!st.comfy_online) return { label: "Start the engine",
     go: function () { show("engine"); startEngine(); } };
   // A different ComfyUI on that port has every symptom of nodes that failed
@@ -1289,7 +1359,13 @@ async function runScript() {
   }
 }
 async function previewVoice(n) {
-  if (!S.status || !S.status.ready) { openSetup(); return; }
+  // The same blocker the Run button names: an engine that is merely offline
+  // or missing a model was sent to the install dialog, which clears neither.
+  if (!S.status || !S.status.ready) {
+    var bl = blocker(S.status);
+    if (bl.go) bl.go();
+    return;
+  }
   try {
     var b = body([{ speaker: 1, text: "This is how I sound when I read your script." }],
                  "Voice sample — " + spkName(n));
@@ -1303,18 +1379,37 @@ async function previewVoice(n) {
     pollJob(true);
   } catch (e) { toast(e.message, true); }
 }
-var jobTimer = null;
+var jobTimer = null, jobMisses = 0;
 async function pollJob(isPreview) {
   clearTimeout(jobTimer);
   var jobs;
-  try { jobs = await api("/api/jobs"); }
+  // Asked for by id, so the server lists this job however long it ran.
+  try { jobs = await api("/api/jobs?id=" + encodeURIComponent(S.job || "")); }
   catch (e) { jobTimer = setTimeout(function () { pollJob(isPreview); }, 3000); return; }
   S.jobs = jobs;
   renderJobs();
   var job = jobs.filter(function (j) { return j.id === S.job; })[0];
-  if (!job) { jobTimer = setTimeout(function () { pollJob(isPreview); }, 1500); return; }
+  if (!job) {
+    // Gone altogether — the app was restarted under it. Waiting on forever
+    // left the Read button disabled over nothing, so say so and let go.
+    if (++jobMisses < 5) {
+      jobTimer = setTimeout(function () { pollJob(isPreview); }, 1500);
+      return;
+    }
+    jobMisses = 0;
+    $("btnRun").disabled = false;
+    $("btnStop").hidden = true;
+    highlight(-1);
+    loadTakes();
+    toast("Lost track of that take — Script Builder was restarted while it "
+          + "ran. Anything it finished is in the Library.", true);
+    return;
+  }
+  jobMisses = 0;
   if (job.status === "running") {
-    highlight(typeof job.line_index === "number" ? job.line_index : -1);
+    // A voice sample is one line of its own, not a line of the script.
+    highlight(!isPreview && typeof job.line_index === "number"
+      ? job.line_index : -1);
     jobTimer = setTimeout(function () { pollJob(isPreview); }, 1200);
     return;
   }
@@ -1347,10 +1442,16 @@ function renderJobs() {
     b.addEventListener("click", function () { stopAll(); });
   });
 }
+/* `index` counts spoken lines, as the server and a take do — empty blocks
+   are never sent — so it is the index-th block with text in it, not block
+   number index. Counting blocks lit the one above after an empty block. */
 function highlight(index) {
+  var n = -1;
   S.blocks.forEach(function (b, i) {
+    if (b.text && b.text.trim()) n++;
     var el = $("blk-" + i);
-    if (el) el.classList.toggle("speaking", i === index);
+    if (el) el.classList.toggle("speaking",
+      index >= 0 && n === index && !!(b.text && b.text.trim()));
   });
 }
 
@@ -1556,10 +1657,33 @@ async function removeTake(t) {
 }
 
 /* ========================= engine page ========================= */
+/* One /api/deps at a time. Opening the Engine page and pressing Install
+   everything missing each asked for the whole report, so a check that already
+   takes seconds per engine ran twice over. A caller that arrives while one is
+   out waits for that one — unless it wants a fresh read and the one out is
+   not. */
+var depsAsk = null;
+function fetchDeps(fresh) {
+  if (depsAsk && (depsAsk.fresh || !fresh)) return depsAsk.promise;
+  var ask = { fresh: !!fresh };
+  ask.promise = api("/api/deps" + (fresh ? "?fresh=1" : ""));
+  depsAsk = ask;
+  var clear = function () { if (depsAsk === ask) depsAsk = null; };
+  ask.promise.then(clear, clear);
+  return ask.promise;
+}
 async function loadDeps(fresh) {
   var box = $("dep-list");
+  // An empty list under a spinner read as a page that had stopped — and the
+  // engine console above it was pointing at a Reinstall button in this list.
+  // Rows already drawn stay up while they are checked again.
+  if (!box.querySelector(".fitem")) {
+    box.innerHTML = '<div class="empty"><span class="spin"></span>Checking '
+      + "each engine's install — PyTorch's files are read one by one, which "
+      + "takes a few seconds…</div>";
+  }
   try {
-    var d = await api("/api/deps" + (fresh ? "?fresh=1" : ""));
+    var d = await fetchDeps(fresh);
     $("torch-index").value = d.torch_index || "";
     // Say what Automatic picked. "Automatic" on its own is what let a machine
     // with an RTX 4060 in it quietly take the CPU build.
@@ -1575,10 +1699,13 @@ async function loadDeps(fresh) {
       // A warning on the engine row means something is answering that is not
       // ours, which is as blocking as a missing install and has to raise the
       // badge. Optional models warn too, and those are not a problem.
-      if (it.state === "missing"
+      // So does a row the server marks `repair`: a CPU-only PyTorch beside an
+      // NVIDIA card is an engine that stops as it starts, not a slow one.
+      if (it.state === "missing" || it.repair
           || (it.state === "warn" && it.id.indexOf("engine") === 0)) bad++;
       var el = document.createElement("div");
       el.className = "fitem";
+      el.dataset.dep = it.id;
       el.innerHTML = '<div class="n"><b>' + esc(it.label) + "</b><span>" +
         esc(it.detail || "") + (it.hint ? " — " + esc(it.hint) : "") +
         '</span></div><div class="right"><span class="state ' + it.state + '">' +
@@ -1594,12 +1721,14 @@ async function loadDeps(fresh) {
         var label = it.action === "update" ? "Update"
           : it.action === "reinstall" ? "Reinstall" : "Install";
         var b = mkBtn(label, function () { installDep(it.id, b); });
-        if (it.state === "missing") b.className = "btn thin go";
+        if (it.state === "missing" || it.repair) b.className = "btn thin go";
         right.appendChild(b);
       }
       box.appendChild(el);
     });
-    $("engineTag").hidden = bad === 0;
+    S.depsBad = bad;
+    paintEngineTag();
+    paintDepTasks(S.tasks || []);
   } catch (e) {
     box.innerHTML = '<div class="empty bad-text">' + esc(e.message) + "</div>";
   }
@@ -1611,8 +1740,51 @@ function mkBtn(label, fn) {
   b.addEventListener("click", fn);
   return b;
 }
+/* The row whose button was pressed is where the eye is, and the Activity
+   panel is a screen further down. A 3 GB PyTorch said "Working…" on that
+   button and nothing else for as long as it took, which read as nothing
+   happening at all. So every running install paints its own row: what it is
+   doing on the line under the name, how far on the button. Painted from the
+   task list, so it survives a re-render and a reload. */
+function paintDepTasks(list) {
+  var seen = {};
+  // Newest first, so the first task met for a row is its latest attempt.
+  list.forEach(function (t) {
+    if (t.kind !== "dependency" || !t.meta || seen[t.meta.dep]) return;
+    seen[t.meta.dep] = true;
+    var row = document.querySelector('#dep-list .fitem[data-dep="'
+                                     + t.meta.dep + '"]');
+    if (!row) return;
+    // A failure stays on the row until the next attempt: the toast that said
+    // so is gone in seconds, and the row it left behind read exactly as it
+    // had before the button was pressed — which looks like nothing happened.
+    var state = row.querySelector(".state");
+    if (t.state === "error" && !(state && state.textContent === "ok")) {
+      var n = row.querySelector(".n"), err = n.querySelector(".dep-err");
+      if (!err) {
+        err = document.createElement("span");
+        err.className = "dep-err";
+        n.appendChild(err);
+      }
+      err.textContent = "Last try failed: "
+        + (t.detail || "see the Activity log below.");
+      return;
+    }
+    if (t.state !== "running") return;
+    var stale = row.querySelector(".dep-err");
+    if (stale) stale.remove();
+    var line = row.querySelector(".n span");
+    if (line && t.detail) line.textContent = t.detail;
+    var btn = row.querySelector(".right button");
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spin"></span>'
+        + esc(t.pct > 0 ? Math.round(t.pct) + "%" : "Working…");
+    }
+  });
+}
 async function installDep(id, btn) {
-  if (btn) { btn.disabled = true; btn.textContent = "Working…"; }
+  var b = busy(btn, "Working…");
   try {
     var r = await api("/api/deps/" + id + "/install", { method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1621,7 +1793,7 @@ async function installDep(id, btn) {
     pollTasks();
   } catch (e) {
     toast(e.message, true);
-    if (btn) { btn.disabled = false; btn.textContent = "Install"; }
+    b.done();
   }
 }
 function waitForTask(id) {
@@ -1658,9 +1830,10 @@ async function installAllMissing() {
   });
   var b = busy($("btnInstallAll"), "Checking what is missing…");
   try {
-    var d = await api("/api/deps");
+    var d = await fetchDeps();
     var missing = order.filter(function (id) {
-      return d.items.some(function (i) { return i.id === id && i.state === "missing"; });
+      return d.items.some(function (i) {
+        return i.id === id && (i.state === "missing" || i.repair); });
     });
     if (!missing.length) { toast("Nothing missing. Try Start ComfyUI."); return; }
     var labelOf = function (id) {
@@ -1743,15 +1916,86 @@ function renderSelfTest(engine, t) {
   }
 }
 async function restartEngine() {
+  var b = busy($("btnRestartEngine"), "Restarting…");
   try {
     var r = await api("/api/comfy/restart?engine=" +
       encodeURIComponent(S.engine), { method: "POST" });
+    // Four routes, four different things to say. "Restarting ComfyUI" over a
+    // takeover hides the part that matters: something else was on that port
+    // and has just been closed.
+    if (r.how === "manager-reboot") {
+      toast("ComfyUI-Manager is rebooting that engine in place — it loads the "
+            + "nodes on the way back up.");
+      show("engine");
+      loadDeps();
+      return;
+    }
+    if (r.how === "takeover") {
+      toast("That ComfyUI was not started here, so it was closed and one of "
+            + "this app's own is starting in its place. Watch the console "
+            + "below.");
+    } else if (r.how === "started") {
+      toast("Nothing was running on that address — starting ComfyUI. The "
+            + "first start is slow.");
+    } else {
+      toast("Restarting ComfyUI so it loads the nodes. The first start is "
+            + "slow.");
+    }
+    show("engine");
     S.taskId = r.task.id; S.taskCursor = 0; $("task-log").textContent = "";
     pollTasks();
-    toast("Restarting ComfyUI so it loads the nodes. The first start is slow.");
     if (await waitForTask(r.task.id)) toast("Nodes loaded.");
     loadDeps();
   } catch (e) { toast(e.message, true); }
+  finally { b.done(); }
+}
+
+/* The engine's own console, polled while the Engine page is open and nowhere
+   else. It is the only visible cue that an engine is starting rather than
+   hung, and the one place the app's own actions on it are written down. */
+var engineLogTimer = null;
+async function pollEngineLog() {
+  clearTimeout(engineLogTimer);
+  if (S.view !== "engine") return;
+  var d;
+  try {
+    d = await api("/api/comfy/log?n=120&engine=" + encodeURIComponent(S.engine));
+  } catch (e) { engineLogTimer = setTimeout(pollEngineLog, 4000); return; }
+  var log = $("engine-log");
+  var text = (d.lines || []).join("\n");
+  if (text && log.textContent !== text) {
+    // Only follow the tail when it was already at the tail: yanking the view
+    // down while someone is reading an IMPORT FAILED higher up is worse than
+    // no scrolling at all.
+    var bottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+    log.textContent = text;
+    if (bottom) log.scrollTop = log.scrollHeight;
+  }
+  var st = S.status || {};
+  var state;
+  if (st.stale_models && d.online) {
+    state = "⚠ " + (st.stale_reason
+      ? st.stale_reason.charAt(0).toUpperCase() + st.stale_reason.slice(1)
+      : "Everything is on disk, but this ComfyUI started before it landed")
+      + ". Press Restart ComfyUI.";
+  } else if (st.engine_mismatch && d.online) {
+    state = "⚠ A different ComfyUI is answering at "
+      + ((st.config || {}).comfy_url || "this address")
+      + (st.engine_argv ? " (" + st.engine_argv + ")" : "")
+      + ". Close it, or give this engine another address in Settings.";
+  } else if (d.stopped && !d.online) {
+    state = "⚠ " + d.stopped;
+  } else if (d.running) {
+    state = d.online ? "Running — started by Script Builder."
+                     : "Starting… the first start is slow.";
+  } else if (d.online) {
+    state = "Online, but started outside Script Builder — Restart ComfyUI "
+          + "will take it over.";
+  } else {
+    state = "Offline. Press Start ComfyUI.";
+  }
+  $("engine-state").textContent = state;
+  engineLogTimer = setTimeout(pollEngineLog, 2500);
 }
 var engineStarting = false;
 async function startEngine(ev) {
@@ -1769,6 +2013,7 @@ async function startEngine(ev) {
     ? ev.currentTarget : $("btnStartEngine");
   var b = busy(btn, "Starting…");
   engineStarting = true;
+  $("runLabel").textContent = blocker(S.status).label;
   try {
     var r = await api("/api/comfy/start?engine=" + encodeURIComponent(engine),
       { method: "POST" });
@@ -1812,9 +2057,13 @@ async function startEngine(ev) {
       }
       var slot = (st.installs || {})[engine] || {};
       if (slot.running === false) {
-        $("task-title").textContent = label + " stopped while starting — its "
-          + "last words are below.";
-        toast(label + " stopped while starting — see the Activity log.", true);
+        // The server reads the crash and says it in a sentence; the console
+        // below still has every line of it.
+        var why = slot.stopped
+          || label + " stopped while starting — its last words are below.";
+        $("task-title").textContent = why;
+        toast(why, true);
+        offerRepair(engine);
         return;
       }
     }
@@ -1822,15 +2071,44 @@ async function startEngine(ev) {
       + "its console is below.";
     toast(label + " did not come up within five minutes — see the Activity "
           + "log.", true);
-  } catch (e) { toast(e.message, true); }
-  finally { engineStarting = false; b.done(); loadDeps(); }
+  } catch (e) {
+    $("task-title").textContent = e.message;
+    toast(e.message, true);
+    offerRepair(engine);
+  }
+  finally { engineStarting = false; b.done(); loadDeps(); refreshStatus(); }
+}
+/* A start refused over a CPU-only PyTorch names the Reinstall button; this
+   offers to press it. The dependency report decides — not the wording of the
+   error — so an engine that failed for any other reason is offered nothing. */
+async function offerRepair(engine) {
+  var d;
+  try { d = await fetchDeps(); } catch (e) { return; }
+  var row = (d.items || []).filter(function (i) {
+    return i.id === "torch_" + engine && i.repair; })[0];
+  if (row && confirm(row.detail + "\n\nReinstall PyTorch now? It downloads "
+                     + "about 3 GB, and the engine can start once it is done.")) {
+    show("engine");
+    installDep(row.id);
+  }
 }
 var taskTimer = null;
 async function pollTasks() {
   clearTimeout(taskTimer);
   var list = [];
   try { list = await api("/api/tasks"); } catch (e) { return; }
+  S.tasks = list;
+  paintDepTasks(list);
   var dls = list.filter(function (t) { return t.kind === "download"; });
+  // A download that has just finished leaves its model row reading
+  // "Starting…" and disabled unless the lists are read again.
+  var wasRunning = S.dlRunning || {}, landed = false;
+  S.dlRunning = {};
+  dls.forEach(function (t) {
+    if (t.state === "running") S.dlRunning[t.id] = true;
+    else if (wasRunning[t.id]) landed = true;
+  });
+  if (landed) { loadHf(); loadLocal(); refreshStatus(); }
   var box = $("dl-list");
   if (box) {
     box.innerHTML = dls.length ? "" : '<div class="empty">No downloads running.</div>';
@@ -1876,10 +2154,19 @@ async function pollTasks() {
       }
       $("btnCancelTask").hidden = t.state !== "running";
       if (t.state !== "running") {
+        // The list this tick painted from still has it running; left that
+        // way, the redraw below would put the spinner back on a finished row.
+        (S.tasks || []).forEach(function (x) {
+          if (x.id === t.id) { x.state = t.state; x.detail = t.detail; } });
         S.taskId = null;
-        loadDeps(); loadLocal(); refreshStatus();
-        toast(t.state === "done" ? t.title + " finished."
-          : t.title + " failed — check the log.", t.state !== "done");
+        // loadVoices too: the Design panel says whether its model is here.
+        loadDeps(); loadLocal(); refreshStatus(); loadVoices();
+        // What it ended on is usually the next step ("Restart ComfyUI"),
+        // and the Activity panel it would otherwise sit in is off-screen.
+        toast(t.state === "done"
+          ? t.title + " finished" + (t.detail ? " — " + t.detail : ".")
+          : t.title + " failed — " + (t.detail || "check the log."),
+          t.state !== "done");
       }
     } catch (e) { S.taskId = null; }
   }
@@ -1900,7 +2187,7 @@ async function loadHf() {
     // than someone moving a MOSS folder into the Qwen tree and wondering why
     // the node downloads it again.
     $("models-dir-note").textContent = (s.models_dir
-      ? "Stored in " + s.models_dir + "/qwen-tts/Qwen/ and " +
+      ? "Stored in " + s.models_dir + "/qwen-tts/ and " +
         s.models_dir + "/moss-tts/"
       : "No models folder set yet — run setup first.") +
       (s.vram_mb ? "  ·  " + (s.gpu_name || "This card") + " has " +
@@ -2018,9 +2305,22 @@ async function deleteModel(repo) {
 /* ========================= setup ========================= */
 function openSetup() {
   $("veil-setup").hidden = false;
+  // Opened over a setup that is already running — the "Setting up…" button,
+  // or a reload during first-run setup — it offered the choice again, Start
+  // got a 409, and the progress panel stayed blank. Show the run instead.
+  if (S.status && S.status.setup_running) { watchSetup(); return; }
   $("setup-choice").hidden = false;
   $("setup-progress").hidden = true;
   renderPicks();
+}
+function watchSetup() {
+  $("setup-choice").hidden = true;
+  $("setup-progress").hidden = false;
+  $("setup-done").hidden = true;
+  $("setup-retry").hidden = true;
+  $("setup-log").textContent = "";
+  S.setupCursor = 0;
+  pollSetup();
 }
 function renderPicks() {
   var box = $("pick-list");
@@ -2066,7 +2366,10 @@ async function runSetup() {
         want_moss_8b: $("opt-moss-8b").checked,
         want_moss_design: $("opt-moss-design").checked }) });
     pollSetup();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    toast(e.message, true);
+    if (/already running/i.test(e.message)) watchSetup();
+  }
 }
 var setupTimer = null;
 async function pollSetup() {
@@ -2112,6 +2415,17 @@ async function pollSetup() {
 }
 
 /* ========================= status ========================= */
+/* The Engine badge has two witnesses — the status poll (is the engine up with
+   its nodes) and the dependency list (is anything missing or in need of
+   repair) — and each used to set it alone. The poll runs every six seconds,
+   so it put the badge down over a PyTorch the list had just marked for
+   repair whenever any engine answered. Either one raises it now. */
+function paintEngineTag() {
+  var st = S.status;
+  var down = !!st && !(st.comfy_online && st.nodes_ready);
+  $("engineTag").hidden = !(down || S.depsBad > 0);
+}
+/* ========================= status ========================= */
 async function refreshStatus() {
   var st;
   try { st = await api("/api/status"); } catch (e) { return; }
@@ -2133,7 +2447,7 @@ async function refreshStatus() {
     : st.missing_models.length ? "Models missing"
     : st.models_known === false ? "No models folder" : "Engine loading";
   $("modelsTag").hidden = !(st.missing_models && st.missing_models.length);
-  $("engineTag").hidden = !!(st.comfy_online && st.nodes_ready);
+  paintEngineTag();
   $("runLabel").textContent = blocker(st).label;
   $("gpuMetric").querySelector("span").textContent =
     st.ready ? "ready" : st.comfy_online ? "loading" : "offline";
@@ -2143,10 +2457,14 @@ async function refreshStatus() {
   var mine = (st.installs || {})[S.engine];
   $("cfg-url").placeholder = mine ? mine.comfy_url : "http://127.0.0.1:8188";
   var c = st.config || {};
-  $("cfg-url").value = c.comfy_url || "";
-  $("cfg-dir").value = c.comfy_dir || "";
-  $("cfg-models").value = c.models_dir || "";
-  $("cfg-auto").checked = !!c.auto_start_comfy;
+  // Not while Settings is open: this runs every six seconds, and it put the
+  // saved values back over whatever was being typed — then Save saved them.
+  if ($("veil-settings").hidden) {
+    $("cfg-url").value = c.comfy_url || "";
+    $("cfg-dir").value = c.comfy_dir || "";
+    $("cfg-models").value = c.models_dir || "";
+    $("cfg-auto").checked = !!c.auto_start_comfy;
+  }
   $("cfg-note").textContent = st.schema_error || "";
   if ((st.ready && !was) || (wasEngine && wasEngine !== st.engine)) loadVoices();
   if (!st.setup_complete && !S.setupSeen) { S.setupSeen = true; openSetup(); }
@@ -2241,6 +2559,7 @@ function wire() {
     runSelfTest("moss", e.currentTarget); });
   $("btnInstallAll").addEventListener("click", installAllMissing);
   $("btnStartEngine").addEventListener("click", startEngine);
+  $("btnRestartEngine").addEventListener("click", restartEngine);
   $("btnReRun").addEventListener("click", openSetup);
   $("btnCancelTask").addEventListener("click", function () {
     if (S.taskId) api("/api/tasks/" + S.taskId + "/cancel", { method: "POST" }); });

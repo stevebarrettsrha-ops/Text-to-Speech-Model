@@ -9,6 +9,7 @@ names say what would break rather than what the function is called.
 from __future__ import annotations
 
 import copy
+import io
 import json
 import os
 import shutil
@@ -17,6 +18,7 @@ import sys
 import tempfile
 import subprocess
 import threading
+import time
 import unittest
 from unittest import mock
 import wave
@@ -148,8 +150,10 @@ class ModelDeletes(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.models = self.root / "models"
-        (self.models / "qwen-tts" / "Qwen" / "Real").mkdir(parents=True)
-        (self.models / "qwen-tts" / "Qwen" / "Real" / "w.safetensors").write_text("x")
+        (self.models / "qwen-tts" / "Real").mkdir(parents=True)
+        (self.models / "qwen-tts" / "Real" / "w.safetensors").write_text("x")
+        (self.models / "qwen-tts" / "voices").mkdir()
+        (self.models / "qwen-tts" / "voices" / "mine.wav").write_text("x")
         (self.models / "checkpoints").mkdir(parents=True)
         self.precious = self.models / "checkpoints" / "keep.safetensors"
         self.precious.write_text("do not delete")
@@ -175,7 +179,7 @@ class ModelDeletes(unittest.TestCase):
         self.assertTrue((self.outside / "f.txt").exists())
 
     def test_a_symlink_out_of_the_tree_is_refused(self):
-        link = self.models / "qwen-tts" / "Qwen" / "Escape"
+        link = self.models / "qwen-tts" / "Escape"
         link.symlink_to(self.outside, target_is_directory=True)
         with self.assertRaises(Exception):
             manager.delete_model(self.cfg, "Qwen/Escape")
@@ -183,8 +187,20 @@ class ModelDeletes(unittest.TestCase):
 
     def test_a_real_delete_still_works(self):
         manager.delete_model(self.cfg, "Qwen/Real")
-        self.assertFalse((self.models / "qwen-tts" / "Qwen" / "Real").exists())
+        self.assertFalse((self.models / "qwen-tts" / "Real").exists())
         self.assertTrue(self.precious.exists())
+
+    def test_the_root_and_the_nodes_saved_voices_are_not_models(self):
+        # With no org folder in between, "Qwen/" names models/qwen-tts itself
+        # and "Qwen/voices" the node's saved voices. Neither is a model, and
+        # a delete of either would take every model or every voice with it.
+        for repo in ("Qwen/", "Qwen/voices", "Anyone/voices"):
+            with self.subTest(repo=repo):
+                with self.assertRaises(Exception):
+                    manager.delete_model(self.cfg, repo)
+        self.assertTrue((self.models / "qwen-tts" / "voices" / "mine.wav")
+                        .exists())
+        self.assertTrue((self.models / "qwen-tts" / "Real").exists())
 
 
 class ModelInstalled(unittest.TestCase):
@@ -214,6 +230,14 @@ class ModelInstalled(unittest.TestCase):
 
     def test_a_missing_folder_is_not_installed(self):
         self.assertFalse(bootstrap.model_installed(self.models, "Qwen/Nope"))
+
+    def test_a_config_whose_weights_never_came_is_not_installed(self):
+        # The weights request failed before its .part was opened — a 503, a
+        # DNS blip — and the config alone counted as installed, so setup
+        # never fetched the model again.
+        d = self._folder("Qwen/C")
+        (d / "config.json").write_text("{}")
+        self.assertFalse(bootstrap.model_installed(self.models, "Qwen/C"))
 
 
 class PipProgress(unittest.TestCase):
@@ -552,6 +576,36 @@ class GraphBuilding(unittest.TestCase):
         self.assertEqual(g["2"]["inputs"]["ref_audio"], ["1", 0])
         self.assertEqual(g["2"]["inputs"]["target_text"], "hi")
 
+    CLONE_SCHEMA = {"VoiceCloneNode": {"input": {
+        "required": {"target_text": ["STRING", {"default": ""}],
+                     "model_choice": [["0.6B", "1.7B"], {"default": "0.6B"}]},
+        "optional": {"ref_audio": ["AUDIO"],
+                     "ref_text": ["STRING", {"default": ""}],
+                     "x_vector_only": ["BOOLEAN", {"default": False}]}}},
+        "LoadAudio": {"input": {"required": {
+            "audio": [["ref.wav"], {"audio_upload": True}]}}}, **SAVE}
+
+    def test_a_clone_with_no_transcript_clones_from_the_sound_alone(self):
+        # The node's default mode refuses a line outright without the words
+        # spoken in the clip — "ref_text is required when
+        # x_vector_only_mode=False" — and the page never said the box was
+        # required, so every clone left blank failed.
+        for blank in ("", "   ", None):
+            with self.subTest(ref_text=blank):
+                ins = client_for(self.CLONE_SCHEMA).build_line(
+                    {"text": "hi"},
+                    {"kind": "clone", "ref_audio": "ref.wav",
+                     "ref_text": blank}, OPTS)["prompt"]["2"]["inputs"]
+                self.assertIs(ins["x_vector_only"], True)
+
+    def test_a_clone_with_a_transcript_keeps_the_closer_copy(self):
+        ins = client_for(self.CLONE_SCHEMA).build_line(
+            {"text": "hi"},
+            {"kind": "clone", "ref_audio": "ref.wav", "ref_text": " spoken "},
+            OPTS)["prompt"]["2"]["inputs"]
+        self.assertIs(ins["x_vector_only"], False)
+        self.assertEqual(ins["ref_text"], "spoken")
+
     def test_a_clone_with_no_reference_audio_says_so(self):
         schema = {"VoiceCloneNode": {"input": {"required": {
             "ref_audio": ["AUDIO"],
@@ -677,6 +731,608 @@ class WhenTheCardIsFull(unittest.TestCase):
         with mock.patch.object(server, "engine_online", return_value=True), \
              mock.patch.object(server, "for_engine", return_value=Dead()):
             self.assertEqual(server.free_the_card("qwen"), [])
+
+
+class TheDesignPanelSaysWhatIsThere(unittest.TestCase):
+    """The Design panel told everyone "Needs the 1.7B VoiceDesign model",
+    with nothing to press — on a machine that had it, that read as a fault.
+    /api/voices now says which model a designed voice loads and whether it
+    is on disk, per engine."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="sb-design-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        patch = mock.patch.object(server, "cfg", split_cfg(self.root))
+        patch.start()
+        self.addCleanup(patch.stop)
+        vram = mock.patch.object(server, "gpu_vram", return_value=8188)
+        vram.start()
+        self.addCleanup(vram.stop)
+
+    def _have(self, engine, repo):
+        base = bootstrap.engine_models_dir(server.cfg, engine)
+        d = bootstrap.model_dir(base, repo, engine)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "model.safetensors").write_text("w")
+
+    def test_each_engine_names_its_own_design_model(self):
+        self.assertEqual(server.design_model("qwen")["repo"],
+                         "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+        self.assertEqual(server.design_model("moss")["repo"],
+                         "OpenMOSS-Team/MOSS-VoiceGenerator")
+
+    def test_absent_until_its_weights_are_on_disk(self):
+        self.assertIs(server.design_model("qwen")["installed"], False)
+        self._have("qwen", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+        self.assertIs(server.design_model("qwen")["installed"], True)
+        # And the other engine's copy is not this one's.
+        self.assertIs(server.design_model("moss")["installed"], False)
+
+    def test_no_models_folder_is_unknown_not_missing(self):
+        server.cfg["engines"]["qwen"]["models_dir"] = str(self.root / "nowhere")
+        self.assertIsNone(server.design_model("qwen")["installed"])
+
+    def test_it_fits_an_8_gb_card(self):
+        self.assertIs(server.design_model("qwen")["fits"], True)
+
+
+class TheQwenNodeKeepsItsModel(unittest.TestCase):
+    """The Qwen node resolves "auto" to a real attention, caches the model
+    under that, and before each line compares it with what it was asked for.
+    Asked for "auto", the two never match and every line reloads the model —
+    so the app asks by the name the node's get_attention_implementation would
+    arrive at, mirrored here case for case."""
+
+    def test_auto_names_what_the_node_would_pick(self):
+        cases = [({"major": 8, "have": []}, "sdpa"),
+                 ({"major": 8, "have": ["flash_attn"]}, "flash_attn"),
+                 ({"major": 9, "have": ["sage_attn", "flash_attn"]},
+                  "sage_attn"),
+                 ({"major": 7, "have": ["flash_attn"]}, "eager"),
+                 ({"major": None, "have": []}, "sdpa"),
+                 ({}, "sdpa")]
+        for found, want in cases:
+            with self.subTest(found=found):
+                self.assertEqual(bootstrap.qwen_attention("auto", found), want)
+
+    def test_a_choice_the_node_cannot_honour_is_sent_as_its_fallback(self):
+        # Asked for flash_attn it does not have, the node falls back to sdpa
+        # and stores that — so asking for flash_attn again reloads each line.
+        self.assertEqual(bootstrap.qwen_attention(
+            "flash_attn", {"major": 8, "have": []}), "sdpa")
+        self.assertEqual(bootstrap.qwen_attention(
+            "sdpa", {"major": 7, "have": []}), "eager")
+        self.assertEqual(bootstrap.qwen_attention(
+            "eager", {"major": 8, "have": []}), "eager")
+
+    def test_the_probe_runs_in_the_engine_s_own_interpreter(self):
+        bootstrap.forget_torch_health()
+        self.addCleanup(bootstrap.forget_torch_health)
+        found = bootstrap.attention_support(sys.executable)
+        self.assertIn("have", found)
+        self.assertEqual(bootstrap.attention_support(""), {})
+
+
+class OneModelLoadPerTake(unittest.TestCase):
+    """Both node packs hold one checkpoint at a time, so on an 8 GB card the
+    order lines are spoken in decides how many times a model is read from
+    disk, and the unload switch decides whether it happens on every line."""
+
+    class Recorder:
+        """Stands in for a ComfyClient: builds nothing, remembers everything."""
+
+        def __init__(self, root: Path):
+            self.root, self.calls, self.n = root, [], 0
+
+        def build_line(self, line, voice, opts):
+            self.calls.append({"text": line["text"],
+                               "weights": comfy.ComfyClient.line_weights(
+                                   voice, opts),
+                               "unload": opts["unload"],
+                               "attention": opts.get("attention")})
+            return {"prompt": {}}
+
+        def queue(self, prompt):
+            self.n += 1
+            return f"p{self.n}"
+
+        def result(self, prompt_id):
+            clip = make_clip(self.root / f"{prompt_id}.wav")
+            return [{"filename": clip.name}], None
+
+        def view(self, item):
+            resp = mock.MagicMock()
+            resp.__enter__.return_value = resp
+            resp.iter_content.return_value = [
+                (self.root / item["filename"]).read_bytes()]
+            return resp
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.client = self.Recorder(self.dir)
+        for target, value in (("for_engine", lambda *_: self.client),
+                              ("TAKES_DIR", self.dir / "takes"),
+                              ("TAKES_PATH", self.dir / "takes.json")):
+            patcher = mock.patch.object(server, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_take(self, speakers, lines, **extra):
+        job = f"job{len(server.jobs)}"
+        server.jobs[job] = {"status": "running"}
+        self.addCleanup(server.jobs.pop, job, None)
+        server.run_job(job, dict({"engine": "qwen", "model": "0.6B",
+                                  "pause": 0.1, "speakers": speakers,
+                                  "lines": [{"speaker": k, "text": t}
+                                            for k, t in lines]}, **extra))
+        return server.jobs[job]
+
+    DIALOGUE = [("1", "a1"), ("2", "b1"), ("1", "a2"), ("2", "b2"),
+                ("1", "a3")]
+    MIXED = {"1": {"name": "Ann", "kind": "preset", "speaker": "Aiden"},
+             "2": {"name": "Bo", "kind": "clone", "ref_audio": "bo.wav"}}
+
+    def test_the_qwen_node_is_asked_for_attention_by_the_name_it_keeps(self):
+        # "Attention changed from 'sdpa' to 'auto', clearing cache…" on every
+        # line: the node stores the attention it resolved and compares the
+        # one it was asked for, so "auto" reloaded the model per line.
+        with mock.patch.object(bootstrap, "attention_support",
+                               return_value={"major": 8, "have": []}):
+            job = self.run_take(self.MIXED, self.DIALOGUE[:2],
+                                attention="auto")
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertEqual({c["attention"] for c in self.client.calls},
+                         {"sdpa"})
+
+    def test_a_take_records_when_it_finished(self):
+        # /api/jobs keeps a finished job listed by this, not by when it began.
+        before = time.time()
+        job = self.run_take(self.MIXED, self.DIALOGUE[:2])
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertGreaterEqual(job.get("finished", 0), before)
+
+    def test_a_preset_answering_a_clone_loads_each_model_once(self):
+        # Spoken in script order this swapped CustomVoice for Base on every
+        # line: five lines, five loads from disk.
+        job = self.run_take(self.MIXED, self.DIALOGUE)
+        self.assertEqual(job["status"], "done", job.get("error"))
+        weights = [c["weights"] for c in self.client.calls]
+        swaps = sum(1 for a, b in zip(weights, weights[1:]) if a != b)
+        self.assertEqual(swaps, 1)
+        self.assertEqual([c["text"] for c in self.client.calls],
+                         ["a1", "a2", "a3", "b1", "b2"])
+
+    def test_the_take_is_still_joined_in_script_order(self):
+        job = self.run_take(self.MIXED, self.DIALOGUE)
+        lines = job["take"]["lines"]
+        self.assertEqual([ln["text"] for ln in lines],
+                         [t for _, t in self.DIALOGUE])
+        self.assertEqual([ln["index"] for ln in lines], list(range(5)))
+        self.assertEqual(lines[1]["file"], "line_001.wav")
+
+    def test_free_memory_is_asked_for_once_after_the_last_line(self):
+        # Sent with every line it unloaded the model after each one, and the
+        # next line read it back from disk.
+        self.run_take(self.MIXED, self.DIALOGUE, unload=True)
+        self.assertEqual([c["unload"] for c in self.client.calls],
+                         [False] * 4 + [True])
+
+    def test_with_the_switch_off_nothing_is_unloaded(self):
+        self.run_take(self.MIXED, self.DIALOGUE, unload=False)
+        self.assertFalse(any(c["unload"] for c in self.client.calls))
+
+    def test_one_voice_keeps_script_order(self):
+        both = {"1": self.MIXED["1"], "2": dict(self.MIXED["1"], name="Cy")}
+        self.run_take(both, self.DIALOGUE)
+        self.assertEqual([c["text"] for c in self.client.calls],
+                         [t for _, t in self.DIALOGUE])
+
+    def test_the_weights_follow_what_each_builder_loads(self):
+        w = comfy.ComfyClient.line_weights
+        qwen = {"engine": "qwen", "model": "0.6B"}
+        self.assertNotEqual(w({"kind": "preset"}, qwen),
+                            w({"kind": "clone"}, qwen))
+        # A designed voice is always the 1.7B, whatever the picker says.
+        self.assertEqual(w({"kind": "design"}, qwen),
+                         w({"kind": "design"}, dict(qwen, model="1.7B")))
+        moss = {"engine": "moss", "moss_model": comfy.MOSS_DEFAULT_MODEL}
+        # MOSS clones and speaks in its own voice on one loader.
+        self.assertEqual(w({"kind": "preset"}, moss),
+                         w({"kind": "clone"}, moss))
+        self.assertEqual(w({"kind": "design"}, moss),
+                         ("moss", comfy.MOSS_VOICE_GENERATOR))
+
+
+class TheNamesComfyUIKnowsTheNodesBy(unittest.TestCase):
+    """ComfyUI registers a node under its NODE_CLASS_MAPPINGS key, and the
+    Qwen pack keys them FB_Qwen3TTS*. Asking for the Python class names found
+    no Qwen node on any real install, so the engine never read as ready."""
+
+    REAL = {"FB_Qwen3TTSCustomVoice": custom_voice(), **SAVE}
+
+    def test_the_registered_name_is_found(self):
+        c = client_for(self.REAL)
+        self.assertTrue(c.engine_ready("qwen"))
+        self.assertEqual(c.speakers(), ["Aiden", "Serena"])
+        self.assertTrue(c.capabilities("qwen")["preset"])
+
+    def test_the_graph_names_the_node_as_ComfyUI_registered_it(self):
+        g = client_for(self.REAL).build_line(
+            {"text": "hi"}, {"kind": "preset", "speaker": "Aiden"}, OPTS)
+        self.assertEqual(g["prompt"]["2"]["class_type"],
+                         "FB_Qwen3TTSCustomVoice")
+
+    def test_an_older_pack_s_names_still_work(self):
+        for name in ("Qwen3TTSCustomVoice", "CustomVoiceNode"):
+            c = client_for({name: custom_voice(), **SAVE})
+            self.assertTrue(c.engine_ready("qwen"), name)
+            g = c.build_line({"text": "hi"}, {"kind": "preset"}, OPTS)
+            self.assertEqual(g["prompt"]["2"]["class_type"], name)
+
+    def test_the_stand_in_uses_the_real_names(self):
+        # The suite passed for months against a mock that used the class
+        # names, which is how the fault shipped.
+        src = (REPO / "tests" / "mock_comfy.py").read_text(encoding="utf-8")
+        self.assertIn('"FB_Qwen3TTSCustomVoice": _node(', src)
+        self.assertNotIn('"CustomVoiceNode": _node(', src)
+
+
+class PipesAreUtf8(unittest.TestCase):
+    """Windows hands a piped Python the ANSI code page with strict errors, and
+    the Qwen pack prints an emoji as it imports: IMPORT FAILED, but only when
+    this app started ComfyUI."""
+
+    def test_a_child_on_a_cp1252_console_can_still_print_an_emoji(self):
+        env = dict(os.environ, PYTHONIOENCODING="cp1252")
+        env.pop("PYTHONUTF8", None)
+        out = bootstrap._run([sys.executable, "-c",
+                              "print('\u2705 ComfyUI-Qwen-TTS loaded')"],
+                             env=env, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("\u2705", out.stdout)
+
+    def test_the_engine_is_launched_with_utf8(self):
+        env = bootstrap.py_env({"PYTHONIOENCODING": "cp1252"})
+        self.assertEqual(env["PYTHONIOENCODING"], "utf-8")
+        self.assertEqual(env["PYTHONUTF8"], "1")
+
+
+class TakesJoinFromFlac(unittest.TestCase):
+    """Current ComfyUI's SaveAudioAdvanced offers flac, mp3 and opus as a
+    DynamicCombo and never wav, so every take used to arrive as a zip."""
+
+    V3_SAVE = {"SaveAudioAdvanced": {"input": {"required": {
+        "audio": ["AUDIO"],
+        "filename_prefix": ["STRING", {"default": "audio/ComfyUI"}],
+        "format": ["COMFY_DYNAMICCOMBO_V3", {"options": [
+            {"key": "flac", "inputs": {}},
+            {"key": "mp3", "inputs": {"required": {"quality": [
+                ["V0", "128k", "320k"], {"default": "V0"}]}}},
+            {"key": "opus", "inputs": {}}]}]}}}}
+
+    def test_a_dynamic_combo_is_read_as_its_keys(self):
+        c = client_for(self.V3_SAVE)
+        self.assertEqual(c._enum("SaveAudioAdvanced", "format"),
+                         ["flac", "mp3", "opus"])
+        self.assertEqual(c.save_node(), ("SaveAudioAdvanced", "flac"))
+
+    def test_lossless_is_picked_over_whatever_comes_first(self):
+        schema = copy.deepcopy(self.V3_SAVE)
+        opts = schema["SaveAudioAdvanced"]["input"]["required"]["format"][1]
+        opts["options"].reverse()
+        self.assertEqual(client_for(schema).save_node()[1], "flac")
+
+    def test_no_interpreter_leaves_the_clips_for_the_zip(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        clip = d / "line_000.flac"
+        clip.write_bytes(b"fLaC")
+        with mock.patch.object(bootstrap, "comfy_python", lambda *_: ""):
+            self.assertEqual(server.to_wav([clip], "qwen"), [clip])
+        self.assertTrue(clip.exists())
+
+    def test_a_failed_conversion_leaves_nothing_half_done(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        clip = d / "line_000.flac"
+        clip.write_bytes(b"not audio")
+        with mock.patch.object(bootstrap, "comfy_python",
+                               lambda *_: sys.executable):
+            self.assertEqual(server.to_wav([clip], "qwen"), [clip])
+        self.assertEqual(sorted(p.name for p in d.iterdir()),
+                         ["line_000.flac"])
+
+    def test_flac_as_ComfyUI_writes_it_comes_back_frame_exact(self):
+        try:
+            import av  # noqa: F401
+            import numpy as np
+        except ImportError:
+            self.skipTest("PyAV is ComfyUI's, not this app's")
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        clips = []
+        for i, (rate, chans) in enumerate([(24000, 1), (24000, 1)]):
+            # AudioSaveHelper.save_audio, as ComfyUI does it: float frames in.
+            wav = np.sin(np.arange(rate) * 0.05)[None].repeat(chans, 0) * 0.5
+            buf = io.BytesIO()
+            with av.open(buf, mode="w", format="flac") as out:
+                stream = out.add_stream("flac", rate=rate, layout="mono")
+                frame = av.AudioFrame.from_ndarray(
+                    wav.T.reshape(1, -1).astype(np.float32), format="flt",
+                    layout="mono")
+                frame.sample_rate, frame.pts = rate, 0
+                out.mux(stream.encode(frame))
+                out.mux(stream.encode(None))
+            clip = d / f"line_{i:03d}.flac"
+            clip.write_bytes(buf.getvalue())
+            clips.append(clip)
+        with mock.patch.object(bootstrap, "comfy_python",
+                               lambda *_: sys.executable):
+            wavs = server.to_wav(clips, "qwen")
+        self.assertEqual([w.suffix for w in wavs], [".wav", ".wav"])
+        self.assertFalse(any(c.exists() for c in clips))
+        with wave.open(str(wavs[0]), "rb") as w:
+            self.assertEqual((w.getnchannels(), w.getframerate(),
+                              w.getnframes()), (1, 24000, 24000))
+        self.assertTrue(server.stitch_wavs(wavs, d / "take.wav", 0.5))
+
+
+class JobsKeepToThemselves(unittest.TestCase):
+    """A take, a Stop and an engine switch each touched more than their own."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.client = mock.MagicMock()
+        for target, value in (("for_engine", lambda *_: self.client),
+                              ("REFS_DIR", self.dir / "refs"),
+                              ("engine_online", lambda *_: True)):
+            patcher = mock.patch.object(server, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.saved_jobs = dict(server.jobs)
+        server.jobs.clear()
+        self.addCleanup(lambda: (server.jobs.clear(),
+                                 server.jobs.update(self.saved_jobs)))
+        self.app = server.app.test_client()
+
+    def test_a_take_longer_than_three_minutes_is_still_seen_to_finish(self):
+        # Listed by when it was created, a take that ran past the window left
+        # /api/jobs the instant it finished: no "Take ready", no error, a Read
+        # button disabled for good over a take that was sitting on disk.
+        now = time.time()
+        server.jobs["long"] = {"id": "long", "status": "done",
+                               "created": now - 600, "finished": now - 1}
+        server.jobs["stale"] = {"id": "stale", "status": "error",
+                                "created": now - 900, "finished": now - 600}
+        listed = {j["id"] for j in self.app.get("/api/jobs").get_json()}
+        self.assertEqual(listed, {"long"})
+        # And the one the page is waiting on is listed however old it is.
+        mine = {j["id"] for j in
+                self.app.get("/api/jobs?id=stale").get_json()}
+        self.assertEqual(mine, {"long", "stale"})
+
+    def test_stop_after_a_take_has_finished_interrupts_nothing(self):
+        # The player's Stop sends the last job's id, and this used to stop
+        # whatever the engine was doing — a self-test, a preview — regardless.
+        server.jobs["old"] = {"id": "old", "status": "done", "engine": "qwen",
+                              "prompt_id": "p1"}
+        r = self.app.post("/api/jobs/old/cancel")
+        self.assertFalse(r.get_json()["running"])
+        self.client.interrupt.assert_not_called()
+
+    def test_stop_on_a_running_take_interrupts_its_own_prompt(self):
+        server.jobs["now"] = {"id": "now", "status": "running",
+                              "engine": "moss", "prompt_id": "p9"}
+        self.app.post("/api/jobs/now/cancel")
+        self.client.interrupt.assert_called_once_with("p9")
+        self.assertTrue(server.jobs["now"]["cancelled"])
+
+    def test_switching_engines_mid_take_leaves_the_take_s_engine_running(self):
+        server.jobs["t"] = {"id": "t", "status": "running", "engine": "qwen",
+                            "title": "Chapter one"}
+        with mock.patch.dict(server.cfg, {"run_both_engines": False}), \
+                mock.patch.object(server.PROCS["qwen"], "stop") as stop:
+            why = server.activate("moss")
+        self.assertIn("Chapter one", why)
+        stop.assert_not_called()
+
+    def test_with_room_for_both_a_take_does_not_block_a_switch(self):
+        server.jobs["t"] = {"id": "t", "status": "running", "engine": "qwen"}
+        with mock.patch.dict(server.cfg, {"run_both_engines": True}):
+            self.assertEqual(server.busy_elsewhere("moss"), "")
+
+    def test_a_reference_is_kept_by_its_contents(self):
+        # Uploaded by file name with overwrite on, two speakers' own
+        # "recording.wav" became one voice.
+        names = []
+        for body in (b"RIFF-one", b"RIFF-two"):
+            r = self.app.post("/api/upload-reference", data={
+                "file": (io.BytesIO(body), "recording.wav")},
+                content_type="multipart/form-data")
+            names.append(r.get_json()["name"])
+        self.assertNotEqual(names[0], names[1])
+        self.assertTrue(all(n.endswith(".wav") for n in names))
+        self.assertTrue((self.dir / "refs" / names[0]).is_file())
+
+    def test_the_engine_that_speaks_the_line_is_sent_the_clip(self):
+        # Each engine is its own ComfyUI with its own input folder: a clip
+        # uploaded while Qwen was showing did not exist for MOSS.
+        r = self.app.post("/api/upload-reference", data={
+            "file": (io.BytesIO(b"RIFF-voice"), "me.wav")},
+            content_type="multipart/form-data")
+        name = r.get_json()["name"]
+        self.client.reset_mock()
+        server.ensure_reference("moss", name)
+        self.client.upload_bytes.assert_called_once()
+        self.assertEqual(self.client.upload_bytes.call_args[0][:2],
+                         (name, b"RIFF-voice"))
+
+    def test_a_pause_of_nothing_is_nothing(self):
+        clip = self.dir / "c.wav"
+        make_clip(clip)
+        self.client.build_line.return_value = {"prompt": {}}
+        self.client.queue.return_value = "p"
+        self.client.result.return_value = ([{"filename": "c.wav"}], None)
+        resp = mock.MagicMock()
+        resp.__enter__.return_value = resp
+        resp.iter_content.return_value = [clip.read_bytes()]
+        self.client.view.return_value = resp
+        server.jobs["z"] = {"id": "z", "status": "running"}
+        with mock.patch.object(server, "TAKES_DIR", self.dir / "takes"), \
+                mock.patch.object(server, "TAKES_PATH",
+                                  self.dir / "takes.json"):
+            server.run_job("z", {"engine": "qwen", "pause": 0,
+                                 "speakers": {"1": {"kind": "preset"}},
+                                 "lines": [{"speaker": 1, "text": "a"},
+                                           {"speaker": 1, "text": "b"}]})
+        take = server.jobs["z"]["take"]
+        self.assertEqual(take["pause"], 0.0)
+        with wave.open(str(self.dir / "takes" / take["id"] / "take.wav")) as w:
+            self.assertEqual(w.getnframes(), 4000)
+
+
+class EngineHousekeeping(unittest.TestCase):
+    """Small readings of the engine that were each wrong on a real machine."""
+
+    def test_a_relative_main_py_names_no_folder(self):
+        # Started as "python main.py" from its own folder, or "ComfyUI\\main.py"
+        # by a portable .bat: resolved against this app's folder, either named
+        # a ComfyUI that does not exist, and our own engine read as foreign.
+        self.assertEqual(comfy.root_from_argv(["main.py", "--port", "8188"]),
+                         "")
+        self.assertEqual(comfy.root_from_argv(["ComfyUI\\main.py"]), "")
+        self.assertEqual(comfy.root_from_argv(["/opt/ComfyUI/main.py"]),
+                         "/opt/ComfyUI")
+        self.assertEqual(comfy.root_from_argv(["D:\\AI\\ComfyUI\\main.py"]),
+                         "D:\\AI\\ComfyUI")
+
+    def test_this_app_s_own_environment_is_never_an_engine_s(self):
+        # A managed install sits beside the launcher, so <parent>/.venv is
+        # Script Builder's Flask venv — which won whenever the engine's own
+        # environment had no torch in it.
+        comfy_dir = bootstrap.APP_DIR / "ComfyUI-Qwen3-TTS"
+        cands = [bootstrap._env_root(c)
+                 for c in bootstrap._interpreters(comfy_dir)]
+        self.assertNotIn((bootstrap.APP_DIR / ".venv").resolve(), cands)
+        self.assertIn(bootstrap._env_root(bootstrap.venv_python(comfy_dir)),
+                      cands)
+
+    def test_windows_reads_a_command_line_without_wmic(self):
+        # WMIC is gone from Windows 11 25H2; an empty answer waved the
+        # not-a-ComfyUI guard through.
+        calls = []
+
+        def run(cmd, **_):
+            calls.append(cmd[0])
+            return subprocess.CompletedProcess(
+                cmd, 0, "C:\\py\\python.exe main.py --port 8188\r\n", "")
+        with mock.patch.object(bootstrap.platform, "system",
+                               return_value="Windows"), \
+                mock.patch.object(bootstrap, "_run", side_effect=run):
+            self.assertIn("main.py", bootstrap.pid_cmdline(42))
+        self.assertEqual(calls, ["powershell"])
+
+    def test_an_unreadable_command_line_is_not_closed(self):
+        no_manager = mock.Mock(status_code=404)
+        with mock.patch.object(server.requests, "post",
+                               return_value=no_manager), \
+                mock.patch.object(server, "comfy_online", return_value=True), \
+                mock.patch.object(bootstrap, "port_pids", return_value=[77]), \
+                mock.patch.object(bootstrap, "pid_cmdline", return_value=""), \
+                mock.patch.object(bootstrap, "kill_pid") as kill, \
+                mock.patch.object(server.time, "sleep"):
+            how, advice = server.take_over_port("http://127.0.0.1:1", 1,
+                                                "qwen")
+        self.assertIsNone(how)
+        self.assertIn("cannot be read", advice)
+        kill.assert_not_called()
+
+    def test_versions_compare_as_numbers(self):
+        v = manager.version_tuple
+        self.assertLess(v("4.9.0"), (4, 40))       # "4.9" >= "4.40" as text
+        self.assertGreaterEqual(v("4.57.3"), (4, 40))
+        self.assertEqual(v("5.0.0rc1"), (5, 0, 0))
+        self.assertEqual(v("4.57.3.dev0")[:3], (4, 57, 3))
+
+    def test_the_console_answers_since_a_mark_after_it_trims_itself(self):
+        # The self-test sliced the buffer by its old length; once it trimmed,
+        # nothing was "new", and a run that downloaded passed as offline.
+        proc = bootstrap.ComfyProcess()
+        for i in range(1500):
+            proc.note(f"old {i}")
+        mark = proc.written
+        for i in range(599):
+            proc.note(f"new {i}")
+        proc.note("Downloading model.safetensors from huggingface")
+        fresh = proc.since(mark)
+        self.assertEqual(len(fresh), 600)
+        self.assertIn("huggingface", fresh[-1])
+        self.assertTrue(all("new" in l or "huggingface" in l for l in fresh))
+
+
+class TorchIsDownloadedOnce(unittest.TestCase):
+    """ComfyUI's requirements name torch. Installed before the build asked
+    for, pip fetched PyPI's — the CPU wheel on Windows, 3 GB of CUDA wheels on
+    a Linux box with no NVIDIA card — only to swap it out straight after."""
+
+    def test_the_requested_build_goes_in_before_the_requirements(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        cfg = split_cfg(root)
+        slot = bootstrap.engine_cfg(cfg, "qwen")
+        slot["managed"] = True
+        comfy_dir = Path(slot["comfy_dir"])
+        (comfy_dir / "requirements.txt").write_text("torch\n")
+        vpy = bootstrap.venv_python(comfy_dir)
+        vpy.parent.mkdir(parents=True)
+        vpy.write_text("")
+        order = []
+        with mock.patch.object(bootstrap, "pip_install",
+                               side_effect=lambda py, args, *a, **k:
+                               order.append(" ".join(args))), \
+                mock.patch.object(bootstrap, "install_requested_torch",
+                                  side_effect=lambda *a, **k:
+                                  order.append("TORCH")), \
+                mock.patch.object(bootstrap, "portable_python",
+                                  return_value=None):
+            bootstrap._setup_one(cfg, bootstrap.Progress(), "qwen", "deps",
+                                 {}, sys.executable, "managed", {})
+        reqs = next(i for i, o in enumerate(order)
+                    if o.endswith(str(comfy_dir / "requirements.txt")))
+        self.assertIn("TORCH", order[:reqs])
+        self.assertEqual(order[-1], "TORCH")   # and still checked last
+
+
+class ALineThatSavedNothing(unittest.TestCase):
+    """A prompt ComfyUI finished with no audio was waited on for the whole
+    fifteen-minute timeout, because nothing was ever going to arrive."""
+
+    def client_with(self, hist):
+        c = comfy.ComfyClient()
+        c.history = lambda _pid: hist
+        return c
+
+    def test_finished_without_audio_is_an_error(self):
+        outs, err = self.client_with({
+            "status": {"status_str": "success", "completed": True},
+            "outputs": {}}).result("p")
+        self.assertEqual(outs, [])
+        self.assertIn("saved no audio", err)
+
+    def test_still_running_is_not(self):
+        self.assertEqual(self.client_with({
+            "status": {"status_str": "running", "completed": False},
+            "outputs": {}}).result("p"), ([], None))
+
+    def test_the_node_s_own_error_comes_first(self):
+        _, err = self.client_with({"status": {
+            "status_str": "error", "completed": False,
+            "messages": [["execution_error", {
+                "node_type": "VoiceCloneNode",
+                "exception_message": "CUDA out of memory"}]]}}).result("p")
+        self.assertEqual(err, "VoiceCloneNode: CUDA out of memory")
 
 
 class WhyTheNodesDidNotLoad(unittest.TestCase):
@@ -1049,41 +1705,696 @@ class GpuDetection(unittest.TestCase):
         self.assertIn("Pick the NVIDIA build above", text)
 
 
+def torch_info(version: str, cuda: str | None = None) -> dict:
+    """What bootstrap.installed_torch reports for a wheel."""
+    return {"version": version, "cuda": cuda, "hip": None, "xpu": None}
+
+
+RTX_4060 = {"name": "NVIDIA GeForce RTX 4060", "driver": True, "vram_mb": 8188}
+NO_GPU = {"name": "", "driver": False, "vram_mb": 0}
+
+
 class TorchReinstall(unittest.TestCase):
     """pip counts torch 2.14.0+cpu as satisfying `torch`, so Reinstall against
     the CUDA index changed nothing at all."""
 
-    def _attempt(self, installed, index):
+    def _attempt(self, installed, index, code=0, said="", offered=True):
         calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            if "index" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0 if offered else 1, "",
+                    "" if offered else "ERROR: No matching distribution "
+                                       "found for torch")
+            return subprocess.CompletedProcess(cmd, code, "", said)
+
         with mock.patch.object(bootstrap, "installed_torch",
                                return_value=installed), \
-             mock.patch.object(bootstrap, "_run",
-                               side_effect=lambda cmd, **kw: calls.append(cmd)
-                               or subprocess.CompletedProcess(cmd, 0, "", "")):
+             mock.patch.object(bootstrap, "_run", side_effect=run):
             dropped = bootstrap.drop_mismatched_torch("py", index, lambda _m: None)
-        return dropped, calls
+        return dropped, [c for c in calls if "index" not in c]
 
     def test_a_cpu_build_is_removed_before_the_cuda_one_lands(self):
-        dropped, calls = self._attempt("2.14.0+cpu", bootstrap.CUDA_INDEX)
+        dropped, calls = self._attempt(torch_info("2.14.0+cpu"),
+                                       bootstrap.CUDA_INDEX)
         self.assertTrue(dropped)
-        self.assertTrue(any("uninstall" in c for c in calls[0]))
+        self.assertTrue(any("uninstall" in c for c in calls))
 
     def test_a_matching_build_is_left_alone(self):
-        dropped, calls = self._attempt("2.14.0+cu128", bootstrap.CUDA_INDEX)
+        dropped, calls = self._attempt(torch_info("2.14.0+cu128", "12.8"),
+                                       bootstrap.CUDA_INDEX)
         self.assertFalse(dropped)
         self.assertEqual(calls, [])
 
-    def test_an_untagged_wheel_is_not_reinstalled_on_a_guess(self):
-        # Plain PyPI wheels carry no +tag; which build they are depends on the
-        # platform, so there is nothing to compare and nothing to do.
-        dropped, calls = self._attempt("2.14.0", bootstrap.CUDA_INDEX)
+    def test_pypis_untagged_cpu_wheel_is_removed_too(self):
+        # The Windows wheel from PyPI is the CPU build and says so nowhere in
+        # its version. "No tag, nothing to compare" left it in place through
+        # every Reinstall on a machine with an RTX 4060, and ComfyUI died on
+        # "Torch not compiled with CUDA enabled" at every start.
+        dropped, calls = self._attempt(torch_info("2.14.0"),
+                                       bootstrap.CUDA_INDEX)
+        self.assertTrue(dropped)
+        self.assertTrue(any("uninstall" in c for c in calls))
+
+    def test_an_untagged_cuda_wheel_is_not_reinstalled_over_a_minor_version(self):
+        # PyPI's Linux wheel is a CUDA build with no tag. It drives the card;
+        # 3 GB is not worth trading cu126 for cu128.
+        dropped, calls = self._attempt(torch_info("2.14.0", "12.6"),
+                                       bootstrap.CUDA_INDEX)
         self.assertFalse(dropped)
         self.assertEqual(calls, [])
+
+    def test_the_silent_uninstall_says_what_it_is(self):
+        # pip prints nothing while it deletes thousands of files; on Windows
+        # that is a minute or more of a button that looks stuck.
+        said = []
+        with mock.patch.object(bootstrap, "installed_torch",
+                               return_value=torch_info("2.14.0+cpu")), \
+             mock.patch.object(bootstrap, "_run", return_value=
+                               subprocess.CompletedProcess([], 0, "", "")):
+            bootstrap.drop_mismatched_torch(
+                "py", bootstrap.CUDA_INDEX, lambda _m: None,
+                lambda text, pct: said.append((text, pct)))
+        self.assertEqual(said[-1], ("Removing torch 2.14.0+cpu (the cpu "
+                                    "build) first…", None))
+
+    def test_nothing_is_removed_until_the_index_has_a_replacement(self):
+        # Uninstall first, find out at the download: an environment with no
+        # torch at all, worse than the CPU build it replaced.
+        calls = []
+        with mock.patch.object(bootstrap, "installed_torch",
+                               return_value=torch_info("2.14.0+cpu")), \
+             mock.patch.object(bootstrap, "_run", side_effect=lambda cmd, **kw:
+                               calls.append(cmd) or subprocess.CompletedProcess(
+                                   cmd, 1, "", "ERROR: No matching "
+                                               "distribution found for torch")):
+            with self.assertRaises(RuntimeError) as caught:
+                bootstrap.drop_mismatched_torch("py", bootstrap.CUDA_INDEX,
+                                                lambda _m: None)
+        self.assertFalse(any("uninstall" in c for c in calls),
+                         "it removed torch with nothing to replace it")
+        self.assertIn("left in place", str(caught.exception))
+        self.assertIn("No matching distribution", str(caught.exception))
+
+    def test_an_index_that_cannot_be_asked_does_not_block_the_install(self):
+        # pip too old for `pip index`: that is not an answer, so no refusal.
+        with mock.patch.object(bootstrap, "_run", return_value=
+                               subprocess.CompletedProcess(
+                                   [], 1, "", 'ERROR: unknown command "index"')):
+            self.assertEqual(bootstrap.index_lacks_torch(
+                "py", bootstrap.CUDA_INDEX), "")
+
+    def test_a_cuda_build_is_removed_when_the_cpu_one_is_asked_for(self):
+        dropped, _ = self._attempt(torch_info("2.14.0", "12.8"),
+                                   bootstrap.CPU_INDEX)
+        self.assertTrue(dropped)
 
     def test_nothing_is_removed_when_no_torch_is_there(self):
-        dropped, calls = self._attempt("", bootstrap.CUDA_INDEX)
+        dropped, calls = self._attempt({}, bootstrap.CUDA_INDEX)
         self.assertFalse(dropped)
         self.assertEqual(calls, [])
+
+    def test_an_uninstall_that_fails_stops_there_and_says_why(self):
+        # It used to log and carry on: pip then found the old build still in
+        # place, called the request satisfied, and the task said "PyTorch
+        # installed" over the build it had failed to remove.
+        with self.assertRaises(RuntimeError) as caught:
+            self._attempt(torch_info("2.14.0+cpu"), bootstrap.CUDA_INDEX,
+                          code=1, said="ERROR: [WinError 5] Access is denied: "
+                                       "'torch\\lib\\c10.dll'")
+        self.assertIn("Access is denied", str(caught.exception))
+        self.assertIn("Close it", str(caught.exception))
+
+    def _install(self, after, index=bootstrap.CUDA_INDEX):
+        calls = []
+        seen = iter([after])
+        with mock.patch.object(bootstrap, "torch_index", return_value=index), \
+             mock.patch.object(bootstrap, "nvidia_gpu", return_value=RTX_4060), \
+             mock.patch.object(bootstrap, "drop_mismatched_torch",
+                               side_effect=lambda *a: calls.append("drop")), \
+             mock.patch.object(bootstrap, "installed_torch",
+                               side_effect=lambda _py: next(seen)), \
+             mock.patch.object(bootstrap, "pip_install",
+                               side_effect=lambda _py, args, *_a:
+                               calls.append(args)):
+            bootstrap.install_requested_torch("py", {}, lambda _m: None)
+        return calls
+
+    def test_the_selected_build_is_the_last_dependency_installed(self):
+        calls = self._install(torch_info("2.10.0+cu128", "12.8"))
+        # torchvision rides along: the drop takes it out, ComfyUI needs it,
+        # and it has to match the torch it was built against.
+        self.assertEqual(calls, ["drop", [
+            "torch", "torchvision", "torchaudio",
+            "--index-url", bootstrap.CUDA_INDEX]])
+
+    def test_a_build_pip_left_in_place_fails_the_install(self):
+        # "PyTorch installed" over a CPU build is the report that sent someone
+        # to restart an engine that could only ever stop as it started.
+        with self.assertRaises(RuntimeError) as caught:
+            self._install(torch_info("2.14.0"))
+        self.assertIn("still", str(caught.exception))
+        self.assertIn("cu128", str(caught.exception))
+
+
+class WhenAnInstallFails(unittest.TestCase):
+    """Reinstall looked as if it did nothing: its progress and its failure
+    both went to a panel a screen below the button, and the failure said
+    only "see the log"."""
+
+    @unittest.skipIf(sys.platform == "win32", "uses a shell script as python")
+    def test_pip_failing_says_what_pip_said(self):
+        root = Path(tempfile.mkdtemp(prefix="sb-pip-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        fake = root / "python"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "echo 'Collecting torch'\n"
+            "echo 'ERROR: Could not find a version that satisfies the "
+            "requirement torch (from versions: none)'\n"
+            "echo 'ERROR: No matching distribution found for torch'\n"
+            "exit 1\n")
+        fake.chmod(0o755)
+        with mock.patch.object(bootstrap, "pip_ready"), \
+             mock.patch.object(bootstrap, "pip_raw_progress", return_value=[]):
+            with self.assertRaises(RuntimeError) as caught:
+                bootstrap.pip_install(str(fake), ["torch"], lambda _m: None)
+        self.assertIn("No matching distribution found for torch",
+                      str(caught.exception))
+
+    def test_a_comfyui_requirement_that_fails_does_not_keep_the_cpu_build(self):
+        # Stopping at ComfyUI's requirements left the row reading exactly as
+        # it had before the button was pressed. The build of PyTorch is what
+        # the button is for; the requirement is reported, afterwards.
+        root = Path(tempfile.mkdtemp(prefix="sb-reinstall-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        comfy = root / "ComfyUI-Qwen3-TTS"
+        comfy.mkdir()
+        (comfy / "main.py").write_text("")
+        (comfy / "requirements.txt").write_text("av>=99\n")
+        vpy = bootstrap.venv_python(comfy)
+        vpy.parent.mkdir(parents=True)
+        vpy.write_text("")
+        cfg = copy.deepcopy(bootstrap.DEFAULT_CONFIG)
+        bootstrap.engine_cfg(cfg, "qwen").update(comfy_dir=str(comfy),
+                                                 managed=True)
+        calls = []
+
+        def pip(_py, args, *_a):
+            calls.append(args)
+            if args[:1] == ["-r"]:
+                raise RuntimeError("pip install failed: ERROR: No matching "
+                                   "distribution found for av>=99")
+
+        with mock.patch.object(bootstrap, "pip_install", side_effect=pip), \
+             mock.patch.object(bootstrap, "install_requested_torch",
+                               side_effect=lambda *_a: calls.append("torch")), \
+             mock.patch.object(bootstrap, "save_config"):
+            with self.assertRaises(RuntimeError) as caught:
+                manager._install_torch(
+                    manager.Task("dependency", "Install PyTorch"), cfg,
+                    {"engine": "qwen"})
+        self.assertEqual(calls[-1], "torch")
+        self.assertIn("PyTorch is in place", str(caught.exception))
+        self.assertIn("av>=99", str(caught.exception))
+
+
+class OnePipPerEnvironment(unittest.TestCase):
+    """A button that looked as if it had done nothing got pressed again, and
+    the one below it — two pips writing one site-packages, one of them
+    uninstalling torch, break each other."""
+
+    def _finish(self, task, timeout=10):
+        deadline = time.time() + timeout
+        while task.state == "running" and time.time() < deadline:
+            time.sleep(0.05)
+        return task.state
+
+    def test_a_second_install_into_the_same_environment_is_refused(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        with mock.patch.object(manager, "_install_torch",
+                               side_effect=lambda *_a: gate.wait(10)), \
+             mock.patch.object(manager, "_install_node_reqs"), \
+             mock.patch.object(manager, "_install_git"):
+            first = manager.install_dependency("torch_qwen", {}, {})
+            with self.assertRaises(manager.InstallBusy) as caught:
+                manager.install_dependency("node_reqs_qwen", {}, {})
+            self.assertIn("Install PyTorch for Qwen3-TTS",
+                          str(caught.exception))
+            # And the page is told so, as a refusal rather than a fault.
+            with server.app.test_client() as web:
+                r = web.post("/api/deps/torch_qwen/install", json={})
+            self.assertEqual(r.status_code, 409)
+            self.assertIn("still running", r.get_json()["error"])
+            # MOSS's environment is not Qwen's, and Git is not pip at all.
+            for other in ("node_reqs_moss", "git"):
+                self.assertEqual(self._finish(manager.install_dependency(
+                    other, {}, {})), "done")
+            gate.set()
+            self.assertEqual(self._finish(first), "done")
+            self.assertEqual(self._finish(manager.install_dependency(
+                "node_reqs_qwen", {}, {})), "done")
+
+
+def fake_torch_site(site: Path, version: str = "2.11.0+cu128",
+                    files: dict | None = None, record: bool = True) -> Path:
+    """A torch installed the way pip leaves one: files, dist-info, RECORD.
+
+    Point PYTHONPATH at `site` and the environment's own interpreter finds it
+    exactly as it would a real one — importlib.metadata reads the RECORD, and
+    find_spec finds the package.
+    """
+    import base64, hashlib
+    files = files or {
+        "torch/__init__.py": "from .version import __version__\n",
+        "torch/version.py": f"__version__ = {version!r}\ncuda = '12.8'\n",
+        "torch/utils/__init__.py": "",
+        "torch/utils/_debug_mode.py": "MODE = 1\n",
+        "torch/_subclasses/fake_tensor.py": "def _is_plain_tensor(t):\n    "
+                                            "return True\n",
+        "torchgen/__init__.py": "",
+    }
+    info = site / f"torch-{version}.dist-info"
+    info.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for rel, text in files.items():
+        (site / rel).parent.mkdir(parents=True, exist_ok=True)
+        (site / rel).write_text(text)
+        digest = base64.urlsafe_b64encode(
+            hashlib.sha256(text.encode()).digest()).rstrip(b"=").decode()
+        rows.append(f"{rel},sha256={digest},{len(text.encode())}")
+    (info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: torch\nVersion: {version}\n")
+    if record:
+        rows.append(f"torch-{version}.dist-info/METADATA,,")
+        rows.append(f"torch-{version}.dist-info/RECORD,,")
+        (info / "RECORD").write_text("\n".join(rows) + "\n")
+    return site
+
+
+class ADamagedTorch(unittest.TestCase):
+    """The Qwen engine died with "cannot import name 'is_fake_tensor'" from
+    inside torch: files of two versions mixed by an install that was cut off.
+    Its version.py read as the right build, so the row said ok, Start
+    launched it, and Reinstall — builds agreeing — did nothing at all."""
+
+    def setUp(self):
+        self.site = Path(tempfile.mkdtemp(prefix="sb-site-"))
+        self.addCleanup(shutil.rmtree, self.site, ignore_errors=True)
+        patch = mock.patch.dict(os.environ, {"PYTHONPATH": str(self.site)})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def damage(self) -> str:
+        return bootstrap.torch_damage_summary(
+            bootstrap.torch_damage(sys.executable))
+
+    def test_a_whole_install_is_not_damaged(self):
+        fake_torch_site(self.site)
+        self.assertEqual(self.damage(), "")
+
+    def test_files_left_by_another_version_are_found(self):
+        # The shape of the real one: a package directory from the newer
+        # torch, left behind beside the older torch's module of that name.
+        fake_torch_site(self.site)
+        stale = self.site / "torch" / "utils" / "_debug_mode"
+        stale.mkdir()
+        (stale / "__init__.py").write_text("from ._calls import *\n")
+        (stale / "_calls.py").write_text("from torch._subclasses.fake_tensor "
+                                         "import is_fake_tensor\n")
+        said = self.damage()
+        self.assertIn("2 files from another version are mixed in", said)
+        self.assertIn("torch/utils/_debug_mode/", said)
+
+    def test_a_file_that_never_arrived_is_found(self):
+        fake_torch_site(self.site)
+        (self.site / "torch" / "_subclasses" / "fake_tensor.py").unlink()
+        self.assertIn("1 of its files is missing", self.damage())
+
+    def test_a_file_from_another_version_in_its_place_is_found(self):
+        fake_torch_site(self.site)
+        (self.site / "torch" / "utils" / "_debug_mode.py").write_text("NEW\n")
+        self.assertIn("1 of its files is not the one that was installed "
+                      "(torch/utils/_debug_mode.py)", self.damage())
+
+    def test_two_versions_installed_over_each_other_are_found(self):
+        fake_torch_site(self.site)
+        fake_torch_site(self.site, "2.14.0+cpu")
+        self.assertIn("two versions of torch", self.damage())
+
+    def test_torch_with_no_record_of_installing_it_is_found(self):
+        fake_torch_site(self.site)
+        shutil.rmtree(self.site / "torch-2.11.0+cu128.dist-info")
+        self.assertIn("pip has no record", self.damage())
+
+    def test_an_install_with_no_record_file_is_not_judged(self):
+        # conda and some system packages ship no RECORD: every file would
+        # read as a stranger, and a working torch would be called damaged.
+        fake_torch_site(self.site, record=False)
+        (self.site / "torch" / "extra.py").write_text("")
+        self.assertEqual(self.damage(), "")
+
+    def test_reinstall_takes_out_what_pip_does_not_know_about(self):
+        fake_torch_site(self.site)
+        stale = self.site / "torch" / "utils" / "_debug_mode"
+        stale.mkdir()
+        (stale / "__init__.py").write_text("")
+        real_run = bootstrap._run
+
+        def run(cmd, **kw):
+            if "uninstall" in cmd:
+                # What pip does: exactly the files its RECORD lists.
+                info = next(self.site.glob("torch-*.dist-info"))
+                for row in (info / "RECORD").read_text().splitlines():
+                    target = self.site / row.split(",")[0]
+                    if target.is_file():
+                        target.unlink()
+                shutil.rmtree(info)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return real_run(cmd, **kw)
+
+        with mock.patch.object(bootstrap, "_run", side_effect=run):
+            bootstrap.remove_torch(sys.executable, "the damaged torch",
+                                   lambda _m: None)
+        self.assertFalse((self.site / "torch").exists(),
+                         "the leftovers pip did not know about are still there")
+        self.assertFalse((self.site / "torchgen").exists())
+        self.assertEqual(bootstrap.torch_damage(sys.executable)["dists"], {})
+
+    def test_reinstall_repairs_a_damaged_torch_of_the_right_build(self):
+        # Builds agreeing used to mean pip called it satisfied and nothing
+        # happened. A damaged torch now goes out before it goes back in.
+        calls = []
+        damaged = {"dists": {"torch": ["2.11.0+cu128"]}, "stray_count": 2,
+                   "stray": ["torch/utils/_debug_mode/__init__.py"]}
+        states = iter([damaged, {}])
+        with mock.patch.object(bootstrap, "torch_index",
+                               return_value=bootstrap.CUDA_INDEX), \
+             mock.patch.object(bootstrap, "nvidia_gpu", return_value=RTX_4060), \
+             mock.patch.object(bootstrap, "drop_mismatched_torch",
+                               return_value=False), \
+             mock.patch.object(bootstrap, "torch_damage",
+                               side_effect=lambda _py: next(states)), \
+             mock.patch.object(bootstrap, "index_lacks_torch", return_value=""), \
+             mock.patch.object(bootstrap, "installed_torch",
+                               return_value=torch_info("2.11.0+cu128", "12.8")), \
+             mock.patch.object(bootstrap, "remove_torch",
+                               side_effect=lambda *a, **k: calls.append("remove")), \
+             mock.patch.object(bootstrap, "pip_install",
+                               side_effect=lambda _py, args, *_a:
+                               calls.append("install")):
+            bootstrap.install_requested_torch("py", {}, lambda _m: None)
+        self.assertEqual(calls, ["remove", "install"])
+
+    def test_a_damaged_torch_is_not_removed_with_nothing_to_replace_it(self):
+        damaged = {"dists": {"torch": ["2.11.0+cu128"]}, "missing_count": 1,
+                   "missing": ["torch/x.py"]}
+        with mock.patch.object(bootstrap, "torch_index",
+                               return_value=bootstrap.CUDA_INDEX), \
+             mock.patch.object(bootstrap, "nvidia_gpu", return_value=RTX_4060), \
+             mock.patch.object(bootstrap, "drop_mismatched_torch",
+                               return_value=False), \
+             mock.patch.object(bootstrap, "torch_damage", return_value=damaged), \
+             mock.patch.object(bootstrap, "installed_torch",
+                               return_value=torch_info("2.11.0+cu128", "12.8")), \
+             mock.patch.object(bootstrap, "index_lacks_torch",
+                               return_value="ERROR: No matching distribution"), \
+             mock.patch.object(bootstrap, "remove_torch") as removed:
+            with self.assertRaises(RuntimeError) as caught:
+                bootstrap.install_requested_torch("py", {}, lambda _m: None)
+        removed.assert_not_called()
+        self.assertIn("left in place", str(caught.exception))
+
+    def test_start_refuses_a_damaged_torch_and_names_the_fix(self):
+        with mock.patch.object(bootstrap, "torch_damage", return_value={
+                "dists": {"torch": ["2.11.0+cu128"]}, "stray_count": 1,
+                "stray": ["torch/utils/_debug_mode/__init__.py"]}):
+            flags, refusal = bootstrap.torch_launch("py", {}, "qwen")
+        self.assertEqual(flags, [])
+        self.assertIn("damaged", refusal)
+        self.assertIn("Reinstall on PyTorch · Qwen3-TTS", refusal)
+
+    def test_the_row_marks_a_damaged_torch_for_repair(self):
+        with mock.patch.object(manager, "_probe", return_value=(0, json.dumps(
+                {"v": "2.11.0+cu128", "cuda": True, "built": "12.8",
+                 "hip": None, "dev": "NVIDIA GeForce RTX 4060"}))), \
+             mock.patch.object(bootstrap, "torch_damage", return_value={
+                 "dists": {"torch": ["2.11.0+cu128"]}, "stray_count": 1,
+                 "stray": ["torch/utils/_debug_mode/__init__.py"]}), \
+             mock.patch.object(bootstrap, "installed_torch",
+                               return_value=torch_info("2.11.0+cu128", "12.8")):
+            row = manager._torch_row("py", "_qwen", "Qwen3-TTS", {})
+        self.assertTrue(row.get("repair"))
+        self.assertIn("damaged", row["detail"])
+
+    def test_the_engine_page_reads_torch_again_only_once_pip_has_changed_it(self):
+        # The Engine page's list sat empty under "Checking what is missing…"
+        # while every torch .py file was hashed, for both engines, on every
+        # visit — long enough that the Reinstall button the console pointed
+        # at never appeared. The answer is kept until pip touches torch.
+        bootstrap.forget_torch_health()
+        self.addCleanup(bootstrap.forget_torch_health)
+        fake_torch_site(self.site)
+        with mock.patch.object(bootstrap, "torch_damage",
+                               wraps=bootstrap.torch_damage) as probe:
+            first = bootstrap.torch_damage_cached(sys.executable)
+            again = bootstrap.torch_damage_cached(sys.executable)
+            self.assertEqual(probe.call_count, 1,
+                             "torch was read again with nothing changed")
+            self.assertEqual(first, again)
+            # pip installing a second torch over the first: a new dist-info.
+            fake_torch_site(self.site, "2.14.0+cpu")
+            said = bootstrap.torch_damage_summary(
+                bootstrap.torch_damage_cached(sys.executable))
+            self.assertEqual(probe.call_count, 2)
+            self.assertIn("two versions of torch", said)
+            # Recheck reads it afresh whatever the folders say.
+            bootstrap.torch_damage_cached(sys.executable, fresh=True)
+            self.assertEqual(probe.call_count, 3)
+
+    def test_an_answer_that_names_no_folder_is_not_kept(self):
+        # Nothing to tell a changed install by, so nothing to trust later.
+        bootstrap.forget_torch_health()
+        self.addCleanup(bootstrap.forget_torch_health)
+        with mock.patch.object(bootstrap, "torch_damage",
+                               return_value={"dists": {}}) as probe:
+            bootstrap.torch_damage_cached("py")
+            bootstrap.torch_damage_cached("py")
+        self.assertEqual(probe.call_count, 2)
+
+    def test_an_install_forgets_what_torch_looked_like(self):
+        # Finished, failed or cut off, pip has run: the kept answer is gone.
+        bootstrap._TORCH_HEALTH["py"] = (("x",), {"root": "/nowhere"})
+        self.addCleanup(bootstrap.forget_torch_health)
+        with mock.patch.object(manager, "_install_torch",
+                               side_effect=RuntimeError("cut off")):
+            task = manager.install_dependency("torch_qwen", {}, {})
+            deadline = time.time() + 10
+            while task.state == "running" and time.time() < deadline:
+                time.sleep(0.02)
+        self.assertEqual(task.state, "error")
+        self.assertEqual(bootstrap._TORCH_HEALTH, {})
+
+    def test_a_torch_that_will_not_import_is_not_called_missing(self):
+        with mock.patch.object(manager, "_probe", return_value=(
+                1, "Traceback …\nImportError: DLL load failed")), \
+             mock.patch.object(bootstrap, "torch_damage", return_value={}), \
+             mock.patch.object(bootstrap, "installed_torch",
+                               return_value=torch_info("2.11.0+cu128", "12.8")):
+            row = manager._torch_row("py", "_qwen", "Qwen3-TTS", {})
+        self.assertTrue(row.get("repair"))
+        self.assertIn("will not import: ImportError: DLL load failed",
+                      row["detail"])
+
+
+# The last words of the Qwen engine that prompted all this, as ComfyUI's
+# console had them — Windows paths, and the colour-coded lines it went on
+# printing after the traceback.
+DAMAGED_TORCH_CRASH = [
+    "Traceback (most recent call last):",
+    '  File "D:\\AI\\Text-to-Speech-Model-main\\ComfyUI-Qwen3-TTS\\main.py", '
+    "line 145, in <module>",
+    '  File "D:\\AI\\Text-to-Speech-Model-main\\comfy-venv-ComfyUI-Qwen3-TTS\\'
+    'Lib\\site-packages\\torch\\utils\\_debug_mode\\_utils.py", line 14, '
+    "in <module>",
+    "    from torch._subclasses.fake_tensor import is_fake_tensor",
+    "ImportError: cannot import name 'is_fake_tensor' from "
+    "'torch._subclasses.fake_tensor' (D:\\AI\\Text-to-Speech-Model-main\\"
+    "comfy-venv-ComfyUI-Qwen3-TTS\\Lib\\site-packages\\torch\\_subclasses\\"
+    "fake_tensor.py). Did you mean: '_is_plain_tensor'?",
+    "\x1b[32m[INFO]\x1b[0m FakeTensor cache stats:",
+    "\x1b[32m[INFO]\x1b[0m   cache_hits: 0",
+]
+
+
+class WhyItStoppedWhileStarting(unittest.TestCase):
+    """"Stopped while starting — its last words are below" over a traceback
+    is rule 15's stack trace with extra steps."""
+
+    def test_a_damaged_torch_is_named_and_the_fix_given(self):
+        said = bootstrap.crash_reason(DAMAGED_TORCH_CRASH, "qwen")
+        self.assertIn("Qwen3-TTS's PyTorch is damaged", said)
+        self.assertIn("is_fake_tensor", said)
+        self.assertIn("Reinstall on PyTorch · Qwen3-TTS", said)
+
+    def test_the_cpu_build_is_named(self):
+        said = bootstrap.crash_reason(
+            ['  File "x\\site-packages\\torch\\cuda\\__init__.py", line 1',
+             "AssertionError: Torch not compiled with CUDA enabled"], "moss")
+        self.assertIn("MOSS-TTS's PyTorch is the CPU-only build", said)
+
+    def test_an_import_error_outside_torch_is_not_blamed_on_torch(self):
+        said = bootstrap.crash_reason(
+            ['  File "x\\site-packages\\transformers\\__init__.py", line 1',
+             "ImportError: cannot import name 'thing'"], "qwen")
+        self.assertNotIn("PyTorch", said)
+        self.assertIn("ImportError: cannot import name 'thing'", said)
+
+    def test_a_taken_port_is_named(self):
+        said = bootstrap.crash_reason(
+            ["OSError: [WinError 10048] Only one usage of each socket address "
+             "(protocol/network address/port) is normally permitted"], "qwen")
+        self.assertIn("port is taken", said)
+
+    def test_a_console_with_no_exception_still_says_something(self):
+        self.assertIn("stopped while starting",
+                      bootstrap.crash_reason(["Starting server"], "qwen"))
+
+
+class ReadingTheTorchBuild(unittest.TestCase):
+    """What a torch was built for comes out of the wheel, through the
+    environment's own interpreter, and without importing torch — that costs
+    seconds on Windows and is asked before every engine start."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="sb-torch-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+    def _wheel(self, version: str, cuda) -> None:
+        pkg = self.root / "torch"
+        pkg.mkdir()
+        # Importing it would fail the test: the probe must not.
+        (pkg / "__init__.py").write_text("raise RuntimeError('imported')\n")
+        (pkg / "version.py").write_text(
+            "from typing import Optional\n"
+            f"__version__ = {version!r}\n"
+            f"cuda: Optional[str] = {cuda!r}\n"
+            "hip: Optional[str] = None\n")
+
+    def _read(self) -> dict:
+        with mock.patch.dict(os.environ, {"PYTHONPATH": str(self.root)}):
+            return bootstrap.installed_torch(sys.executable)
+
+    def test_pypis_windows_wheel_reads_as_the_cpu_build(self):
+        self._wheel("2.14.0", None)
+        info = self._read()
+        self.assertEqual(info["version"], "2.14.0")
+        self.assertEqual(bootstrap.torch_kind(info), "cpu")
+
+    def test_a_cuda_wheel_reads_as_cuda(self):
+        self._wheel("2.10.0+cu128", "12.8")
+        info = self._read()
+        self.assertEqual(info["cuda"], "12.8")
+        self.assertEqual(bootstrap.torch_kind(info), "cuda")
+
+    def test_no_torch_is_an_empty_answer(self):
+        self.assertEqual(self._read(), {})
+        self.assertEqual(bootstrap.torch_kind({}), "")
+
+
+class ACpuOnlyTorch(unittest.TestCase):
+    """ComfyUI asks CUDA for a device while it imports, so a torch with no GPU
+    support in it stops as it starts unless it was told --cpu. Which of the
+    two that means depends on the machine."""
+
+    def _launch(self, installed, gpu=RTX_4060, cfg=None):
+        with mock.patch.object(bootstrap.platform, "system",
+                               return_value="Windows"), \
+             mock.patch.object(bootstrap, "installed_torch",
+                               return_value=installed), \
+             mock.patch.object(bootstrap, "nvidia_gpu", return_value=gpu):
+            return bootstrap.torch_launch("py", cfg or {}, "qwen")
+
+    def test_beside_an_nvidia_card_it_is_refused_and_the_fix_named(self):
+        flags, refusal = self._launch(torch_info("2.14.0"))
+        self.assertEqual(flags, [])
+        self.assertIn("CPU-only build", refusal)
+        self.assertIn("RTX 4060", refusal)
+        self.assertIn("Reinstall on PyTorch · Qwen3-TTS", refusal)
+
+    def test_with_no_nvidia_card_it_runs_on_the_cpu(self):
+        self.assertEqual(self._launch(torch_info("2.14.0+cpu"), NO_GPU),
+                         (["--cpu"], ""))
+
+    def test_the_cpu_build_chosen_on_purpose_runs_on_the_cpu(self):
+        # A card too old for cu128 is a reason to pick the CPU build, and
+        # refusing to run it would leave that machine nothing at all.
+        self.assertEqual(
+            self._launch(torch_info("2.14.0+cpu"),
+                         cfg={"torch_index": bootstrap.CPU_INDEX}),
+            (["--cpu"], ""))
+
+    def test_a_cuda_build_is_started_as_it_is(self):
+        # Never --cpu for a CUDA build, even when nvidia-smi cannot be found:
+        # a portable ComfyUI carries its own CUDA, and silently running it on
+        # the CPU would be rule 5b in a new coat.
+        for gpu in (RTX_4060, NO_GPU):
+            with self.subTest(gpu=gpu["name"]):
+                self.assertEqual(
+                    self._launch(torch_info("2.10.0+cu128", "12.8"), gpu),
+                    ([], ""))
+
+    def test_a_torch_that_cannot_be_read_is_left_to_comfyui(self):
+        self.assertEqual(self._launch({}), ([], ""))
+
+    def test_a_mac_is_never_given_the_flag(self):
+        with mock.patch.object(bootstrap.platform, "system",
+                               return_value="Darwin"), \
+             mock.patch.object(bootstrap, "installed_torch",
+                               return_value=torch_info("2.14.0")):
+            self.assertEqual(bootstrap.torch_launch("py", {}, "qwen"), ([], ""))
+
+
+class TheTorchRow(unittest.TestCase):
+    """The row has to see a CPU build as CPU when the tag does not say so, and
+    mark it as the repair it is when it is what stops the engine starting."""
+
+    def _row(self, probe: dict, gpu=RTX_4060, cfg=None) -> dict:
+        with mock.patch.object(manager, "_probe",
+                               return_value=(0, json.dumps(probe))), \
+             mock.patch.object(bootstrap, "nvidia_gpu", return_value=gpu):
+            return manager._torch_row("py", "_qwen", "Qwen3-TTS", cfg or {})
+
+    def test_an_untagged_cpu_build_beside_a_card_is_a_repair(self):
+        row = self._row({"v": "2.14.0", "cuda": False, "built": None,
+                         "hip": None, "dev": ""})
+        self.assertTrue(row.get("repair"))
+        self.assertIn("CPU-only build", row["detail"])
+        self.assertIn("RTX 4060", row["detail"])
+
+    def test_a_cpu_build_chosen_on_purpose_is_not_a_repair(self):
+        row = self._row({"v": "2.14.0+cpu", "cuda": False, "built": None,
+                         "hip": None, "dev": ""},
+                        cfg={"torch_index": bootstrap.CPU_INDEX})
+        self.assertFalse(row.get("repair"))
+
+    def test_a_cuda_build_waiting_on_a_driver_is_not_a_repair(self):
+        # Reinstalling torch cannot install a driver.
+        row = self._row({"v": "2.10.0+cu128", "cuda": False, "built": "12.8",
+                         "hip": None, "dev": ""},
+                        gpu={"name": "NVIDIA GeForce RTX 4060",
+                             "driver": False, "vram_mb": 0})
+        self.assertFalse(row.get("repair"))
+        self.assertIn("driver", row["detail"])
+
+    def test_a_working_gpu_is_ok(self):
+        row = self._row({"v": "2.10.0+cu128", "cuda": True, "built": "12.8",
+                         "hip": None, "dev": "NVIDIA GeForce RTX 4060"})
+        self.assertEqual(row["state"], "ok")
+        self.assertFalse(row.get("repair"))
 
 
 class PipReadiness(unittest.TestCase):
@@ -1241,6 +2552,32 @@ class NodeImportDiagnosis(unittest.TestCase):
                       bootstrap.node_import_error(sys.executable, self.root))
 
 
+class TheEngineConsoleIsPlainText(unittest.TestCase):
+    """ComfyUI colours its log even into a pipe, and the engine console
+    printed "\x1b[32m[INFO]\x1b[0m" as boxes and brackets on every line."""
+
+    def test_what_the_engine_prints_arrives_without_its_colour_codes(self):
+        said = ("\x1b[32m[INFO]\x1b[0m comfy-kitchen version: 0.2.35",
+                "\x1b[1m\x1b[33m[WARNING]\x1b[0m ****** User settings ******",
+                "\x1b]0;ComfyUI\x07Starting server")
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys\nfor l in sys.argv[1:]: print(l)", *said],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            **bootstrap.PY_TEXT)
+        engine = bootstrap.ComfyProcess()
+        engine._pump(child, bootstrap.Progress())
+        child.wait()
+        self.assertEqual(engine.lines, [
+            "[INFO] comfy-kitchen version: 0.2.35",
+            "[WARNING] ****** User settings ******",
+            "Starting server"])
+
+    def test_a_line_with_no_codes_is_left_exactly_as_it_was(self):
+        line = "Traceback (most recent call last): [x] ~ \\ ok"
+        self.assertEqual(bootstrap.plain(line), line)
+
+
 class NodesNotLoaded(unittest.TestCase):
     """ComfyUI reads custom_nodes once, at startup, so installing them into a
     running engine leaves it running without them."""
@@ -1320,6 +2657,26 @@ class NodesNotLoaded(unittest.TestCase):
                 if i["id"] in ("node_qwen", "node_moss")}
         self.assertEqual({r["state"] for r in rows.values()}, {"missing"})
 
+    def test_the_engines_are_checked_side_by_side(self):
+        # Each engine costs a torch import, a transformers import and a read
+        # of torch's files. One after the other, the Engine page's list stayed
+        # empty for the length of both. Each engine's check here waits for
+        # the other's to start, which only a side-by-side run gets past.
+        both = threading.Barrier(len(bootstrap.ENGINES), timeout=10)
+
+        def row(_py, suffix, label, _cfg=None, _fresh=False):
+            both.wait()
+            return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
+                    "state": "ok", "detail": "", "action": "reinstall"}
+
+        with mock.patch.object(manager, "_torch_row", side_effect=row):
+            items = manager.dependencies(
+                self.cfg, {e: self.Engine(True) for e in bootstrap.ENGINES})
+        ids = [i["id"] for i in items]
+        # And the list still reads in engine order, whichever finished first.
+        self.assertEqual(ids[:3], ["python", "git", "comfyui_qwen"])
+        self.assertLess(ids.index("engine_qwen"), ids.index("comfyui_moss"))
+
     def test_an_engine_turned_off_is_not_reported_as_missing(self):
         items = manager.dependencies(dict(self.cfg, want_moss=False),
                                      {e: self.Engine(True)
@@ -1346,15 +2703,22 @@ MOSS_SCHEMA = {
                      "language": [["auto", "zh", "en"], {"default": "auto"}],
                      "text": ["STRING", {"default": ""}],
                      "seed": ["INT", {"default": 0}],
+                     # The Delay 8B's numbers, whatever the loader holds.
                      "temperature": ["FLOAT", {"default": 1.7}],
-                     "top_p": ["FLOAT", {"default": 0.8}]},
+                     "top_p": ["FLOAT", {"default": 0.8}],
+                     "top_k": ["INT", {"default": 25}],
+                     "repetition_penalty": ["FLOAT", {"default": 1.0}]},
         "optional": {"reference_audio": ["AUDIO"]}}},
     "MossTTSVoiceDesign": {"input": {"required": {
         "moss_pipe": ["MOSS_TTS_PIPE"],
         "language": [["auto", "zh", "en"], {"default": "auto"}],
         "text": ["STRING", {"default": ""}],
         "instruction": ["STRING", {"default": ""}],
-        "seed": ["INT", {"default": 0}]}}},
+        "seed": ["INT", {"default": 0}],
+        "temperature": ["FLOAT", {"default": 1.5}],
+        "top_p": ["FLOAT", {"default": 0.6}],
+        "top_k": ["INT", {"default": 50}],
+        "repetition_penalty": ["FLOAT", {"default": 1.1}]}}},
     "LoadAudio": {"input": {"required": {"audio": [["ref.wav"], {}]}}},
     **SAVE,
 }
@@ -1364,8 +2728,8 @@ MOSS_DIRS = {
     "OpenMOSS-Team/MOSS-Audio-Tokenizer": "/m/moss-tts/Codec",
     "OpenMOSS-Team/MOSS-VoiceGenerator": "/m/moss-tts/VG",
 }
-MOSS_OPTS = {"engine": "moss", "moss_dirs": MOSS_DIRS, "temperature": 1.0,
-             "top_p": 0.9, "prefer_wav": True}
+MOSS_OPTS = {"engine": "moss", "moss_dirs": MOSS_DIRS, "temperature": 0.9,
+             "prefer_wav": True}
 
 
 class ModelFolderLayout(unittest.TestCase):
@@ -1374,10 +2738,13 @@ class ModelFolderLayout(unittest.TestCase):
 
     ROOT = Path("/models")
 
-    def test_qwen_nests_by_org(self):
+    def test_qwen_drops_the_org(self):
+        # The node's README draws models/qwen-tts/Qwen/<Name>; its code lists
+        # models/qwen-tts one level deep and downloads to <Name>. Following
+        # the README put every folder where the node never looked.
         self.assertEqual(
             bootstrap.model_dir(self.ROOT, "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
-            self.ROOT / "qwen-tts" / "Qwen" / "Qwen3-TTS-12Hz-0.6B-Base")
+            self.ROOT / "qwen-tts" / "Qwen3-TTS-12Hz-0.6B-Base")
 
     def test_moss_flattens_the_slash(self):
         # The MOSS loader builds its cache path as repo_id.replace("/", "--").
@@ -1410,6 +2777,173 @@ class ModelFolderLayout(unittest.TestCase):
             self.assertTrue(bootstrap.node_installed(root, "moss"))
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+
+def qwen_node_finds(models_dir: Path, model_type: str, choice: str):
+    """Where ComfyUI-Qwen-TTS loads a model from, or None where it would go
+    to HuggingFace for a second copy — transcribed from its nodes.py.
+
+    load_qwen_model lists models/qwen-tts one level deep for a folder whose
+    name holds both the size and the kind; failing that,
+    download_model_if_needed looks at <qwen_root>/<repo.split("/")[-1]> and
+    downloads there when it is absent.
+    """
+    hf = {("Base", "0.6B"): "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+          ("Base", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+          ("VoiceDesign", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+          ("CustomVoice", "0.6B"): "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+          ("CustomVoice", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"}
+    base = models_dir / "qwen-tts"
+    for d in os.listdir(base):
+        cand = base / d
+        if cand.is_dir() and choice in d and model_type.lower() in d.lower():
+            return cand
+    target = base / hf[(model_type, choice)].split("/")[-1]
+    return target if target.is_dir() else None
+
+
+class TheQwenNodeFindsWhatWeDownload(unittest.TestCase):
+    """Every folder setup fetches has to be the one the node loads. The app
+    followed the node's README, which draws models/qwen-tts/Qwen/<Name>; the
+    node's code has only ever looked one level down. Nothing failed that the
+    app could see — the node quietly fetched every model a second time on the
+    first take, and offline the take failed."""
+
+    def setUp(self):
+        self.models = Path(tempfile.mkdtemp(prefix="sb-qwen-"))
+        self.addCleanup(shutil.rmtree, self.models, ignore_errors=True)
+        for m in bootstrap.MODEL_REPOS:
+            d = bootstrap.model_dir(self.models, m["repo"], "qwen")
+            d.mkdir(parents=True)
+            (d / "model.safetensors").write_text("w")
+        (self.models / "qwen-tts" / "voices").mkdir()
+
+    def test_every_model_a_line_can_ask_for_is_found_on_disk(self):
+        for m in bootstrap.MODEL_REPOS:
+            name = m["repo"].split("/")[-1]
+            if "Tokenizer" in name:
+                continue
+            kind = next(k for k in ("CustomVoice", "VoiceDesign", "Base")
+                        if k in name)
+            size = "0.6B" if "0.6B" in name else "1.7B"
+            with self.subTest(repo=m["repo"]):
+                self.assertEqual(
+                    qwen_node_finds(self.models, kind, size),
+                    bootstrap.model_dir(self.models, m["repo"], "qwen"))
+
+    def test_the_tokenizer_is_where_the_node_checks_for_it(self):
+        # check_and_download_tokenizer runs before every first load and
+        # downloads to <qwen_root>/Qwen3-TTS-Tokenizer-12Hz when that is absent.
+        self.assertEqual(
+            bootstrap.model_dir(self.models, "Qwen/Qwen3-TTS-Tokenizer-12Hz"),
+            self.models / "qwen-tts" / "Qwen3-TTS-Tokenizer-12Hz")
+
+    def test_the_old_shape_is_invisible_to_the_node(self):
+        # Proof the transcription is honest: the folders this app used to
+        # write are not found, which is the fault being fixed.
+        old = Path(tempfile.mkdtemp(prefix="sb-qwen-old-"))
+        self.addCleanup(shutil.rmtree, old, ignore_errors=True)
+        d = old / "qwen-tts" / "Qwen" / "Qwen3-TTS-12Hz-0.6B-CustomVoice"
+        d.mkdir(parents=True)
+        (d / "model.safetensors").write_text("w")
+        self.assertIsNone(qwen_node_finds(old, "CustomVoice", "0.6B"))
+
+    def test_the_models_page_lists_them_under_their_own_repo_ids(self):
+        cfg = dict(bootstrap.DEFAULT_CONFIG, want_moss=False)
+        cfg["engines"] = {eid: dict(bootstrap.engine_defaults(eid),
+                                    models_dir=str(self.models))
+                          for eid in bootstrap.ENGINES}
+        rows = {r["repo"] for r in manager.local_models(cfg)
+                if r["engine"] == "qwen"}
+        # voices/ is the node's saved voices, not a model.
+        self.assertEqual(rows, {m["repo"] for m in bootstrap.MODEL_REPOS})
+
+
+class OldQwenFoldersMoveIntoPlace(unittest.TestCase):
+    """Folders an earlier version left in models/qwen-tts/Qwen/<Name> are
+    moved to where the node looks, rather than downloaded a third time."""
+
+    NAME = "Qwen3-TTS-12Hz-0.6B-CustomVoice"
+
+    def setUp(self):
+        self.models = Path(tempfile.mkdtemp(prefix="sb-migrate-"))
+        self.addCleanup(shutil.rmtree, self.models, ignore_errors=True)
+        self.root = self.models / "qwen-tts"
+        self.old = self.root / "Qwen" / self.NAME
+        self.new = self.root / self.NAME
+        self.said = []
+
+    def _whole(self, d, tag):
+        (d / "speech_tokenizer").mkdir(parents=True)
+        (d / "config.json").write_text("{}")
+        (d / "model.safetensors").write_text(tag)
+        (d / "speech_tokenizer" / "model.safetensors").write_text(tag)
+
+    def _half(self, d):
+        # What huggingface_hub leaves when the node's own download is cut
+        # off: config first, weights still arriving under .cache.
+        (d / ".cache" / "huggingface" / "download").mkdir(parents=True)
+        (d / "config.json").write_text("{}")
+        (d / ".cache" / "huggingface" / "download"
+         / "model.safetensors.incomplete").write_text("half")
+
+    def _migrate(self):
+        return bootstrap.migrate_qwen_layout(self.models, self.said.append)
+
+    def test_a_folder_in_the_old_shape_is_moved(self):
+        self._whole(self.old, "ours")
+        self.assertEqual(self._migrate(), 1)
+        self.assertEqual((self.new / "model.safetensors").read_text(), "ours")
+        self.assertFalse((self.root / "Qwen").exists())
+        self.assertTrue(bootstrap.model_installed(
+            self.models, "Qwen/" + self.NAME))
+        self.assertTrue(self.said)
+
+    def test_a_second_copy_behind_a_whole_one_is_removed(self):
+        # The node already fetched its own; ours is gigabytes nobody can
+        # reach, and the Models page no longer lists it to delete.
+        self._whole(self.old, "ours")
+        self._whole(self.new, "node's")
+        self._migrate()
+        self.assertFalse(self.old.exists())
+        self.assertEqual((self.new / "model.safetensors").read_text(),
+                         "node's")
+
+    def test_an_unfinished_node_download_is_replaced_by_a_whole_copy(self):
+        # The node loads from any folder that exists, whole or not — so a
+        # download it was cut off in the middle of fails every line after.
+        self._whole(self.old, "ours")
+        self._half(self.new)
+        self.assertFalse(bootstrap.model_installed(
+            self.models, "Qwen/" + self.NAME))
+        self._migrate()
+        self.assertEqual((self.new / "model.safetensors").read_text(), "ours")
+        self.assertFalse((self.new / ".cache").exists())
+        self.assertTrue(bootstrap.model_installed(
+            self.models, "Qwen/" + self.NAME))
+
+    def test_two_unfinished_copies_are_both_left_for_a_download(self):
+        (self.old).mkdir(parents=True)
+        (self.old / "model.safetensors.part").write_text("half")
+        self._half(self.new)
+        self.assertEqual(self._migrate(), 0)
+        self.assertTrue(self.old.exists())
+        self.assertTrue(self.new.exists())
+
+    def test_nothing_but_our_own_org_folders_is_touched(self):
+        self._whole(self.root / "voices" / "x", "voice")
+        self._whole(self.root / "SomeoneElse" / "Model", "theirs")
+        self._migrate()
+        self.assertTrue((self.root / "voices" / "x").exists())
+        self.assertTrue((self.root / "SomeoneElse" / "Model").exists())
+
+    def test_it_runs_on_a_missing_or_unset_folder(self):
+        self.assertEqual(bootstrap.migrate_qwen_layout(None), 0)
+        self.assertEqual(bootstrap.migrate_qwen_layout(
+            self.models / "nowhere"), 0)
+        self._whole(self.old, "ours")
+        self._migrate()
+        self.assertEqual(self._migrate(), 0)  # a second run changes nothing
 
 
 class WhichModelsAreWanted(unittest.TestCase):
@@ -1557,6 +3091,51 @@ class MossGraphs(unittest.TestCase):
             c.build_line({"text": "Hi."}, {"kind": "preset"}, MOSS_OPTS)
         self.assertIn("MOSS-TTS", str(caught.exception))
 
+    def _sampling(self, voice, **opts):
+        ins = self.c.build_line({"text": "Hi."}, voice,
+                                dict(MOSS_OPTS, **opts))["prompt"]["4"]["inputs"]
+        return {k: ins[k] for k in ("temperature", "top_p", "top_k",
+                                    "repetition_penalty")}
+
+    def test_each_checkpoint_samples_the_way_openmoss_tuned_it(self):
+        # MossTTSGenerate's defaults are the Delay 8B's whatever the loader
+        # holds. Left to them, the Local 1.7B — the default model — ran with
+        # no repetition penalty and half its top_k.
+        self.assertEqual(self._sampling({"kind": "preset"}), {
+            "temperature": 1.0, "top_p": 0.95, "top_k": 50,
+            "repetition_penalty": 1.1})
+        self.assertEqual(
+            self._sampling({"kind": "preset"},
+                           moss_model="OpenMOSS-Team/MOSS-TTS"),
+            {"temperature": 1.7, "top_p": 0.8, "top_k": 25,
+             "repetition_penalty": 1.0})
+
+    def test_a_designed_voice_samples_as_voicegenerator_whatever_is_picked(self):
+        self.assertEqual(
+            self._sampling({"kind": "design", "instruct": "A low narrator"},
+                           moss_model="OpenMOSS-Team/MOSS-TTS"),
+            {"temperature": 1.5, "top_p": 0.6, "top_k": 50,
+             "repetition_penalty": 1.1})
+
+    def test_expressiveness_scales_the_models_temperature(self):
+        # The slider rests at 0.9, Qwen's own temperature. Passed through as
+        # it was, it cooled the 8B from 1.7 and VoiceGenerator from 1.5.
+        hot = self._sampling({"kind": "preset"}, temperature=1.8)
+        self.assertAlmostEqual(hot["temperature"], 2.0)
+        cool = self._sampling({"kind": "design", "instruct": "x"},
+                              temperature=0.45)
+        self.assertAlmostEqual(cool["temperature"], 0.75)
+        # Only the temperature moves; the rest is the checkpoint's own.
+        self.assertEqual(hot["top_k"], 50)
+        self.assertEqual(hot["repetition_penalty"], 1.1)
+
+    def test_the_tuning_table_names_every_model_a_line_can_load(self):
+        for m in bootstrap.MOSS_MODEL_REPOS:
+            if "Tokenizer" in m["repo"]:
+                continue
+            with self.subTest(repo=m["repo"]):
+                self.assertIn(m["repo"], comfy.MOSS_SAMPLING)
+
     def test_moss_reports_no_preset_speakers_rather_than_an_empty_list(self):
         caps = self.c.capabilities("moss")
         self.assertFalse(caps["preset"])
@@ -1582,6 +3161,7 @@ class BothEnginesOnDisk(unittest.TestCase):
                 bootstrap.engine_models_dir(self.cfg, eid), repo, eid)
             d.mkdir(parents=True)
             (d / "config.json").write_text("{}")
+            (d / "model.safetensors").write_bytes(b"\0" * 32)
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -1945,6 +3525,903 @@ class SeparateInstalls(unittest.TestCase):
         # process. On 8 GB the second engine is the one that fails to
         # allocate, so the default is one at a time.
         self.assertFalse(bootstrap.DEFAULT_CONFIG["run_both_engines"])
+
+
+# --------------------------------------------------------------------------- #
+# the engine kit: real processes, real ports
+# --------------------------------------------------------------------------- #
+# Everything below runs actual processes on actual ports. Mocking the takeover
+# would only prove that the mock returns what it was told to: the whole point
+# is that a port is really held, a pid is really found, and a process really
+# does or does not close.
+import requests  # noqa: E402  (in requirements.txt; the app itself uses it)
+
+MOCK_COMFY = Path(__file__).resolve().parent / "mock_comfy.py"
+# The suite talks to servers on this machine, and a proxy in the environment
+# would swallow every one of those requests.
+os.environ.setdefault("NO_PROXY", "*")
+os.environ.setdefault("no_proxy", "*")
+
+
+def free_port() -> int:
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def online(url: str, timeout: float = 20) -> bool:
+    import time as _t
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        if bootstrap.comfy_online(url):
+            return True
+        _t.sleep(0.2)
+    return False
+
+
+def offline(url: str, timeout: float = 20) -> bool:
+    import time as _t
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        if not bootstrap.comfy_online(url):
+            return True
+        _t.sleep(0.2)
+    return False
+
+
+def spawn_mock(port: int, root: Path) -> subprocess.Popen:
+    """A stand-in ComfyUI on a port of its own, as its own process — which is
+    what makes it something the app has to find and close rather than drop."""
+    root.mkdir(parents=True, exist_ok=True)
+    return subprocess.Popen(
+        [sys.executable, str(MOCK_COMFY), str(root)],
+        env={**os.environ, "MOCK_COMFY_PORT": str(port)},
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
+
+
+def fake_install(root: Path, engine: str = "qwen",
+                 with_nodes: bool = False) -> Path:
+    """A pretend ComfyUI checkout whose main.py serves the stand-in engine.
+
+    This is what lets the app truly own, stop and restart a process in a test:
+    ComfyProcess.start runs `<python> main.py --port N` in this folder, so the
+    engine it ends up managing is a real child of the app.
+
+    `with_nodes` puts the node pack's marker file on disk without putting its
+    classes in the engine — an install that is complete and an engine that
+    started before it was, which is the state Restart exists for.
+    """
+    install = root / bootstrap.ENGINES[engine]["dir_name"]
+    (install / "models").mkdir(parents=True, exist_ok=True)
+    (install / "main.py").write_text(
+        "import argparse, os, pathlib, runpy, sys\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('--listen'); p.add_argument('--port')\n"
+        "p.add_argument('--disable-auto-launch', action='store_true')\n"
+        "p.add_argument('--cpu', action='store_true')\n"
+        "a = p.parse_args()\n"
+        "os.environ['MOCK_COMFY_PORT'] = a.port\n"
+        "print('Device: cpu' if a.cpu else 'Device: cuda:0', flush=True)\n"
+        "print('Starting server', flush=True)\n"
+        "here = pathlib.Path(__file__).parent\n"
+        "sys.argv = ['mock_comfy.py', str(here / 'mockroot')]\n"
+        f"runpy.run_path({str(MOCK_COMFY)!r}, run_name='__main__')\n")
+    if with_nodes:
+        eng = bootstrap.ENGINES[engine]
+        pack = install / "custom_nodes" / eng["node_dir"]
+        pack.mkdir(parents=True, exist_ok=True)
+        (pack / eng["node_marker"]).write_text("# pretend node pack\n")
+    return install
+
+
+def drop_weights(cfg: dict, engine: str) -> None:
+    """Every model this config asks of that engine, on disk and whole."""
+    models = bootstrap.engine_models_dir(cfg, engine)
+    for m in bootstrap.wanted_models(cfg, engine):
+        folder = bootstrap.model_dir(models, m["repo"], engine)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "config.json").write_text("{}")
+        (folder / "model.safetensors").write_bytes(b"\x00" * 16)
+
+
+class EngineFixture(unittest.TestCase):
+    """Shared setup: a throwaway config, and nothing left running after."""
+
+    engine = "qwen"
+
+    def setUp(self):
+        self.saved = copy.deepcopy(server.cfg)
+        self.root = Path(tempfile.mkdtemp(prefix="sb-engine-"))
+        self.strays: list[subprocess.Popen] = []
+        server.cfg["setup_complete"] = True
+
+    def tearDown(self):
+        for proc in server.PROCS.values():
+            proc.stop()
+            proc.lines.clear()
+        for p in self.strays:
+            try:
+                p.kill()
+                p.wait(timeout=5)
+            except Exception:
+                pass
+        server.cfg.clear()
+        server.cfg.update(self.saved)
+        for client in server.CLIENTS.values():
+            client._schema = None
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def stray(self, proc: subprocess.Popen) -> subprocess.Popen:
+        self.strays.append(proc)
+        return proc
+
+    def slot(self, **kw) -> dict:
+        slot = bootstrap.engine_cfg(server.cfg, self.engine)
+        slot.update(kw)
+        return slot
+
+    def finish_task(self, view: dict, timeout: float = 60) -> str:
+        import time as _t
+        deadline = _t.time() + timeout
+        task = manager.TASKS.get(view["id"])
+        while _t.time() < deadline and task and task.state == "running":
+            _t.sleep(0.25)
+        return task.state if task else "gone"
+
+
+class TheEngineConsole(EngineFixture):
+    """The engine's own output, and what the app did to it, in one window.
+
+    "Check the ComfyUI console" is not an instruction anyone running from a
+    launcher can follow — there is no console. This endpoint is the console,
+    and note() is how the app's own half of the story gets into it.
+    """
+
+    def test_the_tail_reports_shape_and_state(self):
+        self.slot(comfy_url=f"http://127.0.0.1:{free_port()}")
+        with server.app.test_client() as web:
+            body = web.get("/api/comfy/log?engine=qwen").get_json()
+        self.assertEqual(body["engine"], "qwen")
+        self.assertEqual(body["lines"], [])
+        self.assertFalse(body["running"])
+        self.assertFalse(body["online"])
+
+    def test_what_the_app_did_to_the_engine_is_in_it(self):
+        server.PROCS["qwen"].note("Stopping pid 1234 — stopped")
+        with server.app.test_client() as web:
+            lines = web.get("/api/comfy/log?engine=qwen").get_json()["lines"]
+        self.assertIn("[Script Builder] Stopping pid 1234 — stopped", lines)
+
+    def test_the_count_is_clamped_and_never_a_500(self):
+        for i in range(500):
+            server.PROCS["qwen"].note(f"line {i}")
+        with server.app.test_client() as web:
+            self.assertEqual(
+                len(web.get("/api/comfy/log?n=9999").get_json()["lines"]), 400)
+            self.assertEqual(
+                len(web.get("/api/comfy/log?n=0").get_json()["lines"]), 1)
+            # A value typed into a URL is not a reason for a stack trace.
+            junk = web.get("/api/comfy/log?n=lots")
+            self.assertEqual(junk.status_code, 200)
+            self.assertEqual(len(junk.get_json()["lines"]), 80)
+
+    def test_an_engine_that_does_not_exist_is_a_sentence(self):
+        with server.app.test_client() as web:
+            r = web.get("/api/comfy/log?engine=nope")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("nope", r.get_json()["error"])
+
+
+class RestartTakesTheFourRoutes(EngineFixture):
+    """Start said "already running", Restart said "not started by this app",
+    and the only advice left was to hunt a windowless python in Task Manager.
+
+    Each route now says which one it took, because "Restarting ComfyUI" over a
+    takeover hides the part that matters — something else was on that port and
+    has just been closed.
+    """
+
+    def test_nothing_running_is_a_plain_start(self):
+        port = free_port()
+        install = fake_install(self.root)
+        self.slot(comfy_url=f"http://127.0.0.1:{port}",
+                  comfy_dir=str(install), python=sys.executable)
+        with server.app.test_client() as web:
+            body = web.post("/api/comfy/restart?engine=qwen").get_json()
+        self.assertEqual(body["how"], "started")
+        self.assertEqual(self.finish_task(body["task"]), "done")
+        self.assertTrue(online(f"http://127.0.0.1:{port}"))
+
+    def test_one_we_own_is_stopped_and_started_under_a_new_pid(self):
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        install = fake_install(self.root)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  python=sys.executable)
+        server.PROCS["qwen"].start(sys.executable, install, port,
+                                   server.progress)
+        self.assertTrue(online(url))
+        before = server.PROCS["qwen"].proc.pid
+        with server.app.test_client() as web:
+            body = web.post("/api/comfy/restart?engine=qwen").get_json()
+        self.assertEqual(body["how"], "managed")
+        self.assertEqual(self.finish_task(body["task"]), "done")
+        self.assertNotEqual(server.PROCS["qwen"].proc.pid, before)
+        self.assertTrue(online(url))
+
+    def test_somebody_elses_is_closed_and_replaced(self):
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        orphan = self.stray(spawn_mock(port, self.root / "orphan"))
+        self.assertTrue(online(url))
+        install = fake_install(self.root)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  python=sys.executable)
+        with server.app.test_client() as web:
+            body = web.post("/api/comfy/restart?engine=qwen").get_json()
+        self.assertEqual(body["how"], "takeover")
+        self.assertIsNotNone(orphan.poll(), "the orphan was left running")
+        self.assertEqual(self.finish_task(body["task"]), "done")
+        self.assertTrue(server.PROCS["qwen"].alive())
+        # And the console says what was done to it, not just that it happened.
+        said = "\n".join(server.PROCS["qwen"].tail(200))
+        self.assertIn("was not started here", said)
+        self.assertIn("Stopping pid", said)
+
+    def test_an_engine_with_no_install_is_refused_before_anything_is_killed(self):
+        # Taking a port from someone and having nothing to start in its place
+        # is not a restart, it is a hole — so this one is answered before the
+        # takeover, and the ComfyUI on the port is left alone.
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        theirs = self.stray(spawn_mock(port, self.root / "theirs"))
+        self.assertTrue(online(url))
+        self.slot(comfy_url=url, comfy_dir="", python="", managed=True)
+        with server.app.test_client() as web:
+            r = web.post("/api/comfy/restart?engine=qwen")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("setup", r.get_json()["error"].lower())
+        self.assertIsNone(theirs.poll(), "it closed a ComfyUI it could not replace")
+
+
+class StartingOnACpuOnlyTorch(EngineFixture):
+    """What this is for: an RTX 4060, PyPI's CPU torch in Qwen's environment,
+    and every Start and Restart ending in a stack trace that closed with
+    "AssertionError: Torch not compiled with CUDA enabled"."""
+
+    def setUp(self):
+        super().setUp()
+        server.cfg["torch_index"] = ""          # Automatic
+        self.port = free_port()
+        self.url = f"http://127.0.0.1:{self.port}"
+        self.install = fake_install(self.root)
+        self.slot(comfy_url=self.url, comfy_dir=str(self.install),
+                  python=sys.executable)
+
+    def cpu_torch(self, gpu: dict) -> None:
+        for patch in (mock.patch.object(bootstrap, "installed_torch",
+                                        return_value=torch_info("2.14.0")),
+                      mock.patch.object(bootstrap, "nvidia_gpu",
+                                        return_value=gpu)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def said(self) -> str:
+        return "\n".join(server.PROCS["qwen"].tail(200))
+
+    @unittest.skipIf(sys.platform == "darwin", "a Mac never gets --cpu")
+    def test_start_beside_a_card_is_a_sentence_and_nothing_is_launched(self):
+        self.cpu_torch(RTX_4060)
+        with server.app.test_client() as web:
+            r = web.post("/api/comfy/start?engine=qwen")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("Reinstall on PyTorch · Qwen3-TTS", r.get_json()["error"])
+        self.assertIsNone(server.PROCS["qwen"].proc,
+                          "it launched an engine that could only die")
+        # And the engine console says it, not just the toast.
+        self.assertIn("CPU-only build", self.said())
+
+    @unittest.skipIf(sys.platform == "darwin", "a Mac never gets --cpu")
+    def test_start_with_no_card_runs_it_on_the_cpu(self):
+        self.cpu_torch(NO_GPU)
+        with server.app.test_client() as web:
+            r = web.post("/api/comfy/start?engine=qwen")
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertTrue(online(self.url))
+        self.assertIn("--cpu", server.PROCS["qwen"].proc.args)
+        deadline = time.time() + 10
+        while "Device: cpu" not in self.said() and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertIn("Device: cpu", self.said(),
+                      "the flag never reached ComfyUI's own command line")
+        self.assertIn("--cpu", self.said())
+
+    @unittest.skipIf(sys.platform == "darwin", "a Mac never gets --cpu")
+    def test_restart_refuses_before_it_takes_anyone_elses_port(self):
+        # Rule 33a: no port is taken that cannot be filled.
+        theirs = self.stray(spawn_mock(self.port, self.root / "theirs"))
+        self.assertTrue(online(self.url))
+        self.cpu_torch(RTX_4060)
+        with server.app.test_client() as web:
+            r = web.post("/api/comfy/restart?engine=qwen")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("CPU-only build", r.get_json()["error"])
+        self.assertIsNone(theirs.poll(),
+                          "it closed a ComfyUI it could not replace")
+
+    def test_a_torch_reinstall_stops_the_engine_it_is_about_to_replace(self):
+        # Windows will not let pip replace a DLL a running ComfyUI has loaded,
+        # and torch is nothing but DLLs.
+        server.PROCS["qwen"].start(sys.executable, self.install, self.port,
+                                   server.progress)
+        self.assertTrue(online(self.url))
+        running = []
+        with mock.patch.object(manager, "_install_torch",
+                               side_effect=lambda *_a: running.append(
+                                   server.PROCS["qwen"].alive())):
+            with server.app.test_client() as web:
+                body = web.post("/api/deps/torch_qwen/install",
+                                json={}).get_json()
+            self.assertEqual(self.finish_task(body["task"]), "done")
+        self.assertEqual(running, [False])
+        self.assertIn("Stopping this engine while its packages change",
+                      self.said())
+
+    def test_installing_git_leaves_the_engine_alone(self):
+        stops = []
+        with mock.patch.object(manager, "_install_git"):
+            view = manager.install_dependency(
+                "git", server.cfg, {},
+                stop_engine=lambda e: stops.append(e) or True).view()
+            self.assertEqual(self.finish_task(view), "done")
+        self.assertEqual(stops, [])
+
+
+class ChoosingAnEngineStartsIt(EngineFixture):
+    """Choosing an engine brings it up and takes the other one down — one
+    engine on the card (rule 31) — and choosing one that cannot start says
+    why and leaves the one that was running alone. Both engines, real
+    processes, real ports."""
+
+    def setUp(self):
+        super().setUp()
+        server.cfg.update(run_both_engines=False, want_moss=True)
+        self.urls = {}
+        for eid in ("qwen", "moss"):
+            self.urls[eid] = f"http://127.0.0.1:{free_port()}"
+            bootstrap.engine_cfg(server.cfg, eid).update(
+                comfy_url=self.urls[eid], python=sys.executable,
+                comfy_dir=str(fake_install(self.root / eid, eid)),
+                managed=True, auto_start=True)
+
+    def choose(self, eid: str):
+        with server.app.test_client() as web:
+            return web.post(f"/api/comfy/start?engine={eid}")
+
+    def test_each_engine_starts_when_chosen_and_the_other_stops(self):
+        for eid, other in (("qwen", "moss"), ("moss", "qwen"),
+                           ("qwen", "moss")):
+            with self.subTest(chose=eid):
+                r = self.choose(eid)
+                self.assertEqual(r.status_code, 200, r.get_json())
+                self.assertTrue(online(self.urls[eid]), f"{eid} never came up")
+                self.assertTrue(offline(self.urls[other]),
+                                f"{other} was left on the card")
+                self.assertFalse(server.PROCS[other].alive())
+
+    def test_an_engine_that_cannot_start_leaves_the_running_one_alone(self):
+        self.assertEqual(self.choose("qwen").status_code, 200)
+        self.assertTrue(online(self.urls["qwen"]))
+        refuse = lambda _py, _cfg, eid: ([], "MOSS-TTS's PyTorch is damaged.") \
+            if eid == "moss" else ([], "")
+        with mock.patch.object(bootstrap, "torch_launch", side_effect=refuse):
+            r = self.choose("moss")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("damaged", r.get_json()["error"])
+        self.assertTrue(server.PROCS["qwen"].alive(),
+                        "switching to a broken engine took the working one down")
+        self.assertTrue(bootstrap.comfy_online(self.urls["qwen"]))
+
+
+class AnEngineThatDiesWhileStarting(EngineFixture):
+    """Restart sat on "Restarting…" for fifteen minutes over an engine that
+    had died in its first seconds, and Start said "its last words are below"
+    over a traceback. Both notice the exit at once and say why."""
+
+    def setUp(self):
+        super().setUp()
+        self.url = f"http://127.0.0.1:{free_port()}"
+        install = fake_install(self.root)
+        (install / "main.py").write_text(
+            "import sys\nprint(%r, flush=True)\nsys.exit(1)\n"
+            % "\n".join(DAMAGED_TORCH_CRASH))
+        self.slot(comfy_url=self.url, comfy_dir=str(install),
+                  python=sys.executable)
+
+    def test_restart_says_why_at_once(self):
+        began = time.time()
+        with server.app.test_client() as web:
+            body = web.post("/api/comfy/restart?engine=qwen").get_json()
+        self.assertEqual(self.finish_task(body["task"], timeout=30), "error")
+        self.assertLess(time.time() - began, 30)
+        detail = manager.TASKS.get(body["task"]["id"]).detail
+        self.assertIn("PyTorch is damaged", detail)
+
+    def test_start_reports_why_it_stopped_in_a_sentence(self):
+        with server.app.test_client() as web:
+            self.assertEqual(web.post("/api/comfy/start?engine=qwen")
+                             .status_code, 200)
+            deadline = time.time() + 20
+            while not server.PROCS["qwen"].crashed() and time.time() < deadline:
+                time.sleep(0.1)
+            time.sleep(0.3)             # let the reader drain the pipe
+            slot = web.get("/api/status?engine=qwen").get_json()["installs"]["qwen"]
+            log = web.get("/api/comfy/log?engine=qwen").get_json()
+        self.assertFalse(slot["running"])
+        self.assertIn("PyTorch is damaged", slot["stopped"])
+        self.assertIn("PyTorch is damaged", log["stopped"])
+
+    def test_a_take_is_told_why_instead_of_waiting(self):
+        began = time.time()
+        why = server.activate("qwen")
+        self.assertLess(time.time() - began, 30)
+        self.assertIn("Reinstall on PyTorch · Qwen3-TTS", why)
+
+
+class WhenThePortWillNotBeGivenUp(EngineFixture):
+    """A refusal has to name the obstacle it actually hit.
+
+    "It would not close" covers a process owned by an administrator, a
+    supervisor respawning it, and a database that was never ComfyUI — and all
+    three need a different sentence from the person reading it.
+    """
+
+    def test_something_supervising_it_is_diagnosed_not_shrugged_at(self):
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        supervisor = self.root / "supervisor.py"
+        # ComfyUI Desktop and every launcher script behave exactly like this:
+        # kill the engine and a second one is up before the port stops
+        # answering. Quiet is only free once it stays quiet.
+        supervisor.write_text(
+            "import os, subprocess, sys, time\n"
+            "while True:\n"
+            f"    p = subprocess.Popen([sys.executable, {str(MOCK_COMFY)!r},\n"
+            f"                          {str(self.root / 'sup')!r}],\n"
+            "                         env=dict(os.environ,\n"
+            f"                                  MOCK_COMFY_PORT='{port}'),\n"
+            "                         stdout=subprocess.DEVNULL,\n"
+            "                         stderr=subprocess.DEVNULL)\n"
+            "    p.wait()\n"
+            "    time.sleep(0.2)\n")
+        self.stray(subprocess.Popen(
+            [sys.executable, str(supervisor)], start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        self.assertTrue(online(url, 30))
+        install = fake_install(self.root)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  python=sys.executable)
+        with server.app.test_client() as web:
+            r = web.post("/api/comfy/restart?engine=qwen")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("supervising", r.get_json()["error"])
+
+    def test_a_process_that_is_not_comfyui_is_named_and_left_alone(self):
+        # The port is this engine's only by convention. Another app's dev
+        # server on it answers every health check exactly like a ComfyUI, and
+        # closing it would be this app doing real damage on a guess.
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        # Launched through a link whose name says nothing about python, so the
+        # command line is the one the guard has to read in the wild.
+        pretender = self.root / "acme-ledger-daemon"
+        os.symlink(sys.executable, pretender)
+        squatter = self.stray(subprocess.Popen(
+            [str(pretender), "-c",
+             "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+             "class H(BaseHTTPRequestHandler):\n"
+             "    def do_GET(self):\n"
+             "        self.send_response(200)\n"
+             "        self.send_header('Content-Type', 'application/json')\n"
+             "        self.end_headers()\n"
+             "        self.wfile.write(b'{\"system\": {}}')\n"
+             "    def log_message(self, *a): pass\n"
+             f"HTTPServer(('127.0.0.1', {port}), H).serve_forever()\n"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        self.assertTrue(online(url))
+        install = fake_install(self.root)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  python=sys.executable)
+        with server.app.test_client() as web:
+            r = web.post("/api/comfy/restart?engine=qwen")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("acme-ledger-daemon", r.get_json()["error"])
+        self.assertIsNone(squatter.poll(), "it killed something it should not")
+
+    def test_kill_pid_reports_what_the_system_said(self):
+        # A refusal that is guessed at reads the same as a process that was
+        # never there, and those need different sentences.
+        victim = self.stray(subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(600)"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        self.assertIn("time.sleep", bootstrap.pid_cmdline(victim.pid))
+        # Reaped on another thread: a killed child nobody waits on stays in
+        # the process table as a zombie, kill(pid, 0) keeps succeeding on it,
+        # and a polite stop then reads as one that had to be forced. Nothing
+        # the app closes is a child of its own, so that is a shape of this
+        # test rather than of the function.
+        threading.Thread(target=victim.wait, daemon=True).start()
+        self.assertEqual(bootstrap.kill_pid(victim.pid), "stopped")
+        self.assertEqual(bootstrap.kill_pid(victim.pid), "already gone")
+
+    def test_a_fresh_process_cmdline_survives_the_exec_race(self):
+        path = mock.Mock()
+        path.exists.return_value = True
+        path.read_bytes.side_effect = [b"", b"", b"python\0main.py\0"]
+        with mock.patch.object(bootstrap, "Path", return_value=path), \
+                mock.patch.object(bootstrap.time, "sleep") as sleep:
+            self.assertEqual(bootstrap.pid_cmdline(123), "python main.py")
+        self.assertEqual(path.read_bytes.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+
+class WeightsTheEngineCannotReach(EngineFixture):
+    """Script Builder's version of the stale-model-scan warning.
+
+    Both node packs resolve their checkpoints per call, so weights that land
+    behind a running engine are found without a restart — that half does not
+    apply here. The half that does is rule 17: ComfyUI reads custom_nodes
+    once, at startup, so an engine started before the pack landed is a
+    complete install with no classes in it. Every folder present, every
+    download finished, and nothing that can speak.
+    """
+
+    def _status(self) -> dict:
+        with server.app.test_client() as web:
+            return web.get("/api/status?engine=qwen").get_json()
+
+    def test_a_complete_install_the_engine_cannot_use_is_named(self):
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        install = fake_install(self.root, with_nodes=True)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  models_dir=str(install / "models"), python=sys.executable)
+        drop_weights(server.cfg, "qwen")
+        self.stray(spawn_mock(port, self.root / "orphan"))
+        self.assertTrue(online(url))
+        requests.post(f"{url}/mock/hide/qwen", timeout=5)
+        server.for_engine("qwen").schema(force=True)
+
+        st = self._status()
+        self.assertTrue(st["comfy_online"])
+        self.assertEqual(st["missing_models"], [])
+        self.assertTrue(st["stale_models"])
+        self.assertIn("started before", st["stale_reason"])
+
+        # And it stops being stale the moment the classes are there — the
+        # flag is about this engine, not about the download.
+        requests.post(f"{url}/mock/hide/none", timeout=5)
+        server.for_engine("qwen").schema(force=True)
+        st = self._status()
+        self.assertFalse(st["stale_models"])
+        self.assertEqual(st["stale_reason"], "")
+
+    def test_models_still_arriving_are_not_called_stale(self):
+        # Nothing is on disk yet, so "the weights are here and unreachable" is
+        # simply untrue — and a warning that fires during a first download is
+        # one nobody reads the second time.
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        install = fake_install(self.root, with_nodes=True)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  models_dir=str(install / "models"), python=sys.executable)
+        self.stray(spawn_mock(port, self.root / "orphan"))
+        self.assertTrue(online(url))
+        requests.post(f"{url}/mock/hide/qwen", timeout=5)
+        server.for_engine("qwen").schema(force=True)
+        st = self._status()
+        self.assertTrue(st["missing_models"])
+        self.assertFalse(st["stale_models"])
+
+    def test_moss_is_judged_on_the_one_list_that_names_checkpoints(self):
+        # MossTTSModelLoader.model_variant is the only enum either pack
+        # publishes that names models. Qwen's name sizes and speakers, which
+        # is why it declares no marker at all.
+        self.assertEqual(bootstrap.ENGINES["moss"]["model_marker"], "moss")
+        self.assertEqual(bootstrap.ENGINES["qwen"]["model_marker"], "")
+        loaded = client_for({
+            "MossTTSModelLoader": {"input": {"required": {
+                "model_variant": [["MOSS-TTS (Local 1.7B)"], {}]}}},
+            "MossTTSGenerate": {"input": {"required": {}}}})
+        self.assertEqual(loaded.model_list("moss"), ["MOSS-TTS (Local 1.7B)"])
+        self.assertEqual(loaded.model_list("qwen"), [])
+
+
+class WhichComfyUIIsAnswering(EngineFixture):
+    """8188 is the port every ComfyUI picks, so the one holding it is often
+    somebody else's — and status has to say so in a flag the console can read,
+    not only in a sentence buried in the dependency report."""
+
+    def test_a_different_install_on_the_address_is_a_mismatch(self):
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        self.stray(spawn_mock(port, self.root / "theirs"))
+        self.assertTrue(online(url))
+        requests.post(f"{url}/mock/argv", json={"root": "/somebody/elses/ComfyUI"},
+                timeout=5)
+        self.slot(comfy_url=url, comfy_dir="/opt/mine/ComfyUI")
+        with server.app.test_client() as web:
+            st = web.get("/api/status?engine=qwen").get_json()
+        self.assertTrue(st["engine_mismatch"])
+        self.assertIn("somebody/elses", st["engine_argv"])
+        self.assertFalse(st["engine_managed"])
+
+        requests.post(f"{url}/mock/argv", json={"root": "/opt/mine/ComfyUI"},
+                timeout=5)
+        with server.app.test_client() as web:
+            st = web.get("/api/status?engine=qwen").get_json()
+        self.assertFalse(st["engine_mismatch"])
+
+    def test_a_build_that_will_not_say_is_not_accused(self):
+        # Older ComfyUI reports no argv. Crying wolf about the usual case
+        # teaches people to ignore the warning that matters.
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        self.stray(spawn_mock(port, self.root / "quiet"))
+        self.assertTrue(online(url))
+        self.slot(comfy_url=url, comfy_dir="/opt/mine/ComfyUI")
+        with server.app.test_client() as web:
+            st = web.get("/api/status?engine=qwen").get_json()
+        self.assertFalse(st["engine_mismatch"])
+        self.assertEqual(st["engine_argv"], "")
+
+
+class ALaunchEndsWithAWorkingEngine(EngineFixture):
+    """No button pressed. Offline: start it. Healthy: adopt it, and say so — a
+    ComfyUI somebody left running is not a problem to be solved. Useless:
+    replace it, through the same guard Restart uses."""
+
+    def test_a_quiet_port_gets_an_engine_of_our_own(self):
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        install = fake_install(self.root)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  models_dir=str(install / "models"), python=sys.executable)
+        server.ensure_engine_at_boot()
+        self.assertTrue(online(url, 30))
+        self.assertTrue(server.PROCS["qwen"].alive())
+
+    def test_a_healthy_engine_is_adopted_rather_than_killed(self):
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        install = fake_install(self.root, with_nodes=True)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  models_dir=str(install / "models"), python=sys.executable)
+        drop_weights(server.cfg, "qwen")
+        healthy = self.stray(spawn_mock(port, self.root / "healthy"))
+        self.assertTrue(online(url))
+        server.ensure_engine_at_boot()
+        self.assertIsNone(healthy.poll(), "it killed a working engine")
+        self.assertFalse(server.PROCS["qwen"].alive())
+        self.assertIn("Adopting", "\n".join(server.PROCS["qwen"].tail(50)))
+
+    def test_an_engine_that_cannot_reach_the_weights_is_replaced(self):
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        install = fake_install(self.root, with_nodes=True)
+        self.slot(comfy_url=url, comfy_dir=str(install),
+                  models_dir=str(install / "models"), python=sys.executable)
+        drop_weights(server.cfg, "qwen")
+        orphan = self.stray(spawn_mock(port, self.root / "orphan"))
+        self.assertTrue(online(url))
+        requests.post(f"{url}/mock/hide/qwen", timeout=5)
+
+        server.ensure_engine_at_boot()
+        self.assertIsNotNone(orphan.poll(), "the useless engine was left up")
+        self.assertTrue(server.PROCS["qwen"].alive())
+        said = "\n".join(server.PROCS["qwen"].tail(200))
+        self.assertIn("Replacing it", said)
+        self.assertIn("Stopping pid", said)
+
+    def test_an_engine_somebody_else_runs_is_never_touched(self):
+        # External mode: managed False with no folder of its own. There is
+        # nothing here to put back, so closing it would leave them with
+        # nothing at all.
+        port = free_port()
+        url = f"http://127.0.0.1:{port}"
+        theirs = self.stray(spawn_mock(port, self.root / "theirs"))
+        self.assertTrue(online(url))
+        self.slot(comfy_url=url, comfy_dir="", python="", managed=False)
+        server.ensure_engine_at_boot()
+        self.assertIsNone(theirs.poll())
+        self.assertIn("yours, not this app's",
+                      "\n".join(server.PROCS["qwen"].tail(50)))
+
+    def test_an_engine_set_not_to_start_is_left_alone(self):
+        port = free_port()
+        install = fake_install(self.root)
+        self.slot(comfy_url=f"http://127.0.0.1:{port}",
+                  comfy_dir=str(install), python=sys.executable,
+                  auto_start=False)
+        server.ensure_engine_at_boot()
+        self.assertFalse(server.PROCS["qwen"].alive())
+        self.assertFalse(bootstrap.comfy_online(f"http://127.0.0.1:{port}"))
+
+
+class ProductionLaunch(unittest.TestCase):
+    """Exercise the real entry point, not only its startup helper.
+
+    A unit call to ``ensure_engine_at_boot`` can pass even if ``main`` stops
+    invoking it, invokes it before loading the saved configuration, or fails
+    to bring up the web application alongside it.  This is the launch shape a
+    packaged user actually runs: a fresh server process and an offline,
+    managed ComfyUI install.
+    """
+
+    def test_server_launch_starts_its_managed_engine(self):
+        root = Path(tempfile.mkdtemp(prefix="sb-production-launch-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        data = root / "data"
+        data.mkdir()
+        install = fake_install(root)
+        app_port, engine_port = free_port(), free_port()
+        config = copy.deepcopy(bootstrap.DEFAULT_CONFIG)
+        config.update({"setup_complete": True, "engine": "moss"})
+        config["engines"] = {
+            "qwen": dict(bootstrap.engine_defaults("qwen"),
+                         comfy_url=f"http://127.0.0.1:{engine_port}",
+                         comfy_dir=str(install),
+                         models_dir=str(install / "models"),
+                         python=sys.executable),
+            "moss": bootstrap.engine_defaults("moss"),
+        }
+        (data / "config.json").write_text(json.dumps(config))
+        env = {**os.environ,
+               "SCRIPT_BUILDER_DATA": str(data),
+               "SCRIPT_BUILDER_PORT": str(app_port),
+               "SCRIPT_BUILDER_NO_BROWSER": "1"}
+        app_proc = subprocess.Popen(
+            [sys.executable, str(REPO / "server.py")], env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        engine_url = f"http://127.0.0.1:{engine_port}"
+        try:
+            deadline = time.time() + 30
+            app_url = f"http://127.0.0.1:{app_port}"
+            while time.time() < deadline:
+                try:
+                    if requests.get(app_url, timeout=1).status_code == 200:
+                        break
+                except requests.RequestException:
+                    pass
+                time.sleep(0.1)
+            else:
+                self.fail("server.py did not make the application reachable")
+
+            self.assertTrue(online(engine_url, 30),
+                            "launch did not start the managed ComfyUI")
+            log = requests.get(f"{app_url}/api/comfy/log?engine=qwen",
+                               timeout=5).json()
+            self.assertTrue(log["running"])
+            self.assertTrue(log["online"])
+            self.assertIn("Starting the engine",
+                          "\n".join(log["lines"]))
+
+            # Read through the same public API as the browser and inspect the
+            # bytes it returns.  "Engine online" is not production-ready if
+            # the first prompt cannot travel through ComfyUI and come back as
+            # decodable, non-silent audio.
+            speak = requests.post(f"{app_url}/api/speak", json={
+                "mode": "multi", "style": "Clear and natural",
+                "title": "Production launch audio",
+                "lines": [{"speaker": 1,
+                           "text": "The production launch can speak."},
+                          {"speaker": 2,
+                           "text": "It can design a second voice too."}],
+                "speakers": {"1": {"name": "Narrator",
+                                    "kind": "preset", "speaker": "Ryan"},
+                             "2": {"name": "Designed voice",
+                                   "kind": "design",
+                                   "instruct": "A warm, confident voice"}},
+                "model": "0.6B", "attention": "auto", "pause": 0.2,
+            }, timeout=5)
+            self.assertEqual(speak.status_code, 200, speak.text)
+            job_id = speak.json()["job"]
+            deadline = time.time() + 30
+            job = None
+            while time.time() < deadline:
+                jobs = requests.get(f"{app_url}/api/jobs", timeout=5).json()
+                job = next((item for item in jobs if item["id"] == job_id), None)
+                if job and job["status"] != "running":
+                    break
+                time.sleep(0.1)
+            self.assertIsNotNone(job, "audio job disappeared")
+            self.assertEqual(job["status"], "done", job)
+            take = job["take"]
+            audio = requests.get(f"{app_url}/api/take/{take['id']}", timeout=5)
+            self.assertEqual(audio.status_code, 200)
+            with wave.open(io.BytesIO(audio.content), "rb") as wav:
+                self.assertGreater(wav.getnframes(), 0)
+                self.assertGreater(wav.getframerate(), 0)
+                raw = wav.readframes(wav.getnframes())
+            samples = struct.unpack(f"<{len(raw) // 2}h", raw)
+            self.assertGreater(max(map(abs, samples)), 0,
+                               "generated WAV contains only silence")
+
+            # Voice cloning is the third advertised Qwen workflow. Feed the
+            # take back through the upload endpoint, then require a second
+            # generation to complete with that server-side reference name.
+            upload = requests.post(
+                f"{app_url}/api/upload-reference",
+                files={"file": ("reference.wav", audio.content, "audio/wav")},
+                timeout=5)
+            self.assertEqual(upload.status_code, 200, upload.text)
+            clone = requests.post(f"{app_url}/api/speak", json={
+                "mode": "single", "title": "Production clone audio",
+                "lines": [{"speaker": 1,
+                           "text": "The cloned voice path works."}],
+                "speakers": {"1": {"name": "Clone", "kind": "clone",
+                                    "ref_audio": upload.json()["name"],
+                                    "ref_text": "The production launch can speak."}},
+                "model": "0.6B", "attention": "auto",
+            }, timeout=5)
+            self.assertEqual(clone.status_code, 200, clone.text)
+            clone_id = clone.json()["job"]
+            deadline = time.time() + 30
+            clone_job = None
+            while time.time() < deadline:
+                jobs = requests.get(f"{app_url}/api/jobs", timeout=5).json()
+                clone_job = next((item for item in jobs
+                                  if item["id"] == clone_id), None)
+                if clone_job and clone_job["status"] != "running":
+                    break
+                time.sleep(0.1)
+            self.assertIsNotNone(clone_job, "clone job disappeared")
+            self.assertEqual(clone_job["status"], "done", clone_job)
+
+            # The page calls the transcript optional, and the node refuses a
+            # clone without one unless it is told to copy the sound alone.
+            bare = requests.post(f"{app_url}/api/speak", json={
+                "mode": "single", "title": "Clone with no transcript",
+                "lines": [{"speaker": 1, "text": "Nobody typed the words."}],
+                "speakers": {"1": {"name": "Clone", "kind": "clone",
+                                    "ref_audio": upload.json()["name"],
+                                    "ref_text": ""}},
+                "model": "0.6B", "attention": "auto",
+            }, timeout=5)
+            self.assertEqual(bare.status_code, 200, bare.text)
+            bare_id = bare.json()["job"]
+            deadline = time.time() + 30
+            bare_job = None
+            while time.time() < deadline:
+                jobs = requests.get(f"{app_url}/api/jobs", timeout=5).json()
+                bare_job = next((item for item in jobs
+                                 if item["id"] == bare_id), None)
+                if bare_job and bare_job["status"] != "running":
+                    break
+                time.sleep(0.1)
+            self.assertIsNotNone(bare_job, "clone job disappeared")
+            self.assertEqual(bare_job["status"], "done", bare_job)
+
+            # Launch always returns to the primary engine, rather than
+            # silently restoring the secondary engine from the last session.
+            saved = json.loads((data / "config.json").read_text())
+            self.assertEqual(saved["engine"], "qwen")
+        finally:
+            app_proc.terminate()
+            try:
+                app_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                app_proc.kill()
+                app_proc.wait(timeout=5)
+            # SIGTERM can bypass Flask's finally block on some interpreters;
+            # never let the test's stand-in engine escape into the next test.
+            for pid in bootstrap.port_pids(engine_port):
+                bootstrap.kill_pid(pid)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ ComfyUI's packages, the node's own packages (transformers in particular), the
 model folders and the running engine — and install any of them on request.
 
 HuggingFace: browse a repo, pull a whole model folder into
-ComfyUI/models/qwen-tts/Qwen/, show progress, cancel, delete. Repo, token and
+ComfyUI/models/qwen-tts/<Name>/, show progress, cancel, delete. Repo, token and
 mirror are all set from the page; nothing here needs a terminal.
 """
 
@@ -22,6 +22,7 @@ import threading
 import time
 import uuid
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import bootstrap
@@ -120,10 +121,11 @@ def spawn(kind: str, title: str, fn, meta: dict | None = None) -> Task:
 def stream(cmd: list[str], task: Task, keep: tuple[str, ...] = ()) -> int:
     task.log("$ " + " ".join(cmd))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+                            stderr=subprocess.STDOUT, **bootstrap.PY_TEXT,
+                            env=bootstrap.py_env(), bufsize=1)
     assert proc.stdout
     for line in proc.stdout:
-        line = line.rstrip()
+        line = bootstrap.plain(line).rstrip()
         if not line:
             continue
         if not keep or line.startswith(keep):
@@ -140,7 +142,8 @@ def _probe(python: str, code: str, timeout: int = 90) -> tuple[int, str]:
         return 1, "no interpreter"
     try:
         out = subprocess.run([python, "-c", code], capture_output=True,
-                             text=True, timeout=timeout)
+                             **bootstrap.PY_TEXT, env=bootstrap.py_env(),
+                             timeout=timeout)
         return out.returncode, (out.stdout or out.stderr).strip()
     except Exception as exc:  # noqa: BLE001
         return 1, str(exc)
@@ -149,7 +152,7 @@ def _probe(python: str, code: str, timeout: int = 90) -> tuple[int, str]:
 # --------------------------------------------------------------------------- #
 # dependency report
 # --------------------------------------------------------------------------- #
-def no_cuda_reason(version: str) -> str:
+def no_cuda_reason(version: str, cpu_only: bool | None = None) -> str:
     """Why torch cannot see a GPU, in the words that fit this machine.
 
     "no GPU found" was reported to someone holding an RTX 4060, because all
@@ -157,9 +160,15 @@ def no_cuda_reason(version: str) -> str:
     usual cause is the build: a wheel tagged +cpu has no CUDA in it at all and
     never will, whatever hardware is underneath. Look at the machine before
     blaming it.
+
+    `cpu_only` is what torch itself says (torch.version.cuda is None), and
+    wins over the tag when given: PyPI's wheels carry no tag, so on Windows
+    the CPU build reads as a plain "2.14.0".
     """
     gpu = bootstrap.nvidia_gpu()
     build = version.split("+")[1] if "+" in version else ""
+    if cpu_only is None:
+        cpu_only = build == "cpu"
     # What the picker is set to now. Told to "pick the NVIDIA build above" by a
     # panel whose picker already reads "Automatic — NVIDIA GeForce RTX 4060
     # (CUDA build)", the only honest next move is the one button that is left,
@@ -167,7 +176,7 @@ def no_cuda_reason(version: str) -> str:
     fix = ("Press Reinstall." if bootstrap.torch_build(bootstrap.torch_index({}))
            .startswith("cu") else "Pick the NVIDIA build above and press "
                                   "Reinstall.")
-    if gpu["name"] and build == "cpu":
+    if gpu["name"] and cpu_only:
         return (f"torch {version} — this is the CPU-only build, but {gpu['name']} "
                 f"is here. {fix}")
     if gpu["name"] and not gpu["driver"]:
@@ -176,27 +185,54 @@ def no_cuda_reason(version: str) -> str:
     if gpu["name"]:
         return (f"torch {version} — {gpu['name']} is here but this build cannot "
                 f"use it. {fix}")
-    if build == "cpu":
+    if cpu_only:
         return (f"torch {version} — the CPU-only build, and no NVIDIA GPU was "
                 "found. Speech will be slow.")
     return f"torch {version} — no NVIDIA GPU found, speech will be slow."
 
 
-def _torch_row(py_comfy: str, suffix: str, label: str) -> dict:
-    """PyTorch as this engine's own environment has it."""
+def _torch_row(py_comfy: str, suffix: str, label: str,
+               cfg: dict | None = None, fresh: bool = False) -> dict:
+    """PyTorch as this engine's own environment has it.
+
+    `fresh` reads torch's files again even if pip has not touched them since
+    the last look — what Recheck asks for.
+    """
     if not py_comfy:
         return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
                 "state": "unknown", "detail": "Install ComfyUI first.",
                 "action": "install"}
     kind = "portable python_embeded" if "python_embeded" in py_comfy \
         else "virtual environment"
+    # Read before anything else: a damaged torch imports fine here and still
+    # dies inside ComfyUI, and its version reads as exactly the right build —
+    # which is how this row said "ok" over an engine that could not start.
+    # Nor is there any point importing it: the answer is already known.
+    damage = bootstrap.torch_damage_summary(bootstrap.torch_damage_cached(
+        py_comfy, fresh))
+    if damage:
+        have = bootstrap.installed_torch(py_comfy)
+        return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
+                "state": "warn", "repair": True, "action": "reinstall",
+                "detail": (f"torch {have.get('version', '')} is damaged — "
+                           f"{damage}. ComfyUI will not start on it. Press "
+                           "Reinstall.")}
     code, out = _probe(py_comfy,
                        "import torch,json;"
                        "print(json.dumps({'v':torch.__version__,"
                        "'cuda':torch.cuda.is_available(),"
+                       "'built':torch.version.cuda,"
+                       "'hip':getattr(torch.version,'hip',None),"
                        "'dev':(torch.cuda.get_device_name(0) "
                        "if torch.cuda.is_available() else '')}))")
     if code != 0:
+        have = bootstrap.installed_torch(py_comfy)
+        if have:
+            last = (out or "").strip().splitlines()[-1:] or [""]
+            return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
+                    "state": "warn", "repair": True, "action": "reinstall",
+                    "detail": (f"torch {have['version']} is installed but will "
+                               f"not import: {last[0][:160]} Press Reinstall.")}
         return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
                 "state": "missing", "detail": f"Not installed in the {kind}.",
                 "action": "install"}
@@ -210,9 +246,35 @@ def _torch_row(py_comfy: str, suffix: str, label: str) -> dict:
         return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
                 "state": "ok", "detail": f"torch {d['v']} — GPU: {d['dev']}",
                 "action": "reinstall"}
-    return {"id": "torch" + suffix, "label": f"PyTorch · {label}",
-            "state": "warn", "detail": no_cuda_reason(d["v"]),
-            "action": "reinstall"}
+    cpu_only = not d.get("built") and not d.get("hip")
+    row = {"id": "torch" + suffix, "label": f"PyTorch · {label}",
+           "state": "warn", "detail": no_cuda_reason(d["v"], cpu_only),
+           "action": "reinstall"}
+    # A CPU-only build where there is an NVIDIA card and the CUDA build is
+    # what the picker asks for is not a slow engine: it is one that stops as
+    # it starts, and bootstrap.torch_launch refuses to launch it. So it raises
+    # the Engine badge and Install everything missing repairs it, like a
+    # missing row — a "warn" alone left that button saying nothing was wrong.
+    if cpu_only and bootstrap.nvidia_gpu()["name"] and bootstrap.build_kind(
+            bootstrap.torch_build(bootstrap.torch_index(cfg or {}))) == "cuda":
+        row["repair"] = True
+    return row
+
+
+def version_tuple(ver: str) -> tuple:
+    """ "4.57.3" -> (4, 57, 3); "5.0.0rc1" -> (5, 0, 0). Stops at the first
+    part that does not start with a digit."""
+    out = []
+    for part in ver.strip().split("."):
+        digits = ""
+        for ch in part:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if not digits:
+            break
+        out.append(int(digits))
+    return tuple(out)
 
 
 def same_install(comfy_dir: str, engine_root: str) -> bool:
@@ -264,7 +326,8 @@ def engine_row(label: str, suffix: str, url: str, online: bool,
             "state": "ok", "detail": url + where, "action": None}
 
 
-def dependencies(cfg: dict, clients=None, engine: str = "") -> list[dict]:
+def dependencies(cfg: dict, clients=None, engine: str = "",
+                 fresh: bool = False) -> list[dict]:
     """What each engine needs, engine by engine.
 
     They no longer share anything below ComfyUI — separate clones, separate
@@ -294,143 +357,190 @@ def dependencies(cfg: dict, clients=None, engine: str = "") -> list[dict]:
                   "detail": git or "Needed to download ComfyUI and the nodes.",
                   "action": None if git else "install"})
 
-    for eid, eng in ENGINES.items():
-        label, suffix = eng["label"], "_" + eid
-        if not bootstrap.engine_enabled(cfg, eid):
-            items.append({"id": "comfyui" + suffix,
-                          "label": f"ComfyUI · {label}", "state": "off",
-                          "detail": "Turned off in Settings.", "action": None})
-            continue
-        slot = bootstrap.engine_cfg(cfg, eid)
-        client = clients.get(eid)
-        comfy_dir = Path(slot["comfy_dir"]) if slot.get("comfy_dir") else None
-
-        # Its own ComfyUI ------------------------------------------------- #
-        if comfy_dir and (comfy_dir / "main.py").exists():
-            items.append({"id": "comfyui" + suffix,
-                          "label": f"ComfyUI · {label}", "state": "ok",
-                          "detail": str(comfy_dir), "action": "update"})
-        else:
-            items.append({"id": "comfyui" + suffix,
-                          "label": f"ComfyUI · {label}", "state": "missing",
-                          "detail": f"{label} has no ComfyUI of its own yet — "
-                                    f"it would go in {APP_DIR / eng['dir_name']}.",
-                          "action": "install"})
-
-        # Its own nodes ---------------------------------------------------- #
-        loaded = client.engine_ready(eid) if client else None
-        if not (comfy_dir and bootstrap.node_installed(comfy_dir, eid)):
-            if loaded:
-                items.append({"id": "node" + suffix, "label": f"{label} nodes",
-                              "state": "ok",
-                              "detail": "Loaded by the ComfyUI you are "
-                                        "running. Set its folder in Settings "
-                                        "to manage them from here.",
-                              "action": None})
-            else:
-                items.append({"id": "node" + suffix, "label": f"{label} nodes",
-                              "state": "missing",
-                              "detail": f"{eng['node_repo']} is not installed.",
-                              "action": "install"})
-        else:
-            items.append({
-                "id": "node" + suffix, "label": f"{label} nodes",
-                "state": "ok" if loaded is not False else "warn",
-                "detail": (str(comfy_dir / "custom_nodes" / eng["node_dir"])
-                           if loaded is not False else
-                           "Installed, but this ComfyUI started before they "
-                           "were. Restart it so it loads them."),
-                "action": "update" if loaded is not False else "restart"})
-
-        # Its own environment ---------------------------------------------- #
-        py_comfy = comfy_python(cfg, eid)
-        items.append(_torch_row(py_comfy, suffix, label))
-
-        if py_comfy:
-            code, out = _probe(py_comfy,
-                               "import transformers,librosa;"
-                               "print(transformers.__version__)")
-            if code != 0:
-                items.append({"id": "node_reqs" + suffix,
-                              "label": f"Speech packages · {label}",
-                              "state": "missing",
-                              "detail": "transformers or librosa is missing.",
-                              "action": "install"})
-            else:
-                ver = out.splitlines()[-1].strip()
-                major = int(ver.split(".")[0]) if ver[:1].isdigit() else 0
-                # Qwen3-TTS is the strict one: 4.57.3, or 5.0 and up. MOSS asks
-                # only for 4.40+, and now that they no longer share an
-                # environment each is judged on its own floor.
-                good = (ver.startswith("4.57.3") or major >= 5) if eid == "qwen" \
-                    else (major >= 5 or ver >= "4.40")
-                items.append({
-                    "id": "node_reqs" + suffix,
-                    "label": f"Speech packages · {label}",
-                    "state": "ok" if good else "warn",
-                    "detail": f"transformers {ver}" + ("" if good else
-                              " — Qwen3-TTS needs 4.57.3, or 5.0 and up."),
-                    "action": "install"})
-        else:
-            items.append({"id": "node_reqs" + suffix,
-                          "label": f"Speech packages · {label}",
-                          "state": "unknown", "detail": "Install ComfyUI first.",
-                          "action": "install"})
-
-        # Its own models ---------------------------------------------------- #
-        models_dir = bootstrap.engine_models_dir(cfg, eid)
-        if models_dir and models_dir.is_dir():
-            missing = bootstrap.missing_models(models_dir, cfg, eid)
-            need = [m for m in missing
-                    if m["group"] in ("core", "preset", "moss_core")]
-            if need:
-                items.append({"id": "models" + suffix,
-                              "label": f"Voices and models · {label}",
-                              "state": "missing",
-                              "detail": "Missing: " + ", ".join(m["repo"] for m in need),
-                              "action": "models"})
-            elif missing:
-                items.append({"id": "models" + suffix,
-                              "label": f"Voices and models · {label}",
-                              "state": "warn",
-                              "detail": "Optional: " + ", ".join(m["repo"]
-                                                                 for m in missing),
-                              "action": "models"})
-            else:
-                items.append({"id": "models" + suffix,
-                              "label": f"Voices and models · {label}",
-                              "state": "ok", "detail": "All folders present.",
-                              "action": "models"})
-        else:
-            items.append({"id": "models" + suffix,
-                          "label": f"Voices and models · {label}",
-                          "state": "unknown",
-                          "detail": "Set up this engine first.",
-                          "action": "models"})
-
-        # Is it up, and is it ours ------------------------------------------- #
-        online = bootstrap.comfy_online(slot["comfy_url"])
-        root = ""
-        if online and client:
-            try:
-                root = client.engine_root()
-            except Exception:  # noqa: BLE001
-                root = ""
-        items.append(engine_row(label, suffix, slot["comfy_url"], online,
-                                slot.get("comfy_dir") or "", root))
+    # The engines share nothing below ComfyUI, so they are checked side by
+    # side: each costs a torch import, a transformers import and a read of
+    # torch's files, and one after the other that kept the Engine page's list
+    # empty under its spinner for the length of both.
+    engines = list(ENGINES)
+    with ThreadPoolExecutor(max_workers=len(engines)) as pool:
+        for rows in pool.map(lambda e: _engine_rows(cfg, e, clients.get(e),
+                                                     fresh), engines):
+            items.extend(rows)
     return items
 
 
-def install_dependency(dep_id: str, cfg: dict, opts: dict) -> Task:
+def _engine_rows(cfg: dict, eid: str, client, fresh: bool = False) \
+        -> list[dict]:
+    """One engine's rows of the dependency report, in the order shown."""
+    eng = ENGINES[eid]
+    label, suffix = eng["label"], "_" + eid
+    items: list[dict] = []
+    if not bootstrap.engine_enabled(cfg, eid):
+        return [{"id": "comfyui" + suffix,
+                 "label": f"ComfyUI · {label}", "state": "off",
+                 "detail": "Turned off in Settings.", "action": None}]
+    slot = bootstrap.engine_cfg(cfg, eid)
+    comfy_dir = Path(slot["comfy_dir"]) if slot.get("comfy_dir") else None
+
+    # Its own ComfyUI ------------------------------------------------- #
+    if comfy_dir and (comfy_dir / "main.py").exists():
+        items.append({"id": "comfyui" + suffix,
+                      "label": f"ComfyUI · {label}", "state": "ok",
+                      "detail": str(comfy_dir), "action": "update"})
+    else:
+        items.append({"id": "comfyui" + suffix,
+                      "label": f"ComfyUI · {label}", "state": "missing",
+                      "detail": f"{label} has no ComfyUI of its own yet — "
+                                f"it would go in {APP_DIR / eng['dir_name']}.",
+                      "action": "install"})
+
+    # Its own nodes ---------------------------------------------------- #
+    loaded = client.engine_ready(eid) if client else None
+    if not (comfy_dir and bootstrap.node_installed(comfy_dir, eid)):
+        if loaded:
+            items.append({"id": "node" + suffix, "label": f"{label} nodes",
+                          "state": "ok",
+                          "detail": "Loaded by the ComfyUI you are "
+                                    "running. Set its folder in Settings "
+                                    "to manage them from here.",
+                          "action": None})
+        else:
+            items.append({"id": "node" + suffix, "label": f"{label} nodes",
+                          "state": "missing",
+                          "detail": f"{eng['node_repo']} is not installed.",
+                          "action": "install"})
+    else:
+        items.append({
+            "id": "node" + suffix, "label": f"{label} nodes",
+            "state": "ok" if loaded is not False else "warn",
+            "detail": (str(comfy_dir / "custom_nodes" / eng["node_dir"])
+                       if loaded is not False else
+                       "Installed, but this ComfyUI started before they "
+                       "were. Restart it so it loads them."),
+            "action": "update" if loaded is not False else "restart"})
+
+    # Its own environment ---------------------------------------------- #
+    py_comfy = comfy_python(cfg, eid)
+    items.append(_torch_row(py_comfy, suffix, label, cfg, fresh))
+
+    if py_comfy:
+        code, out = _probe(py_comfy,
+                           "import transformers,librosa;"
+                           "print(transformers.__version__)")
+        if code != 0:
+            items.append({"id": "node_reqs" + suffix,
+                          "label": f"Speech packages · {label}",
+                          "state": "missing",
+                          "detail": "transformers or librosa is missing.",
+                          "action": "install"})
+        else:
+            ver = out.splitlines()[-1].strip()
+            have = version_tuple(ver)
+            # Qwen3-TTS is the strict one: 4.57.3, or 5.0 and up. MOSS asks
+            # only for 4.40+, and now that they no longer share an
+            # environment each is judged on its own floor. Compared as
+            # numbers: as text, "4.9" passed a floor of "4.40".
+            if eid == "qwen":
+                good = have[:3] == (4, 57, 3) or have >= (5,)
+                need = "Qwen3-TTS needs 4.57.3, or 5.0 and up."
+            else:
+                good = have >= (4, 40)
+                need = f"{ENGINES[eid]['label']} needs 4.40 or later."
+            items.append({
+                "id": "node_reqs" + suffix,
+                "label": f"Speech packages · {label}",
+                "state": "ok" if good else "warn",
+                "detail": f"transformers {ver}" + ("" if good else
+                          f" — {need}"),
+                "action": "install"})
+    else:
+        items.append({"id": "node_reqs" + suffix,
+                      "label": f"Speech packages · {label}",
+                      "state": "unknown", "detail": "Install ComfyUI first.",
+                      "action": "install"})
+
+    # Its own models ---------------------------------------------------- #
+    models_dir = bootstrap.engine_models_dir(cfg, eid)
+    if models_dir and models_dir.is_dir():
+        missing = bootstrap.missing_models(models_dir, cfg, eid)
+        need = [m for m in missing
+                if m["group"] in ("core", "preset", "moss_core")]
+        if need:
+            items.append({"id": "models" + suffix,
+                          "label": f"Voices and models · {label}",
+                          "state": "missing",
+                          "detail": "Missing: " + ", ".join(m["repo"] for m in need),
+                          "action": "models"})
+        elif missing:
+            items.append({"id": "models" + suffix,
+                          "label": f"Voices and models · {label}",
+                          "state": "warn",
+                          "detail": "Optional: " + ", ".join(m["repo"]
+                                                             for m in missing),
+                          "action": "models"})
+        else:
+            items.append({"id": "models" + suffix,
+                          "label": f"Voices and models · {label}",
+                          "state": "ok", "detail": "All folders present.",
+                          "action": "models"})
+    else:
+        items.append({"id": "models" + suffix,
+                      "label": f"Voices and models · {label}",
+                      "state": "unknown",
+                      "detail": "Set up this engine first.",
+                      "action": "models"})
+
+    # Is it up, and is it ours ------------------------------------------- #
+    online = bootstrap.comfy_online(slot["comfy_url"])
+    root = ""
+    if online and client:
+        try:
+            root = client.engine_root()
+        except Exception:  # noqa: BLE001
+            root = ""
+    items.append(engine_row(label, suffix, slot["comfy_url"], online,
+                            slot.get("comfy_dir") or "", root))
+    return items
+
+
+# The installs that run pip in an engine's own environment.
+PIP_STEPS = ("node", "torch", "node_reqs")
+_INSTALL_LOCK = threading.Lock()
+
+
+class InstallBusy(RuntimeError):
+    """Another install is already writing this engine's environment."""
+
+
+def dep_parts(dep_id: str) -> tuple[str, str]:
+    """"torch_moss" -> ("torch", "moss"); a bare id is the default engine's."""
+    base, _, eid = dep_id.rpartition("_")
+    if eid not in ENGINES:
+        base, eid = dep_id, bootstrap.DEFAULT_ENGINE
+    return base, eid
+
+
+def install_dependency(dep_id: str, cfg: dict, opts: dict,
+                       stop_engine=None) -> Task:
     """Install one thing for one engine.
 
     Ids carry the engine — "torch_moss", "node_qwen" — because nothing below
     ComfyUI is shared any more. A bare id without a suffix is Qwen's, which is
     what a page written before the split would send.
+
+    `stop_engine(engine)` stops that engine's ComfyUI if this app is running
+    it, and says whether it did. Anything in PIP_STEPS calls it first: Windows
+    will not let pip replace a file a running ComfyUI has loaded — torch's
+    DLLs above all, which is exactly what a Reinstall has to replace — and the
+    engine has to restart to use new packages anyway.
+
+    One pip at a time per environment. A button that looked as if it had done
+    nothing got pressed again, and the row below it too, and two pips writing
+    the same site-packages — one of them uninstalling torch — break each
+    other; on Windows the loser fails on a file the winner holds. So a second
+    one is refused, naming the one that is running and how far it has got.
     """
-    base, _, eid = dep_id.rpartition("_")
-    if eid not in ENGINES:
-        base, eid = dep_id, bootstrap.DEFAULT_ENGINE
+    base, eid = dep_parts(dep_id)
     label = ENGINES[eid]["label"]
     titles = {"git": "Install Git",
               "comfyui": f"Install ComfyUI for {label}",
@@ -440,6 +550,18 @@ def install_dependency(dep_id: str, cfg: dict, opts: dict) -> Task:
     opts = dict(opts, engine=eid)
 
     def run(task: Task) -> None:
+        try:
+            _run(task)
+        finally:
+            # Whatever pip did — finished, failed or cut off — torch's files
+            # are read again rather than trusted from before it ran.
+            if base in PIP_STEPS:
+                bootstrap.forget_torch_health()
+
+    def _run(task: Task) -> None:
+        if base in PIP_STEPS and stop_engine and stop_engine(eid):
+            task.log(f"Stopped {label}'s ComfyUI first — its packages are "
+                     "about to change, and a running ComfyUI holds them open.")
         if base == "git":
             _install_git(task)
         elif base == "comfyui":
@@ -453,8 +575,18 @@ def install_dependency(dep_id: str, cfg: dict, opts: dict) -> Task:
         else:
             raise RuntimeError(f"Nothing to install for '{dep_id}'.")
 
-    return spawn("dependency", titles.get(base, dep_id), run,
-                 {"dep": dep_id, "engine": eid})
+    with _INSTALL_LOCK:
+        if base in PIP_STEPS:
+            for other in TASKS.running("dependency"):
+                kind, where = dep_parts(other.meta.get("dep", ""))
+                if kind in PIP_STEPS and where == eid:
+                    raise InstallBusy(
+                        f"{other.title} is still running"
+                        + (f" ({other.detail})" if other.detail else "")
+                        + f" — one install at a time into {label}'s "
+                          "environment. Wait for it to finish.")
+        return spawn("dependency", titles.get(base, dep_id), run,
+                     {"dep": dep_id, "engine": eid})
 
 
 def _reporter(task: Task):
@@ -537,7 +669,7 @@ def _install_torch(task: Task, cfg: dict, opts: dict) -> None:
     # there, beside the ComfyUI that will import it — never into a second
     # environment ComfyUI never loads. Probed once: each call runs the
     # candidates to see which of them is real.
-    own = "" if (target or cfg.get("managed")) \
+    own = "" if (target or slot.get("managed")) \
         else bootstrap.existing_python(comfy_dir)
     if target:
         task.log(f"Portable ComfyUI — installing into {target}")
@@ -549,29 +681,36 @@ def _install_torch(task: Task, cfg: dict, opts: dict) -> None:
         if not vpy.exists():
             task.set(detail="Creating the Python environment…")
             base = bootstrap.find_python()
-            if stream([base, "-m", "venv",
-                       str(comfy_dir.parent / "comfy-venv")], task) != 0:
+            if stream([base, "-m", "venv", str(vpy.parents[1])], task) != 0:
                 raise RuntimeError("Could not create the environment.")
         target = vpy
-    cfg["python"] = str(target)
-    bootstrap.save_config(cfg)
+    slot["python"] = str(target)
     if opts.get("torch_index") is not None:
         cfg["torch_index"] = opts["torch_index"]
-    index = bootstrap.torch_index(cfg)
+    bootstrap.save_config(cfg)
     say = _reporter(task)
-    task.set(detail="Installing PyTorch — this is the long one…")
     bootstrap.pip_install(str(target), ["--upgrade", "pip", "wheel"],
                           task.log, say)
-    bootstrap.drop_mismatched_torch(str(target), index, task.log)
-    args = ["torch", "torchaudio"]
-    if index:
-        args += ["--index-url", index]
-    bootstrap.pip_install(str(target), args, task.log, say)
     task.set(detail="Installing ComfyUI requirements…")
-    bootstrap.pip_install(str(target),
-                          ["-r", str(comfy_dir / "requirements.txt")],
-                          task.log, say)
-    task.set(detail="PyTorch installed.")
+    # The build of PyTorch is what this button is for. A requirement of
+    # ComfyUI's that will not install is worth reporting, but it is no reason
+    # to leave the CPU build in place — which is what stopping here did, and
+    # the row then read exactly as it had before the button was pressed.
+    reqs_failed = ""
+    try:
+        bootstrap.pip_install(str(target),
+                              ["-r", str(comfy_dir / "requirements.txt")],
+                              task.log, say)
+    except RuntimeError as exc:
+        reqs_failed = str(exc)
+        task.log(f"ComfyUI's requirements did not all install ({exc}) — "
+                 "carrying on with PyTorch.")
+    task.set(detail="Installing the selected PyTorch build — the long one…")
+    bootstrap.install_requested_torch(str(target), cfg, task.log, say)
+    if reqs_failed:
+        raise RuntimeError("PyTorch is in place, but ComfyUI's own "
+                           f"requirements did not all install — {reqs_failed}")
+    task.set(detail="PyTorch installed. Start the engine to use it.")
 
 
 def _install_node_reqs(task: Task, cfg: dict, engine: str = "") -> None:
@@ -594,6 +733,11 @@ def _install_node_reqs(task: Task, cfg: dict, engine: str = "") -> None:
             raise RuntimeError(f"The {eng['label']} nodes are not installed yet.")
         task.set(detail=f"Installing the {eng['label']} requirements…")
         bootstrap.pip_install(py, ["-r", str(reqs)], task.log, _reporter(task))
+    # A node requirements file is allowed to name torch.  On Windows that can
+    # silently swap a CUDA wheel for PyPI's CPU wheel, so restore the build the
+    # GPU picker selected before calling the engine repaired.
+    task.set(detail="Verifying the selected PyTorch build…")
+    bootstrap.install_requested_torch(py, cfg, task.log, _reporter(task))
     task.set(detail="Packages installed. Restart ComfyUI.")
 
 
@@ -662,17 +806,21 @@ class _Steps:
         return self.add(sid, label, "skip", detail)
 
 
-def selftest(cfg: dict, client, engine: str, task: Task, tail=None) -> None:
+def selftest(cfg: dict, client, engine: str, task: Task,
+             console=None) -> None:
     """Prove an engine end to end, or say exactly where it stops.
 
-    `tail` returns the last lines of ComfyUI's console when we are the ones who
-    started it; None when someone else's ComfyUI is in front of us and its
-    output is theirs to read.
+    `console` is the ComfyProcess whose output we can read when we are the
+    ones who started it; None when someone else's ComfyUI is in front of us
+    and its output is theirs to read.
     """
     eng = ENGINES[engine]
     steps = _Steps(task)
     task.set(meta={**task.meta, "engine": engine, "steps": []})
-    started_lines = len(tail(4000)) if tail else 0
+    # A count of lines written, not the buffer's length: the buffer trims
+    # itself, and slicing it by where it used to end found nothing new —
+    # "ran without reaching for the network" over a run that downloaded.
+    started_lines = console.written if console else 0
 
     # 1. is anything there ---------------------------------------------- #
     here = bootstrap.engine_cfg(cfg, engine)
@@ -713,28 +861,28 @@ def selftest(cfg: dict, client, engine: str, task: Task, tail=None) -> None:
         steps.fail("models", "Model folders are on disk",
                    "No models folder is set — run setup, or set it in Settings.")
         raise RuntimeError("No models folder.")
-    missing = bootstrap.missing_models(models_dir, cfg, engine)
-    if missing:
-        steps.fail("models", "Model folders are on disk",
-                   "Missing: " + ", ".join(m["repo"] for m in missing))
-        raise RuntimeError("Models are missing.")
     sizes = []
     for m in bootstrap.wanted_models(cfg, engine):
         folder = bootstrap.model_dir(models_dir, m["repo"], engine)
         sizes.append(f"{m['repo'].split('/')[-1]} "
                      f"{bootstrap.human_size(bootstrap.dir_size(folder))}")
-        # model_installed() accepts a folder with only a config.json in it,
-        # deliberately — a repo whose config landed first is still arriving.
-        # By the time anyone presses Test, a folder with no weights in it is a
-        # download that stopped, and it fails at load rather than here. Weight
-        # files, not a byte count: the right floor for a tokenizer is not the
-        # right floor for an 8B, and picking one number gets both wrong.
-        if not any(f.suffix in WEIGHT_SUFFIXES for f in folder.rglob("*")):
+        # Named before the plain "missing" below, because it says more: a
+        # folder that is there with no weights in it is a download that
+        # stopped, and the cure is to fetch it again. Weight files, not a
+        # byte count: the right floor for a tokenizer is not the right floor
+        # for an 8B, and picking one number gets both wrong.
+        if folder.is_dir() and not bootstrap.partial_download(folder) and \
+                not any(f.suffix in WEIGHT_SUFFIXES for f in folder.rglob("*")):
             steps.fail("models", "Model folders are on disk",
                        f"{m['repo']} has no weights in it, only "
                        f"{', '.join(sorted({f.suffix or f.name for f in folder.rglob('*') if f.is_file()}))[:80]}"
                        " — delete it on the Models page and fetch it again.")
             raise RuntimeError("A model folder has no weights in it.")
+    missing = bootstrap.missing_models(models_dir, cfg, engine)
+    if missing:
+        steps.fail("models", "Model folders are on disk",
+                   "Missing: " + ", ".join(m["repo"] for m in missing))
+        raise RuntimeError("Models are missing.")
     steps.ok("models", "Model folders are on disk", " · ".join(sizes))
 
     # 4. can we build a graph for it ------------------------------------- #
@@ -818,14 +966,14 @@ def selftest(cfg: dict, client, engine: str, task: Task, tail=None) -> None:
         if peak >= 0:
             detail += f" · peak {peak * 100:.0f}%"
     except wave.Error:
-        # Not a wav: SaveAudioAdvanced fell back to flac or opus, which is not
-        # a failure — only a take that will be zipped rather than joined.
-        detail += " (not wav — takes will be zipped instead of joined)"
+        # Not a wav: current ComfyUI saves flac, which takes convert back to
+        # wav in the engine's own interpreter before joining.
+        detail += f" ({Path(outs[0].get('filename', '')).suffix[1:] or 'not wav'})"
     steps.ok("audio", "Speech comes back", detail)
 
     # 7. what ComfyUI said while it worked -------------------------------- #
-    if tail:
-        fresh = tail(4000)[started_lines:]
+    if console:
+        fresh = console.since(started_lines)
         pulled = [l for l in fresh
                   if "huggingface" in l.lower() or "Downloading" in l
                   or "%|" in l]
@@ -894,7 +1042,7 @@ def hf_download_repo(cfg: dict, repo: str) -> Task:
 def _folder_row(repo: str, engine: str, folder: Path) -> dict:
     size = sum(f.stat().st_size for f in folder.rglob("*") if f.is_file())
     return {"repo": repo, "engine": engine, "size": size,
-            "partial": any(f.suffix == ".part" for f in folder.rglob("*")),
+            "partial": bootstrap.partial_download(folder),
             "path": str(folder)}
 
 
@@ -902,10 +1050,10 @@ def local_models(cfg: dict) -> list[dict]:
     """Every model folder on disk, each engine read in its own install.
 
     Two things differ per engine and both matter: where the folder lives —
-    each ComfyUI has its own models directory now — and its shape. Qwen nests
-    <Org>/<Name>, MOSS flattens to <Org>--<Name>. Walking one shape over the
-    other lists nothing, which is how a downloaded MOSS folder would read as
-    never downloaded.
+    each ComfyUI has its own models directory now — and its name. Qwen keeps
+    <Name> alone, MOSS flattens to <Org>--<Name>. Reading one shape as the
+    other gets every repo id wrong, which is how a downloaded model would read
+    as never downloaded.
     """
     out: list[dict] = []
     for eid, eng in ENGINES.items():
@@ -915,15 +1063,22 @@ def local_models(cfg: dict) -> list[dict]:
         root = base / eng["subdir"]
         if not root.is_dir():
             continue
-        if eng["layout"] == "flat":
-            for folder in sorted(p for p in root.iterdir() if p.is_dir()):
-                out.append(_folder_row(folder.name.replace("--", "/", 1), eid,
-                                       folder))
-        else:
-            for org in sorted(p for p in root.iterdir() if p.is_dir()):
-                for folder in sorted(p for p in org.iterdir() if p.is_dir()):
-                    out.append(_folder_row(f"{org.name}/{folder.name}", eid,
-                                           folder))
+        # A Qwen folder name has lost its org, so the table puts it back. One
+        # the table does not know is given Qwen's, which is enough for
+        # delete_model to find the same folder again. An org folder left over
+        # from the old <Org>/<Name> shape is not itself a model.
+        known = {m["repo"].split("/", 1)[1]: m["repo"] for m in eng["models"]}
+        orgs = {m["repo"].split("/", 1)[0] for m in eng["models"]}
+        for folder in sorted(p for p in root.iterdir() if p.is_dir()):
+            name = folder.name
+            if name.startswith(".") or name in bootstrap.QWEN_RESERVED \
+                    or name in orgs:
+                continue
+            if eng["layout"] == "org--name":
+                repo = name.replace("--", "/", 1)
+            else:
+                repo = known.get(name) or f"Qwen/{name}"
+            out.append(_folder_row(repo, eid, folder))
     return out
 
 
@@ -938,6 +1093,12 @@ def delete_model(cfg: dict, repo: str) -> None:
     target = bootstrap.model_dir(base, repo, engine).resolve()
     if not str(target).startswith(str(root)):
         raise RuntimeError("That path is outside the models folder.")
+    # A model is a folder *inside* the root. With no org folder in the way,
+    # "Qwen/" would name the root itself, and "Qwen/voices" the node's own
+    # saved voices.
+    if target == root or target.parent != root \
+            or target.name in bootstrap.QWEN_RESERVED:
+        raise RuntimeError("That is not a model folder.")
     if not target.is_dir():
         raise RuntimeError("That folder is already gone.")
     shutil.rmtree(target)

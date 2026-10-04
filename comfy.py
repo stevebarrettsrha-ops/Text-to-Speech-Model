@@ -13,6 +13,8 @@ is set up:
   cloned voice   LoadAudio ─► VoiceCloneNode(ref_audio, ref_text, target_text) ─► Save
   designed voice VoiceDesignNode(text, instruct) ─► Save
 
+  (Python class names — ComfyUI knows them as FB_Qwen3TTSCustomVoice etc.)
+
 Lines are generated one at a time and stitched afterwards, which is what lets
 the pause between lines, per-speaker voices and per-line retries work.
 
@@ -43,6 +45,23 @@ DESIGN = "VoiceDesignNode"
 CLONE_PROMPT = "VoiceClonePromptNode"
 DIALOGUE = "DialogueInferenceNode"
 
+# The names above are roles, not what ComfyUI calls the nodes. ComfyUI
+# registers a node under its NODE_CLASS_MAPPINGS key, and flybirdxx's pack
+# keys them "FB_Qwen3TTSCustomVoice" and so on — the Python class names above
+# never reach /object_info. Asking for them directly found no Qwen node on any
+# real install, so the engine never read as ready. Each role is resolved
+# against the schema through these lists, newest name first; rule 2's
+# candidate lists, one level up.
+QWEN_CLASS_NAMES = {
+    CUSTOM: ["FB_Qwen3TTSCustomVoice", "Qwen3TTSCustomVoice", CUSTOM],
+    CLONE: ["FB_Qwen3TTSVoiceClone", "Qwen3TTSVoiceClone", CLONE],
+    DESIGN: ["FB_Qwen3TTSVoiceDesign", "Qwen3TTSVoiceDesign", DESIGN],
+    CLONE_PROMPT: ["FB_Qwen3TTSVoiceClonePrompt", "Qwen3TTSVoiceClonePrompt",
+                   CLONE_PROMPT],
+    DIALOGUE: ["FB_Qwen3TTSDialogueInference", "Qwen3TTSDialogueInference",
+               DIALOGUE],
+}
+
 MOSS_LOADER = "MossTTSModelLoader"
 MOSS_GEN = "MossTTSGenerate"
 MOSS_DESIGN = "MossTTSVoiceDesign"
@@ -63,6 +82,33 @@ MOSS_DEFAULT_MODEL = "OpenMOSS-Team/MOSS-TTS-Local-Transformer"
 MOSS_VOICE_GENERATOR = "OpenMOSS-Team/MOSS-VoiceGenerator"
 MOSS_CODEC = "OpenMOSS-Team/MOSS-Audio-Tokenizer"
 
+# What OpenMOSS tuned each checkpoint to sample with: the node's own
+# utils/constants.py DEFAULT_PARAMS — keep it in step with that file, as
+# MOSS_MODEL_REPOS is. The node publishes the table and never applies it:
+# every MossTTSGenerate input defaults to the Delay 8B's numbers whatever the
+# loader holds, so leaving them to the schema ran the Local 1.7B — the model
+# this app loads by default — with no repetition penalty and half its top_k,
+# the settings the node's own README says to change for that model. None of
+# this reaches /object_info, which is why it is written down here at all.
+MOSS_SAMPLING = {
+    "OpenMOSS-Team/MOSS-TTS": {
+        "temperature": 1.7, "top_p": 0.8, "top_k": 25,
+        "repetition_penalty": 1.0},
+    "OpenMOSS-Team/MOSS-TTS-Local-Transformer": {
+        "temperature": 1.0, "top_p": 0.95, "top_k": 50,
+        "repetition_penalty": 1.1},
+    "OpenMOSS-Team/MOSS-VoiceGenerator": {
+        "temperature": 1.5, "top_p": 0.6, "top_k": 50,
+        "repetition_penalty": 1.1},
+}
+
+# Where the page's Expressiveness slider rests — Qwen's own default
+# temperature. On MOSS it scales the model's tuned temperature rather than
+# replacing it: 0.9 means "as OpenMOSS tuned it", which for the 8B is 1.7 and
+# for VoiceGenerator 1.5, so passing 0.9 through unchanged cooled every MOSS
+# model below the range it was trained for.
+NEUTRAL_TEMPERATURE = 0.9
+
 FALLBACK_SPEAKERS = ["Aiden", "Eric", "Serena"]
 
 
@@ -73,6 +119,29 @@ class ComfyError(RuntimeError):
 OFFLINE = ("ComfyUI stopped answering at {url}. It may have crashed or been "
            "closed — check its console, then start it again from the Engine "
            "panel.")
+
+
+def root_from_argv(argv) -> str:
+    """The ComfyUI folder an argv list was launched from, or "".
+
+    /system_stats reports the process's own argv, which starts with the
+    main.py it was started from. Empty when it cannot be told: older builds do
+    not report argv at all, and that must never read as "someone else's".
+    """
+    for arg in argv or []:
+        if isinstance(arg, str) and arg.lower().endswith("main.py"):
+            # Only an absolute path says where: "main.py" (how a launcher
+            # that cd's first starts it) or "ComfyUI\\main.py" (a portable
+            # .bat) is relative to a folder the process never reports, and
+            # resolved against this app's own folder it named a ComfyUI that
+            # does not exist — a mismatch warning over our own engine.
+            if not (arg.startswith(("/", "\\\\"))
+                    or (len(arg) > 2 and arg[1] == ":" and arg[2] in "/\\")):
+                return ""
+            # Both separators appear: a Windows path read on any platform.
+            cut = max(arg.rfind("/"), arg.rfind("\\"))
+            return arg[:cut] if cut > 0 else ""
+    return ""
 
 
 def _reach(fn, url: str):
@@ -124,8 +193,16 @@ class ComfyClient:
                 self._schema_at = time.time()
             return self._schema
 
+    def real(self, class_type: str) -> str:
+        """The name this ComfyUI registered a role under (see QWEN_CLASS_NAMES)."""
+        names = QWEN_CLASS_NAMES.get(class_type)
+        if not names:
+            return class_type
+        schema = self.schema()
+        return next((n for n in names if n in schema), class_type)
+
     def has(self, class_type: str) -> bool:
-        return class_type in self.schema()
+        return self.real(class_type) in self.schema()
 
     def vram_mb(self) -> int:
         """What ComfyUI says the card has, as a second opinion to nvidia-smi.
@@ -168,15 +245,10 @@ class ComfyClient:
             argv = ((r.json() or {}).get("system") or {}).get("argv") or []
         except Exception:  # noqa: BLE001
             return ""
-        for arg in argv:
-            if isinstance(arg, str) and arg.lower().endswith("main.py"):
-                # Both separators appear: a Windows path read on any platform.
-                cut = max(arg.rfind("/"), arg.rfind("\\"))
-                return arg[:cut] if cut > 0 else ""
-        return ""
+        return root_from_argv(argv)
 
     def node_inputs(self, class_type: str) -> dict:
-        info = self.schema().get(class_type)
+        info = self.schema().get(self.real(class_type))
         if not info:
             kit = "MOSS-TTS" if class_type.startswith("Moss") else "Qwen-TTS"
             raise ComfyError(
@@ -218,6 +290,14 @@ class ComfyClient:
             return []
         if spec and isinstance(spec[0], list):
             return [str(v) for v in spec[0]]
+        # ComfyUI's V3 nodes publish some choices as a DynamicCombo:
+        # ["COMFY_DYNAMICCOMBO_V3", {"options": [{"key": "flac", ...}]}], and
+        # the prompt takes the key as a plain string. SaveAudioAdvanced's
+        # format is one, so reading only plain lists found no formats at all.
+        if spec and len(spec) > 1 and isinstance(spec[1], dict) \
+                and isinstance(spec[1].get("options"), list):
+            return [str(o.get("key")) for o in spec[1]["options"]
+                    if isinstance(o, dict) and o.get("key")]
         return []
 
     def speakers(self) -> list[str]:
@@ -256,6 +336,19 @@ class ComfyClient:
     def moss_variants(self) -> list[str]:
         return self._enum(MOSS_LOADER, "model_variant")
 
+    def model_list(self, engine: str) -> list[str]:
+        """The engine's own account of which checkpoints it can load.
+
+        MOSS names them: MossTTSModelLoader.model_variant is a list of MOSS
+        checkpoint display names, so "moss" being absent from it means the
+        engine answering cannot load a MOSS model at all. Qwen's enums name
+        sizes ("0.6B") and preset speakers ("Ryan") and never a model, which
+        is why ENGINES["qwen"] declares no model_marker and this is empty for
+        it — an empty list with no marker to match is not evidence of
+        anything, and `stale_engine` treats it as none.
+        """
+        return self.moss_variants() if engine == "moss" else []
+
     def moss_variant_for(self, repo: str) -> str:
         """The loader enum entry that means `repo`, read off the node.
 
@@ -283,7 +376,12 @@ class ComfyClient:
             fmts = self._enum("SaveAudioAdvanced", "format")
             if prefer_wav and "wav" in fmts:
                 return "SaveAudioAdvanced", "wav"
-            return "SaveAudioAdvanced", (fmts[0] if fmts else "flac")
+            # Current ComfyUI offers no wav at all — flac, mp3 and opus. Flac
+            # is lossless, so the server can turn it back into wav and join
+            # the take (see server.flac_to_wav).
+            if "flac" in fmts or not fmts:
+                return "SaveAudioAdvanced", "flac"
+            return "SaveAudioAdvanced", fmts[0]
         if self.has("SaveAudio"):
             return "SaveAudio", "flac"
         raise ComfyError("ComfyUI has no audio save node. Update ComfyUI.")
@@ -334,7 +432,7 @@ class ComfyClient:
                     inputs[name] = opts["default"]
                 elif kind == "STRING":
                     inputs[name] = ""
-        return {"class_type": class_type, "inputs": inputs}
+        return {"class_type": self.real(class_type), "inputs": inputs}
 
     def _save(self, g: dict, source: str, opts: dict) -> str:
         save_class, fmt = self.save_node(prefer_wav=opts.get("prefer_wav", True))
@@ -347,6 +445,27 @@ class ComfyClient:
             wanted["format"] = {"names": ["format"], "value": fmt}
         g["3"] = self._node(save_class, wanted)
         return fmt
+
+    @staticmethod
+    def line_weights(voice: dict, opts: dict) -> tuple:
+        """Which checkpoint a line makes the engine hold.
+
+        Both node packs keep exactly one model resident: Qwen's
+        `load_qwen_model` clears its cache before loading a different one, and
+        MOSS's loader moves the last model off the card first. So a script
+        alternating a preset speaker with a cloned one reloads a checkpoint
+        from disk on every line. `run_job` groups lines by this key, and this
+        mirrors the choices the two builders below make.
+        """
+        kind = voice.get("kind") or "preset"
+        if (opts.get("engine") or "qwen") == "moss":
+            if kind == "design":
+                return ("moss", MOSS_VOICE_GENERATOR)
+            return ("moss", opts.get("moss_model") or MOSS_DEFAULT_MODEL)
+        if kind == "design":
+            return ("qwen", DESIGN, "1.7B")
+        node = CLONE if kind == "clone" else CUSTOM
+        return ("qwen", node, opts.get("model") or "")
 
     def build_line(self, line: dict, voice: dict, opts: dict) -> dict:
         """One line of dialogue → one prompt graph, on whichever engine."""
@@ -408,11 +527,8 @@ class ComfyClient:
             "seed": {"names": ["seed", "noise_seed"],
                      "value": random.randint(0, 2 ** 31 - 1)},
         }
-        if opts.get("temperature") is not None:
-            wanted["temperature"] = {"names": ["temperature"],
-                                     "value": float(opts["temperature"])}
-        if opts.get("top_p") is not None:
-            wanted["top_p"] = {"names": ["top_p"], "value": float(opts["top_p"])}
+        for name, value in moss_sampling(repo, opts).items():
+            wanted[name] = {"names": [name], "value": value}
         if opts.get("language"):
             wanted["language"] = {"names": ["language"],
                                   "value": opts["language"]}
@@ -491,12 +607,22 @@ class ComfyClient:
             g["1"] = self._node("LoadAudio",
                                 {"audio": {"names": ["audio"], "value": ref,
                                            "required": True}})
+            ref_text = (voice.get("ref_text") or "").strip()
             wanted = dict(common)
             wanted.update({
                 "ref_audio": {"names": ["ref_audio", "reference_audio"],
                               "value": ["1", 0], "required": True},
                 "ref_text": {"names": ["ref_text", "reference_text"],
-                             "value": voice.get("ref_text", "")},
+                             "value": ref_text},
+                # Without a transcript the node's default mode refuses the
+                # line outright — "ref_text is required when
+                # x_vector_only_mode=False (ICL mode)" — and the page calls the
+                # transcript optional. The speaker embedding alone still copies
+                # the voice, less closely, so that is what an empty box asks
+                # for.
+                "x_vector_only": {"names": ["x_vector_only",
+                                            "x_vector_only_mode"],
+                                  "value": not ref_text},
                 "text": {"names": ["target_text", "text"], "value": text,
                          "required": True},
             })
@@ -580,9 +706,18 @@ class ComfyClient:
         except Exception:  # noqa: BLE001
             return False
 
-    def interrupt(self) -> None:
+    def interrupt(self, prompt_id: str = "") -> None:
+        """Stop a prompt. Given its id, only that one — ComfyUI skips the
+        interrupt when something else is running — and it is also taken out
+        of the queue if it had not started. Without an id, whatever runs."""
         try:
-            requests.post(f"{self.url}/interrupt", timeout=10)
+            if prompt_id:
+                requests.post(f"{self.url}/interrupt",
+                              json={"prompt_id": prompt_id}, timeout=10)
+                requests.post(f"{self.url}/queue",
+                              json={"delete": [prompt_id]}, timeout=10)
+            else:
+                requests.post(f"{self.url}/interrupt", timeout=10)
         except Exception:
             pass
 
@@ -592,8 +727,8 @@ class ComfyClient:
         r.raise_for_status()
         return r.json().get(prompt_id) or {}
 
-    def outputs(self, prompt_id: str) -> list[dict]:
-        hist = self.history(prompt_id)
+    @staticmethod
+    def _audio(hist: dict) -> list[dict]:
         found = []
         for node_out in (hist.get("outputs") or {}).values():
             for key in ("audio", "audios", "result"):
@@ -602,8 +737,9 @@ class ComfyClient:
                         found.append(item)
         return found
 
-    def failed(self, prompt_id: str) -> str | None:
-        status = (self.history(prompt_id).get("status") or {})
+    @staticmethod
+    def _error(hist: dict) -> str | None:
+        status = (hist.get("status") or {})
         if status.get("status_str") == "error":
             for kind, data in status.get("messages", []):
                 if kind == "execution_error":
@@ -612,12 +748,47 @@ class ComfyClient:
             return "ComfyUI reported an error while generating."
         return None
 
+    def outputs(self, prompt_id: str) -> list[dict]:
+        return self._audio(self.history(prompt_id))
+
+    def failed(self, prompt_id: str) -> str | None:
+        return self._error(self.history(prompt_id))
+
+    def result(self, prompt_id: str) -> tuple[list[dict], str | None]:
+        """(audio, error) from one read of the history.
+
+        A prompt ComfyUI calls finished with no audio in it is an error now:
+        it used to be waited on for the full fifteen minutes, since nothing
+        was ever going to arrive.
+        """
+        hist = self.history(prompt_id)
+        err = self._error(hist)
+        if err:
+            return [], err
+        outs = self._audio(hist)
+        if not outs and (hist.get("status") or {}).get("completed"):
+            return [], ("ComfyUI finished the line but saved no audio. "
+                        "Check the engine's console for a warning.")
+        return outs, None
+
     def view(self, item: dict):
         params = {"filename": item.get("filename", ""),
                   "subfolder": item.get("subfolder", ""),
                   "type": item.get("type", "output")}
         return _reach(lambda: requests.get(f"{self.url}/view", params=params,
                                           stream=True, timeout=180), self.url)
+
+    def upload_bytes(self, name: str, data: bytes, mimetype: str) -> str:
+        files = {"image": (name, data, mimetype or "audio/wav")}
+        r = _reach(lambda: requests.post(
+            f"{self.url}/upload/image", files=files,
+            data={"type": "input", "overwrite": "true"}, timeout=180),
+            self.url)
+        r.raise_for_status()
+        data = r.json()
+        got = data.get("name") or name
+        sub = data.get("subfolder") or ""
+        return f"{sub}/{got}" if sub else got
 
     def upload_audio(self, file_storage) -> str:
         files = {"image": (file_storage.filename, file_storage.stream,
@@ -631,6 +802,22 @@ class ComfyClient:
         name = data.get("name") or file_storage.filename
         sub = data.get("subfolder") or ""
         return f"{sub}/{name}" if sub else name
+
+
+def moss_sampling(repo: str, opts: dict) -> dict:
+    """temperature, top_p, top_k and repetition_penalty for one MOSS line.
+
+    The checkpoint's own tuning, with the Expressiveness slider as a scale on
+    its temperature. A repo the table does not know gets the default model's
+    numbers, which are the conservative ones.
+    """
+    tuned = dict(MOSS_SAMPLING.get(repo) or MOSS_SAMPLING[MOSS_DEFAULT_MODEL])
+    if opts.get("temperature") is not None:
+        scale = float(opts["temperature"]) / NEUTRAL_TEMPERATURE
+        tuned["temperature"] = round(tuned["temperature"] * scale, 3)
+    if opts.get("top_p") is not None:
+        tuned["top_p"] = float(opts["top_p"])
+    return tuned
 
 
 def _readable(err: dict) -> str:

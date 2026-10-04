@@ -8,7 +8,7 @@ Steps, in order:
      requirements with the interpreter that ComfyUI itself runs on — the
      portable python_embeded when that is what is there, otherwise the venv.
   4. Download the Qwen3-TTS model folders from HuggingFace into
-     ComfyUI/models/qwen-tts/Qwen/.
+     ComfyUI/models/qwen-tts/<Name>/.
   5. Start ComfyUI headless and wait for /system_stats.
 
 Everything long runs on a worker thread and reports into a Progress object the
@@ -22,6 +22,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -84,7 +85,7 @@ def comfy_port(url: str) -> int:
     return port or 8188
 
 # The Qwen3-TTS collection on HuggingFace. The custom node looks for these
-# under ComfyUI/models/qwen-tts/Qwen/<folder>.
+# under ComfyUI/models/qwen-tts/<folder> — one level, no org folder.
 #
 # Which checkpoint serves which node: the CustomVoice weights carry the preset
 # speakers, the Base weights do zero-shot cloning, VoiceDesign builds a voice
@@ -167,7 +168,11 @@ DEFAULT_CONFIG = {
     "hf_repo": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
     "want_clone": True,
     "want_17b": False,
-    "want_voicedesign": False,
+    # On by default for the same reason as MOSS's below: the Voices card
+    # offers "Described" on the primary engine, and with the folder absent
+    # the node fetched ~4 GB in the middle of someone's first designed take —
+    # or, offline, failed it. At 1.7B it fits the same 8 GB card.
+    "want_voicedesign": True,
     "want_moss": True,
     "want_moss_8b": False,
     # On by default: MOSS has no preset speakers, so describing a voice is one
@@ -191,10 +196,11 @@ MOSS_SUBDIR = Path("moss-tts")
 # Everything that differs between the two engines, in one place, so adding a
 # third is a table entry rather than a hunt through four files.
 #
-# `layout` is the part that bites: the Qwen node searches
-# models/qwen-tts/<Org>/<Name>, while the MOSS loader builds its cache path as
-# repo_id.replace("/", "--") under models/moss-tts. Put a MOSS folder in the
-# Qwen shape and the node silently ignores it and downloads its own copy.
+# `layout` is the part that bites: the Qwen node lists models/qwen-tts one
+# level deep and downloads into models/qwen-tts/<Name>, while the MOSS loader
+# builds its cache path as repo_id.replace("/", "--") under models/moss-tts.
+# Put a folder anywhere else and that node silently ignores it and downloads
+# its own copy — or, offline, fails the line.
 ENGINES = {
     "qwen": {
         "id": "qwen",
@@ -205,8 +211,15 @@ ENGINES = {
         "dir_name": "ComfyUI-Qwen3-TTS",
         "port": 8188,
         "subdir": QWEN_SUBDIR,
-        "layout": "org",
+        "layout": "name",
         "models": MODEL_REPOS,
+        # A substring every entry of a healthy model list carries, for
+        # `stale_engine`. Qwen has none on purpose: its node publishes
+        # model_choice as ["0.6B", "1.7B"] and speaker as preset names, so
+        # nothing it reports names a checkpoint and there is nothing to match.
+        # An engine that cannot see Qwen's weights is caught by its nodes
+        # being absent instead.
+        "model_marker": "",
         "role": "primary",
         "blurb": "Preset speakers, cloning and voice design. Small and fast.",
     },
@@ -219,8 +232,12 @@ ENGINES = {
         "dir_name": "ComfyUI-MOSS-TTS",
         "port": 8189,
         "subdir": MOSS_SUBDIR,
-        "layout": "flat",
+        "layout": "org--name",
         "models": MOSS_MODEL_REPOS,
+        # MossTTSModelLoader.model_variant is the one enum either node pack
+        # publishes that names checkpoints, and every entry of it is a MOSS
+        # one.
+        "model_marker": "moss",
         "role": "secondary",
         "blurb": "Zero-shot cloning and voice design, no preset speakers.",
     },
@@ -416,8 +433,34 @@ class Progress:
 # --------------------------------------------------------------------------- #
 # interpreters
 # --------------------------------------------------------------------------- #
+# Every Python this app starts talks UTF-8 on its pipes, both ends. Windows
+# gives a piped child the ANSI code page with strict errors, ComfyUI's log
+# interceptor keeps it, and the Qwen pack prints "✅ … loaded" as it imports —
+# so on a cp1252 machine the pack died with UnicodeEncodeError, IMPORT FAILED,
+# only when this app started ComfyUI. And the reader here decoded with the same
+# code page, which raises on bytes UTF-8 uses: the pump thread died, the pipe
+# filled, and ComfyUI stalled on its next print.
+PY_TEXT = {"text": True, "encoding": "utf-8", "errors": "replace"}
+
+
+def py_env(env: dict | None = None) -> dict:
+    out = dict(os.environ if env is None else env)
+    out.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+    return out
+
+
+def _runs_python(cmd: list[str]) -> bool:
+    return len(cmd) > 1 and cmd[1] in ("-c", "-m")
+
+
 def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+    if _runs_python(cmd):
+        kw["env"] = py_env(kw.get("env"))
+        return subprocess.run(cmd, capture_output=True, **PY_TEXT, **kw)
+    # Other tools answer in the console's code page; a byte it cannot map is
+    # a character lost, never an exception.
+    return subprocess.run(cmd, capture_output=True, text=True,
+                          errors="replace", **kw)
 
 
 def find_python(prog: Progress | None = None) -> str:
@@ -501,7 +544,24 @@ def _interpreters(comfy_dir: Path) -> list[Path]:
     else:
         cands += [comfy_dir.parent / "python_standalone" / "bin" / "python"]
     cands += [venv_python(comfy_dir)]
-    return cands
+    # Never this app's own environment. A managed install sits beside the
+    # launcher, so comfy_dir.parent/.venv *is* Script Builder's Flask venv —
+    # and with torch missing from the engine's (a download cut off, a failed
+    # Reinstall) it won as the first interpreter that ran: ComfyUI was
+    # launched on it, and Install put torch into it. Rule 4.
+    ours = (APP_DIR / ".venv").resolve()
+    return [c for c in cands if _env_root(c) != ours]
+
+
+def _env_root(python: Path) -> Path:
+    # <env>/bin/python, <env>/Scripts/python.exe, <env>/python.exe
+    up = python.parent
+    if up.name.lower() in ("bin", "scripts"):
+        up = up.parent
+    try:
+        return up.resolve()
+    except OSError:
+        return up
 
 
 def existing_python(comfy_dir: Path) -> str:
@@ -607,21 +667,37 @@ def model_dir(models_dir: Path, repo: str, engine: str = "") -> Path:
     """Where a model folder has to live for its own node to find it.
 
     Two different layouts, and neither is a preference:
-      qwen  models/qwen-tts/<Org>/<Name>  — where the Qwen node searches.
+      qwen  models/qwen-tts/<Name>        — load_qwen_model lists
+            models/qwen-tts one level deep for a folder whose name carries the
+            size and the kind, and download_model_if_needed builds
+            <qwen_root>/<repo.split("/")[-1]>. The node's README draws an
+            <Org>/<Name> tree; its code has never looked there.
       moss  models/moss-tts/<Org>--<Name> — what the MOSS loader builds from
-            repo_id.replace("/", "--"). Put a MOSS folder in the Qwen shape
-            and the node does not see it; it downloads its own second copy.
+            repo_id.replace("/", "--").
+    Put a folder in any other shape and the node does not see it: it
+    downloads its own second copy, and offline the line fails.
     """
     eng = ENGINES[engine or engine_of(repo)]
     org, name = repo.split("/", 1)
-    if eng["layout"] == "flat":
+    if eng["layout"] == "org--name":
         return models_dir / eng["subdir"] / f"{org}--{name}"
-    return models_dir / eng["subdir"] / org / name
+    return models_dir / eng["subdir"] / name
 
 
 def qwen_model_dir(models_dir: Path, repo: str) -> Path:
     """Kept for callers that only ever meant Qwen."""
     return model_dir(models_dir, repo, "qwen")
+
+
+# A download still arriving: ours stream to .part, huggingface_hub's
+# snapshot_download (which both node packs call themselves) to .incomplete
+# under <folder>/.cache/huggingface/download.
+PARTIAL_SUFFIXES = (".part", ".incomplete")
+WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
+
+
+def partial_download(d: Path) -> bool:
+    return any(f.suffix in PARTIAL_SUFFIXES for f in d.rglob("*"))
 
 
 def model_installed(models_dir: Path, repo: str, engine: str = "") -> bool:
@@ -631,13 +707,95 @@ def model_installed(models_dir: Path, repo: str, engine: str = "") -> bool:
     # A .part is a download that stopped part way through. The config.json
     # beside it arrived first and is perfectly good, which is exactly why this
     # has to be checked: without it a folder whose weights are still half here
-    # reports as installed, and the engine reports ready.
-    if any(d.rglob("*.part")):
+    # reports as installed, and the engine reports ready. The .incomplete is
+    # the same thing left by a download the node started itself — and the
+    # node treats any folder that exists as finished, so it will load from it
+    # and fail on every line until the folder is whole.
+    if partial_download(d):
         return False
-    weights = [f for f in d.rglob("*")
-               if f.suffix in (".safetensors", ".bin", ".pt", ".pth")]
-    has_config = (d / "config.json").exists()
-    return bool(weights) or has_config
+    # And a config is not a model. download_repo fetches the small files
+    # first, so a request for the weights that fails before its .part is
+    # opened — a 503, a dropped DNS lookup — left config.json alone in the
+    # folder, which counted as installed: setup never fetched it again, and
+    # the first take failed inside the node. Every repo either engine uses
+    # carries its weights as one of these files.
+    return any(f.suffix in WEIGHT_SUFFIXES for f in d.rglob("*"))
+
+
+def folder_whole(d: Path) -> bool:
+    """Weights on disk and nothing still arriving: the bar one copy of a
+    folder has to clear before it is kept over another copy of itself."""
+    if not d.is_dir():
+        return False
+    files = list(d.rglob("*"))
+    return (not any(f.suffix in PARTIAL_SUFFIXES for f in files)
+            and any(f.suffix in WEIGHT_SUFFIXES for f in files))
+
+
+# Folders the Qwen node keeps under models/qwen-tts that are not models.
+QWEN_RESERVED = {"voices"}
+
+
+def migrate_qwen_layout(models_dir: Path | None, log=None) -> int:
+    """Move Qwen folders out of the <Org>/<Name> shape, into <Name>.
+
+    Script Builder used to download into models/qwen-tts/Qwen/<Name>, after
+    the node's README, which is not where the node's code looks. Every line
+    then either downloaded a second copy of a model already on disk — minutes
+    of silence on the first take, gigabytes twice over — or, offline, failed.
+    The node may also have started that second copy and been cut off, and a
+    folder that exists is one it loads from, whole or not.
+
+    Only the org folders our own tables name are touched. Per folder:
+    nothing at <Name> yet → move it there; a whole copy at <Name> already →
+    this one is the duplicate, and nothing can see it, so it goes; a partial
+    copy at <Name> and a whole one here → the whole one takes its place;
+    neither whole → both left for a download to finish. Returns how many
+    folders were settled.
+    """
+    if not models_dir:
+        return 0
+    root = Path(models_dir) / QWEN_SUBDIR
+    if not root.is_dir():
+        return 0
+    say = log or (lambda _m: None)
+    settled = 0
+    for org in sorted({m["repo"].split("/", 1)[0] for m in MODEL_REPOS}):
+        nest = root / org
+        if not nest.is_dir() or nest.is_symlink():
+            continue
+        for old in sorted(p for p in nest.iterdir()
+                          if p.is_dir() and not p.is_symlink()):
+            if old.name in QWEN_RESERVED or old.name.startswith("."):
+                continue
+            new = root / old.name
+            try:
+                if not new.exists():
+                    old.rename(new)
+                    say(f"Moved {org}/{old.name} to qwen-tts/{old.name}, "
+                        "where the Qwen node looks for it.")
+                elif folder_whole(new):
+                    shutil.rmtree(old)
+                    say(f"Removed {org}/{old.name}: a second copy of "
+                        f"qwen-tts/{old.name}, which the node already uses.")
+                elif folder_whole(old):
+                    shutil.rmtree(new)
+                    old.rename(new)
+                    say(f"Replaced an unfinished qwen-tts/{old.name} with the "
+                        f"whole copy from {org}/{old.name}.")
+                else:
+                    say(f"Left {org}/{old.name} alone: neither it nor "
+                        f"qwen-tts/{old.name} is whole yet.")
+                    continue
+                settled += 1
+            except OSError as exc:
+                say(f"Could not move {org}/{old.name} into place — {exc}. "
+                    "Close ComfyUI and start Script Builder again.")
+        try:
+            nest.rmdir()  # only when it is empty now
+        except OSError:
+            pass
+    return settled
 
 
 def wanted_models(cfg: dict, engine: str = "") -> list[dict]:
@@ -838,74 +996,155 @@ def download_repo(cfg: dict, repo: str, models_dir: Path,
         if should_cancel and should_cancel():
             return
         done_bytes += f["size"]
+    # A download the node began itself leaves .incomplete markers under
+    # <folder>/.cache. Every file they stood for is whole now, and left in
+    # place they would keep the folder reading as unfinished for good.
+    cache = target / ".cache"
+    if cache.is_dir():
+        for stale in cache.rglob("*.incomplete"):
+            stale.unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- #
 # ComfyUI process
 # --------------------------------------------------------------------------- #
+# ComfyUI colours its log whether or not anything is reading it as a
+# terminal, so a piped line arrives as "\x1b[32m[INFO]\x1b[0m ..." and the
+# engine console printed the escapes as boxes and brackets around every
+# line. Colour sequences (CSI), title sequences (OSC) and a stray ESC go.
+ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|.?)")
+
+
+def plain(line: str) -> str:
+    """A console line without its terminal colour codes."""
+    return ANSI.sub("", line) if "\x1b" in line else line
+
+
 class ComfyProcess:
     def __init__(self) -> None:
         self.proc: subprocess.Popen | None = None
         self.lines: list[str] = []
+        self.written = 0
         self._lock = threading.Lock()
+
+    def note(self, msg: str) -> None:
+        """An app-side line in the engine console.
+
+        What Script Builder does *to* an engine — stopping it, taking a port
+        off someone else, starting one in its place — belongs next to what the
+        engine itself says, in one window, in order. Split across two places it
+        reads as two unrelated stories.
+        """
+        with self._lock:
+            self._append(f"[Script Builder] {msg}")
+
+    def _append(self, line: str) -> None:
+        # Caller holds the lock. `written` never shrinks, so a reader can mark
+        # where it started and ask for what came after, which an index into a
+        # buffer that trims itself cannot answer.
+        self.lines.append(line)
+        self.written += 1
+        if len(self.lines) > 2000:
+            del self.lines[:1000]
+
+    def since(self, mark: int) -> list[str]:
+        """Lines written after `mark` (a value of `written`), as many as the
+        buffer still holds."""
+        with self._lock:
+            n = min(self.written - mark, len(self.lines))
+            return self.lines[-n:] if n > 0 else []
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
+    def crashed(self) -> bool:
+        """It was started here and has exited without being told to stop."""
+        return self.proc is not None and self.proc.poll() is not None
+
     def start(self, python: str, comfy_dir: Path, port: int,
-              prog: Progress) -> None:
+              prog: Progress, cfg: dict | None = None,
+              engine: str = "", extra: list[str] | None = None) -> None:
         """Raises RuntimeError with a sentence a person can act on. A ComfyUI
         folder that has moved, or an interpreter that is gone, is an engine
-        that cannot start — never a reason the whole app fails to boot."""
+        that cannot start — never a reason the whole app fails to boot.
+
+        With `cfg`, the torch it would run on is read first (`torch_launch`):
+        a CPU-only build is started with --cpu where that is the machine, and
+        refused where it is the fault, rather than launched to die on
+        "Torch not compiled with CUDA enabled". A caller that has already
+        asked passes the flags it got as `extra`, and the question is not put
+        twice."""
         if self.alive():
             return
         if not (comfy_dir / "main.py").exists():
             raise RuntimeError(
                 f"There is no ComfyUI at {comfy_dir} any more — the folder has "
                 "moved or been deleted. Run setup again from Settings.")
-        cmd = [python, "main.py", "--listen", "127.0.0.1", "--port", str(port),
-               "--disable-auto-launch"]
+        if extra is None and cfg is not None:
+            extra, refusal = torch_launch(python, cfg, engine)
+            if refusal:
+                raise RuntimeError(refusal)
+        if extra and "--cpu" in extra:
+            self.note("This environment's PyTorch has no GPU support in it — "
+                      "starting ComfyUI on the CPU (--cpu). Speech will be "
+                      "slow.")
+        # main.py by its full path, so /system_stats reports where this
+        # engine runs from (rule 18e); run as a bare "main.py" it cannot say.
+        cmd = [python, str(comfy_dir / "main.py"), "--listen", "127.0.0.1",
+               "--port", str(port),
+               "--disable-auto-launch"] + (extra or [])
         prog.log("Launching ComfyUI: " + " ".join(cmd))
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) \
             if platform.system() == "Windows" else 0
         try:
             self.proc = subprocess.Popen(cmd, cwd=str(comfy_dir),
                                          stdout=subprocess.PIPE,
-                                         stderr=subprocess.STDOUT, text=True,
-                                         bufsize=1, creationflags=flags)
+                                         stderr=subprocess.STDOUT, **PY_TEXT,
+                                         env=py_env(), bufsize=1,
+                                         creationflags=flags)
         except OSError as exc:
             raise RuntimeError(
                 f"ComfyUI could not be started with {python} — {exc}. "
                 "Run setup again from Settings.") from exc
-        threading.Thread(target=self._pump, args=(prog,), daemon=True).start()
+        # Give the reader the process it owns.  Looking it up through
+        # ``self.proc`` in the thread races with a quick stop/start: start()
+        # replaces that attribute while the old reader is still draining its
+        # pipe, which can leave the old Popen (and its descriptor) unclosed.
+        threading.Thread(target=self._pump, args=(self.proc, prog),
+                         daemon=True).start()
 
-    def _pump(self, prog: Progress) -> None:
-        assert self.proc and self.proc.stdout
-        for line in self.proc.stdout:
-            line = line.rstrip()
-            with self._lock:
-                self.lines.append(line)
-                if len(self.lines) > 2000:
-                    del self.lines[:1000]
-            if any(k in line for k in ("Error", "Traceback", "error:",
-                                       "Qwen", "Starting server",
-                                       "IMPORT FAILED")):
-                prog.log(f"ComfyUI: {line}")
+    def _pump(self, proc: subprocess.Popen, prog: Progress) -> None:
+        assert proc.stdout
+        try:
+            for line in proc.stdout:
+                line = plain(line).rstrip()
+                with self._lock:
+                    self._append(line)
+                if any(k in line for k in ("Error", "Traceback", "error:",
+                                           "Qwen", "Starting server",
+                                           "IMPORT FAILED")):
+                    prog.log(f"ComfyUI: {line}")
+        finally:
+            proc.stdout.close()
 
     def tail(self, n: int = 40) -> list[str]:
         with self._lock:
             return self.lines[-n:]
 
     def stop(self) -> None:
-        if self.alive():
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
             try:
-                self.proc.terminate()
-                self.proc.wait(timeout=15)
+                proc.terminate()
+                proc.wait(timeout=15)
             except Exception:
                 try:
-                    self.proc.kill()
+                    proc.kill()
+                    proc.wait(timeout=5)
                 except Exception:
                     pass
+        if self.proc is proc:
+            self.proc = None
 
 
 def comfy_online(url: str) -> bool:
@@ -915,13 +1154,251 @@ def comfy_online(url: str) -> bool:
         return False
 
 
-def wait_for_comfy(url: str, timeout: int = 900) -> bool:
-    deadline = time.time() + timeout
+def comfy_stats(url: str) -> dict | None:
+    """What is actually answering on the address — argv says which install.
+
+    `ComfyClient.engine_root()` reads the same field and returns the folder;
+    this returns the whole `system` dict, for the callers that want to print
+    the command line itself rather than compare two paths.
+    """
+    try:
+        r = requests.get(f"{url}/system_stats", timeout=3)
+        if r.status_code == 200:
+            return r.json().get("system") or {}
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def wait_for_comfy(url: str, timeout: int = 900, on_wait=None,
+                   alive=None) -> bool:
+    """Poll until ComfyUI answers.
+
+    `on_wait(elapsed, timeout)` runs on each pass. There is no honest
+    percentage for a model load, so how long it has been waiting is the only
+    number a caller can narrate with — and a start with no narration at all is
+    the one that reads as a hang.
+
+    `alive()` is the process being waited on. Once it has exited nothing is
+    going to answer, and Restart sat on "Restarting…" for fifteen minutes
+    over an engine that had died in its first two seconds.
+    """
+    started = time.time()
+    deadline = started + timeout
     while time.time() < deadline:
         if comfy_online(url):
             return True
+        if alive is not None and not alive():
+            return comfy_online(url)
+        if on_wait:
+            on_wait(time.time() - started, timeout)
         time.sleep(2)
     return False
+
+
+_TORCH_PATH = re.compile(
+    r"[\\/]site-packages[\\/](torch|torchvision|torchaudio|torchgen|functorch)"
+    r"[\\/]", re.I)
+
+
+def crash_reason(lines: list[str], engine: str = "") -> str:
+    """A ComfyUI that died while starting, in one sentence a person can act on.
+
+    Its console ends in a traceback, and the traceback is the truth — but
+    "ImportError: cannot import name 'is_fake_tensor'" three hundred
+    characters into site-packages is not something anyone can act on (rule
+    15). The shapes worth naming each get their own sentence and the control
+    that clears them; anything else is its own last line, never nothing.
+    """
+    label = ENGINES[engine]["label"] if engine in ENGINES else "The engine"
+    text = "\n".join(lines)
+    last, where, frame = "", "", ""
+    for line in lines:
+        hit = re.search(r'File "([^"]+)"', line)
+        if hit:
+            frame = hit.group(1)
+        elif re.match(r"\s*[\w.]*(Error|Exception)(:|$)", line):
+            # The exception, and the frame it was raised in.
+            last, where = line.strip(), frame
+    fix = f"Press Reinstall on PyTorch · {label} on the Engine page"
+    if "Torch not compiled with CUDA enabled" in text:
+        return (f"{label}'s PyTorch is the CPU-only build, and ComfyUI stops "
+                f"as it starts on it. {fix}.")
+    if "No module named 'torch'" in text:
+        return (f"{label}'s environment has no PyTorch at all. Press Install "
+                f"on PyTorch · {label} on the Engine page.")
+    if re.match(r"(ModuleNotFound|Import|Attribute)Error", last) \
+            and _TORCH_PATH.search(where):
+        return (f"{label}'s PyTorch is damaged — ComfyUI failed inside torch "
+                f"itself ({last[:160]}). That is what an install cut off "
+                f"partway leaves behind. {fix}: it takes torch out completely "
+                "and puts it back.")
+    if "Found no NVIDIA driver" in text:
+        return (f"{label} cannot reach the NVIDIA driver. Install or update "
+                "the driver, then start the engine again.")
+    if re.search(r"10048|address already in use|only one usage of each "
+                 r"socket address", text, re.I):
+        return (f"{label}'s port is taken by something else. Press Restart "
+                "ComfyUI to take it over, or give the engine another port in "
+                "Settings.")
+    if re.search(r"out of memory|OutOfMemoryError", text, re.I):
+        return (f"{label} ran out of GPU memory while starting. Close other "
+                "programs using the card, then start it again.")
+    if last:
+        return f"{label} stopped while starting: {last[:200]}"
+    return f"{label} stopped while starting — its console says why."
+
+
+# --------------------------------------------------------------------------- #
+# whoever is holding the port
+# --------------------------------------------------------------------------- #
+# "Close it yourself" is not an instruction anyone can follow against a
+# windowless python: it sends them hunting through Task Manager for one of
+# several identical rows. Everything below exists so the app can find that
+# process, say what it is, and close it — or say exactly why it could not.
+def _pids_from_proc_net(port: int) -> list[int]:
+    """Linux, with no external tools: the socket inode from /proc/net/tcp*,
+    then the process whose fd table holds it.
+
+    lsof is the obvious way and is missing from most minimal images, which is
+    where an orphan ComfyUI is likeliest to be the only thing on the port.
+    """
+    inodes = set()
+    for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(name).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 10:
+                continue
+            local, state, inode = parts[1], parts[3], parts[9]
+            # 0A is TCP_LISTEN, and the local port is four uppercase hex
+            # digits — 8188 is "1FFC", never "1ffc" and never "8188".
+            if state == "0A" and local.rsplit(":", 1)[-1] == f"{port:04X}":
+                inodes.add(inode)
+    if not inodes:
+        return []
+    pids = set()
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            for fd in (proc / "fd").iterdir():
+                try:
+                    target = os.readlink(fd)
+                except OSError:
+                    continue
+                if any(f"socket:[{i}]" == target for i in inodes):
+                    pids.add(int(proc.name))
+                    break
+        except OSError:
+            continue        # someone else's process, or one that just exited
+    return sorted(pids)
+
+
+def port_pids(port: int) -> list[int]:
+    """Whoever is listening on the port."""
+    if platform.system() == "Windows":
+        pids = set()
+        try:
+            out = _run(["netstat", "-ano", "-p", "TCP"], timeout=25).stdout
+        except Exception:  # noqa: BLE001
+            return []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0] == "TCP" \
+                    and parts[3] == "LISTENING" \
+                    and parts[1].rsplit(":", 1)[-1] == str(port):
+                try:
+                    pids.add(int(parts[4]))
+                except ValueError:
+                    pass
+        return sorted(pids)
+    found = _pids_from_proc_net(port)
+    if found:
+        return found
+    if shutil.which("lsof"):
+        try:
+            out = _run(["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+                       timeout=25).stdout
+            return sorted({int(t) for t in out.split() if t.strip().isdigit()})
+        except Exception:  # noqa: BLE001
+            pass
+    return []
+
+
+def pid_cmdline(pid: int) -> str:
+    """The command line of a process, or "" when it cannot be read."""
+    try:
+        if platform.system() == "Windows":
+            # WMIC is off by default from Windows 11 24H2 and gone in 25H2,
+            # and an empty answer here waved the not-a-ComfyUI guard through.
+            # CIM through PowerShell is the supported way; WMIC stays as the
+            # fallback for machines old enough to lack Get-CimInstance.
+            out = _run(["powershell", "-NoProfile", "-Command",
+                        "(Get-CimInstance Win32_Process -Filter "
+                        f"'ProcessId={int(pid)}').CommandLine"],
+                       timeout=25).stdout.strip()
+            if out:
+                return out.splitlines()[0].strip()
+            out = _run(["wmic", "process", "where", f"processid={pid}",
+                        "get", "commandline"], timeout=25).stdout
+            lines = [ln.strip() for ln in out.splitlines()
+                     if ln.strip() and "CommandLine" not in ln]
+            return lines[0] if lines else ""
+        cmd = Path(f"/proc/{pid}/cmdline")
+        if cmd.exists():
+            # A freshly forked process briefly has an empty cmdline while the
+            # child crosses exec().  Treating that transient as "unreadable"
+            # makes the port-takeover guard lose the very command it uses to
+            # decide whether a process is safe to stop.
+            for attempt in range(5):
+                value = cmd.read_bytes().replace(b"\0", b" ").decode(
+                    "utf-8", "replace").strip()
+                if value or attempt == 4:
+                    return value
+                time.sleep(0.01)
+        return _run(["ps", "-p", str(pid), "-o", "command="],
+                    timeout=25).stdout.strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def kill_pid(pid: int) -> str:
+    """Stop a process: politely first, firmly if it lingers.
+
+    Returns what the system said — "stopped", "already gone", "access denied",
+    "sent SIGKILL" — because a refusal has to be *shown*. Guessing produces
+    "it would not close" for a process that was never there and for one owned
+    by an administrator, and those need different sentences.
+    """
+    if platform.system() == "Windows":
+        try:
+            out = _run(["taskkill", "/PID", str(pid), "/T", "/F"], timeout=30)
+            return (out.stdout or out.stderr or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            return str(exc)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "already gone"
+    except PermissionError:
+        return "access denied"
+    for _ in range(25):
+        time.sleep(0.2)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "stopped"
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return "stopped"
+    except PermissionError:
+        return "access denied"
+    return "sent SIGKILL"
 
 
 # --------------------------------------------------------------------------- #
@@ -1149,6 +1626,7 @@ def pip_install(python: str, args: list[str], log, on_detail=None) -> None:
     log("$ " + " ".join(cmd[:8]) + (" …" if len(cmd) > 8 else ""))
 
     state: dict = {}
+    errors: list[str] = []
     last = [0.0]
     last_pct = [-1.0]
     started = time.time()
@@ -1173,7 +1651,7 @@ def pip_install(python: str, args: list[str], log, on_detail=None) -> None:
     # The context manager closes the pipe and reaps the child even if reading
     # its output raises, which a bare Popen left to garbage collection did not.
     with subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT, text=True,
+                          stderr=subprocess.STDOUT, **PY_TEXT, env=py_env(),
                           bufsize=0) as proc:
         assert proc.stdout
         if on_detail:
@@ -1190,6 +1668,8 @@ def pip_install(python: str, args: list[str], log, on_detail=None) -> None:
                                     "Successfully", "ERROR", "Building",
                                     "WARNING: ")):
                     log(line[:200])
+                if line.startswith("ERROR"):
+                    errors.append(line)
                 shown = pip_progress(line, state)
                 if not (shown and on_detail):
                     continue
@@ -1208,6 +1688,11 @@ def pip_install(python: str, args: list[str], log, on_detail=None) -> None:
             stop.set()
         code = proc.wait()
     if code != 0:
+        # pip's own last word names the package and the reason. "See the log"
+        # sent people to a panel a screen away from the button they pressed,
+        # which is how a failed Reinstall came to look like nothing at all.
+        if errors:
+            raise RuntimeError("pip install failed: " + errors[-1][:300])
         raise RuntimeError("pip install failed — see the log.")
 
 
@@ -1354,19 +1839,452 @@ def torch_build(index: str) -> str:
     return match.group(1) if match else ""
 
 
-def installed_torch(python: str) -> str:
-    """The torch already in this environment, "" if there is none."""
+# What a torch was built for, read out of torch/version.py rather than by
+# `import torch`. The import costs seconds on Windows and this is asked before
+# every engine start; the build facts are all in that one file, written when
+# the wheel was built. find_spec has the environment's own interpreter locate
+# the package, so this is still that interpreter's answer (rule 5), never a
+# guess from a path.
+TORCH_PROBE = """
+import importlib.util, json, os, runpy
+spec = importlib.util.find_spec("torch")
+if spec is None or not spec.submodule_search_locations:
+    raise SystemExit(3)
+v = runpy.run_path(os.path.join(list(spec.submodule_search_locations)[0],
+                                "version.py"))
+print(json.dumps({k: (None if v.get(k) is None else str(v.get(k)))
+                  for k in ("__version__", "cuda", "hip", "xpu")}))
+"""
+
+
+def installed_torch(python: str) -> dict:
+    """The torch in this environment and what it was built for, {} if none.
+
+    {"version": "2.14.0+cpu", "cuda": None, "hip": None, "xpu": None}. The
+    version string alone cannot answer the question that matters: a wheel from
+    PyPI carries no local tag at all, so on Windows "2.14.0" is the CPU build
+    and nothing in the string says so. `cuda` is what the wheel was compiled
+    against, and None there means no CUDA in it at all.
+    """
     try:
-        out = _run([str(python), "-c", "import torch;print(torch.__version__)"],
+        out = _run([str(python), "-c", TORCH_PROBE], timeout=60)
+    except Exception:  # noqa: BLE001
+        return {}
+    if out.returncode != 0:
+        return {}
+    try:
+        raw = json.loads((out.stdout or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {}
+    if not isinstance(raw, dict) or not raw.get("__version__"):
+        return {}
+    return {"version": raw["__version__"], "cuda": raw.get("cuda"),
+            "hip": raw.get("hip"), "xpu": raw.get("xpu")}
+
+
+def torch_kind(info: dict) -> str:
+    """What an installed torch can drive: cuda, rocm, xpu or cpu ("" if none)."""
+    if not info:
+        return ""
+    if info.get("cuda"):
+        return "cuda"
+    if info.get("hip"):
+        return "rocm"
+    if info.get("xpu"):
+        return "xpu"
+    return "cpu"
+
+
+def build_kind(build: str) -> str:
+    """The same question asked of an index's tag: cu128 is cuda."""
+    if build.startswith("cu"):
+        return "cuda"
+    if build.startswith("rocm"):
+        return "rocm"
+    return build
+
+
+def torch_mismatch(info: dict, wanted: str) -> bool:
+    """Is this installed torch a different build from the `wanted` tag?
+
+    A tagged wheel is compared tag for tag, so cu126 is not cu128. An untagged
+    one — what PyPI serves — is compared by what the wheel says it was built
+    for. Treating "no tag" as "nothing to compare" is how a Windows machine
+    with an RTX 4060 kept PyPI's CPU build through every Reinstall: ComfyUI's
+    own requirements put it there, the check saw no tag and stood aside, and
+    pip called the CUDA request satisfied. Kind rather than exact version for
+    these, though: an untagged CUDA build is left alone rather than 3 GB
+    reinstalled over a CUDA minor version.
+    """
+    if not wanted or not info:
+        return False
+    version = info.get("version", "")
+    if "+" in version:
+        return version.split("+", 1)[1] != wanted
+    return torch_kind(info) != build_kind(wanted)
+
+
+def index_lacks_torch(python: str, index: str) -> str:
+    """What pip said if `index` has no torch this interpreter can install.
+
+    "" when it has one, and "" when pip could not be asked at all — a
+    question that cannot be put is no reason to block the install.
+    `pip index versions` reads the listing and filters it by this Python's
+    own tags, so it answers without downloading anything.
+    """
+    try:
+        res = _run([str(python), "-m", "pip", "index", "versions", "torch",
+                    "--index-url", index, "--disable-pip-version-check"],
                    timeout=180)
     except Exception:  # noqa: BLE001
         return ""
-    if out.returncode != 0 or not (out.stdout or "").strip():
+    if res.returncode == 0:
         return ""
-    return out.stdout.strip().splitlines()[-1].strip()
+    said = ((res.stderr or "") + (res.stdout or "")).strip()
+    if "No matching distribution" not in said:
+        return ""
+    return said.splitlines()[-1][:200]
 
 
-def drop_mismatched_torch(python: str, index: str, log) -> bool:
+# Whether the torch in an environment is the one pip installed, file for file.
+# An install cut off partway — the app closed mid-download, two installs at
+# once — leaves a tree that is neither version: its version.py reads fine, so
+# every check that asks "which torch is this" says all is well, and ComfyUI
+# then dies inside torch itself ("cannot import name 'is_fake_tensor'"). pip's
+# own RECORD is the truth about what belongs there. Only .py files are hashed
+# and walked: they are what an import can trip over, and they are small.
+# A dist with no RECORD (conda, some system packages) cannot be judged and is
+# left out rather than called damaged.
+TORCH_HEALTH_PROBE = r"""
+import base64, csv, hashlib, importlib.util, io, json, os
+from importlib import metadata
+NAMES = ("torch", "torchvision", "torchaudio")
+dists, recorded, tops, missing, changed = {}, set(), set(), [], []
+root = ""
+spec = importlib.util.find_spec("torch")
+if spec is not None and spec.submodule_search_locations:
+    root = os.path.dirname(os.path.normpath(
+        list(spec.submodule_search_locations)[0]))
+for dist in metadata.distributions():
+    name = (dist.metadata["Name"] or "").lower()
+    if name not in NAMES:
+        continue
+    dists.setdefault(name, []).append(dist.version)
+    # RECORD itself, not dist.files: from Python 3.12 dist.files quietly
+    # leaves out files that are not on disk, which is the very thing asked.
+    record = dist.read_text("RECORD")
+    if not record:
+        continue
+    base = str(dist.locate_file(""))
+    for row in csv.reader(io.StringIO(record)):
+        if not row:
+            continue
+        rel, digest = row[0].replace("\\", "/"), (row[1:2] or [""])[0]
+        if rel.startswith("..") or ".dist-info/" in rel or "/" not in rel:
+            continue
+        full = os.path.join(base, rel)
+        recorded.add(os.path.normcase(os.path.normpath(full)))
+        top = rel.split("/", 1)[0]
+        if top == "functorch" or top.startswith("torch"):
+            tops.add(os.path.join(base, top))
+        if not rel.endswith(".py"):
+            continue
+        if not os.path.exists(full):
+            missing.append(rel)
+        elif digest.startswith("sha256="):
+            with open(full, "rb") as fh:
+                got = base64.urlsafe_b64encode(
+                    hashlib.sha256(fh.read()).digest()).rstrip(b"=").decode()
+            if got != digest[len("sha256="):]:
+                changed.append(rel)
+stray = []
+for top in sorted(tops):
+    for here, subdirs, names in os.walk(top):
+        subdirs[:] = [d for d in subdirs if d != "__pycache__"]
+        for n in names:
+            full = os.path.join(here, n)
+            if n.endswith(".py") and os.path.normcase(
+                    os.path.normpath(full)) not in recorded:
+                stray.append(os.path.relpath(
+                    full, os.path.dirname(top)).replace(os.sep, "/"))
+print(json.dumps({"root": root, "dists": dists,
+                  "tops": sorted(os.path.basename(t) for t in tops),
+                  "orphan": bool(root) and "torch" not in dists,
+                  "stray": stray[:3], "stray_count": len(stray),
+                  "missing": missing[:3], "missing_count": len(missing),
+                  "changed": changed[:3], "changed_count": len(changed)}))
+"""
+
+
+def torch_damage(python: str) -> dict:
+    """What the probe above found, or {} when it could not ask.
+
+    A question that cannot be put is not an answer: an interpreter that will
+    not run, or a probe that times out, reads as healthy here and is left to
+    the checks that can speak to it.
+    """
+    try:
+        out = _run([str(python), "-c", TORCH_HEALTH_PROBE], timeout=180)
+    except Exception:  # noqa: BLE001
+        return {}
+    if out.returncode != 0:
+        return {}
+    try:
+        found = json.loads((out.stdout or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {}
+    return found if isinstance(found, dict) else {}
+
+
+# The dependency report's copy of torch_damage, per interpreter. The probe
+# hashes every .py file torch ships — thousands, twice over when two versions
+# are installed over each other — and the Engine page asked for it on every
+# visit, both engines one after the other, so the list sat empty under a
+# spinner long enough to read as a page that had stopped. The answer only
+# changes when pip changes torch, and pip cannot do that without touching
+# what the fingerprint below reads: site-packages itself (a new dist-info, or
+# the ~orch folder an uninstall stashes into), the torch folders at its top,
+# and each torch RECORD. Launch, Reinstall and Recheck still read afresh.
+_TORCH_HEALTH: dict[str, tuple[tuple, dict]] = {}
+_TORCH_HEALTH_LOCK = threading.Lock()
+# "~" is how pip names what it stashes while it uninstalls ("~orch").
+TORCH_TOPS = ("torch", "functorch", "~")
+
+
+def _torch_fingerprint(root: str) -> tuple:
+    """What pip cannot change torch in `root` without changing."""
+    marks = []
+    try:
+        marks.append(("", os.stat(root).st_mtime_ns))
+        for entry in sorted(os.scandir(root), key=lambda e: e.name):
+            if not entry.name.lower().startswith(TORCH_TOPS):
+                continue
+            st = entry.stat()
+            marks.append((entry.name, st.st_mtime_ns))
+            if entry.name.endswith(".dist-info"):
+                rec = os.stat(os.path.join(entry.path, "RECORD"))
+                marks.append(("RECORD", rec.st_mtime_ns, rec.st_size))
+    except OSError:
+        return ()
+    return tuple(marks)
+
+
+def torch_damage_cached(python: str, fresh: bool = False) -> dict:
+    """torch_damage, read again only when pip has changed torch since.
+
+    Only an answer that names where torch lives is kept — without the folder
+    there is nothing to tell a changed install by — and `fresh` always asks.
+    """
+    key = str(python)
+    with _TORCH_HEALTH_LOCK:
+        held = None if fresh else _TORCH_HEALTH.get(key)
+    if held:
+        mark, found = held
+        if mark and mark == _torch_fingerprint(found["root"]):
+            return found
+    found = torch_damage(python)
+    mark = _torch_fingerprint(found["root"]) if found.get("root") else ()
+    with _TORCH_HEALTH_LOCK:
+        if mark:
+            _TORCH_HEALTH[key] = (mark, found)
+        else:
+            _TORCH_HEALTH.pop(key, None)
+    return found
+
+
+def forget_torch_health() -> None:
+    """Drop every kept answer — called when an install has run pip."""
+    with _TORCH_HEALTH_LOCK:
+        _TORCH_HEALTH.clear()
+        _ATTENTION.clear()
+
+
+# What the Qwen node will do with an attention choice, asked of the engine's
+# own interpreter. The node caches its model under the attention it
+# *resolved* ("sdpa") and then compares that with the one it was *asked
+# for* ("auto") before every line — never equal, so every line after the
+# first threw the model away and read it back from disk ("Attention changed
+# from 'sdpa' to 'auto', clearing cache…"). Asked for by the name it will
+# store, it keeps the model loaded. The probe mirrors the node's own
+# get_attention_implementation: pre-Ampere CUDA is eager whatever was asked,
+# then sageattention, flash-attn and sdpa by what actually imports.
+ATTENTION_PROBE = r"""
+import json
+major = None
+try:
+    import torch
+    if torch.cuda.is_available():
+        major = torch.cuda.get_device_capability()[0]
+except Exception:
+    pass
+have = []
+for name, module in (("sage_attn", "sageattention"), ("flash_attn", "flash_attn")):
+    try:
+        __import__(module)
+        have.append(name)
+    except Exception:
+        pass
+print(json.dumps({"major": major, "have": have}))
+"""
+_ATTENTION: dict[str, dict] = {}
+
+
+def attention_support(python: str) -> dict:
+    """{"major": 8, "have": ["flash_attn"]} for this interpreter, {} unknown.
+
+    Read once per interpreter per run — it imports torch — and forgotten
+    with the torch answers when an install runs pip.
+    """
+    key = str(python or "")
+    if not key or not Path(key).exists():
+        return {}
+    with _TORCH_HEALTH_LOCK:
+        if key in _ATTENTION:
+            return _ATTENTION[key]
+    try:
+        out = _run([key, "-c", ATTENTION_PROBE], timeout=120)
+        found = json.loads((out.stdout or "").strip().splitlines()[-1])
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(found, dict):
+        return {}
+    with _TORCH_HEALTH_LOCK:
+        _ATTENTION[key] = found
+    return found
+
+
+def qwen_attention(selection: str, found: dict) -> str:
+    """The attention the Qwen node will store its model under for `selection`.
+
+    Unknown hardware answers "sdpa" for "auto": it is what auto picks on any
+    card from the last five years without extra packages, and being asked for
+    by name the node keeps it cached — "auto" never is.
+    """
+    selection = selection or "auto"
+    major = found.get("major")
+    if major is not None and major < 8:
+        return "eager"
+    have = list(found.get("have") or []) + ["sdpa", "eager"]
+    if selection == "auto":
+        return next(a for a in ("sage_attn", "flash_attn", "sdpa", "eager")
+                    if a in have)
+    return selection if selection in have else "sdpa"
+
+
+def torch_damage_summary(found: dict) -> str:
+    """The damage in words, or "" when there is none."""
+    if not found:
+        return ""
+
+    def some(key: str) -> str:
+        names = found.get(key) or []
+        more = found.get(f"{key}_count", 0) > len(names)
+        return ", ".join(names) + (", …" if more else "")
+
+    parts = []
+    for name, versions in (found.get("dists") or {}).items():
+        if len(versions) > 1:
+            parts.append(f"two versions of {name} are installed over each "
+                         f"other ({' and '.join(versions)})")
+    if found.get("orphan"):
+        parts.append("its files are there but pip has no record of "
+                     "installing them")
+    n = found.get("stray_count", 0)
+    if n:
+        parts.append(f"{n} file{'s' if n != 1 else ''} from another version "
+                     f"{'are' if n != 1 else 'is'} mixed in ({some('stray')})")
+    n = found.get("missing_count", 0)
+    if n:
+        parts.append(f"{n} of its files {'are' if n != 1 else 'is'} missing "
+                     f"({some('missing')})")
+    n = found.get("changed_count", 0)
+    if n:
+        parts.append(f"{n} of its files {'are' if n != 1 else 'is'} not the "
+                     f"one{'s' if n != 1 else ''} that "
+                     f"{'were' if n != 1 else 'was'} installed "
+                     f"({some('changed')})")
+    return "; ".join(parts)
+
+
+def _torch_dist_count(python: str) -> int:
+    try:
+        out = _run([str(python), "-c",
+                    "from importlib import metadata as m;print(sum(1 for d in "
+                    "m.distributions() if (d.metadata['Name'] or '').lower() "
+                    "in ('torch','torchvision','torchaudio')))"], timeout=60)
+        return int((out.stdout or "0").strip().splitlines()[-1])
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def remove_torch(python: str, what: str, log, on_detail=None) -> None:
+    """Take torch, torchvision and torchaudio out completely, leftovers too.
+
+    `pip uninstall` removes what its RECORD lists, once per install — so two
+    versions installed over each other need it twice, and the files an
+    interrupted install left behind are in no RECORD at all. Those are the
+    ones that break an import, so after pip is done, whatever is still in the
+    torch folders goes as well. Only folders named for torch, in the one
+    directory the interpreter itself loads torch from.
+    """
+    found = torch_damage(python)
+    root = Path(found["root"]) if found.get("root") else None
+    tops = {t for t in (found.get("tops") or [])
+            if t == "functorch" or t.startswith("torch")}
+    tops |= {"torch", "torchgen", "functorch", "torchvision", "torchaudio"}
+    if on_detail:
+        # pip prints nothing while it deletes thousands of files, which on
+        # Windows is a minute or more — say what that silence is.
+        on_detail(f"Removing {what} first…", None)
+    why = ""
+    for _ in range(3):
+        try:
+            res = _run([str(python), "-m", "pip", "uninstall", "-y",
+                        "torch", "torchaudio", "torchvision"], timeout=900)
+            if res.returncode != 0:
+                why = ((res.stderr or "") + (res.stdout or "")).strip()[-300:]
+        except Exception as exc:  # noqa: BLE001
+            why = str(exc)
+        if why or not _torch_dist_count(python):
+            break
+    if not why and root and root.is_dir():
+        for name in sorted(tops):
+            for path in [root / name] + [
+                    p for p in root.glob(f"{name}-*.dist-info")]:
+                if not path.is_dir():
+                    continue
+                log(f"Removing what pip left behind: {path}")
+                try:
+                    shutil.rmtree(path)
+                except OSError as exc:
+                    why = str(exc)
+                    break
+    if why:
+        raise RuntimeError(
+            f"Could not remove {what} ({why}). On Windows that is almost "
+            "always a program still using this environment — a ComfyUI "
+            "started from it. Close it, then try again.")
+
+
+def _refuse_without_replacement(python: str, index: str, what: str,
+                                on_detail=None) -> None:
+    """Raise, removing nothing, when `index` has no torch for this Python."""
+    if not index:
+        return
+    if on_detail:
+        on_detail(f"Checking {index} has PyTorch for this Python…", None)
+    lacking = index_lacks_torch(python, index)
+    if lacking:
+        raise RuntimeError(
+            f"{index} has no PyTorch this environment's Python can install "
+            f"({lacking}), so {what} was left in place rather than removed "
+            "with nothing to replace it. If the machine is offline, try again "
+            "once it is not; otherwise pick another build in the PyTorch "
+            "picker.")
+
+
+def drop_mismatched_torch(python: str, index: str, log,
+                          on_detail=None) -> bool:
     """Remove a torch whose build is not the one being asked for.
 
     pip treats `torch` as satisfied by torch 2.14.0+cpu, so pointing it at the
@@ -1375,28 +2293,130 @@ def drop_mismatched_torch(python: str, index: str, log) -> bool:
     The old build has to go first. Nothing is removed when the builds already
     agree, so a Reinstall that only wants to repair a broken install is still
     the cheap operation it looks like.
+
+    An uninstall that fails raises. Carrying on used to be silent: pip then
+    found the old build still there, called the request satisfied, and the
+    task reported PyTorch installed over the build it had failed to replace.
+
+    And nothing is removed until the index is known to have a replacement for
+    this Python. Uninstalling first and finding out at the download left an
+    environment with no torch at all — worse than the CPU build it replaced.
     """
     wanted = torch_build(index)
     if not wanted:
         return False
     have = installed_torch(python)
-    if not have:
+    if not torch_mismatch(have, wanted):
         return False
-    current = have.split("+")[1] if "+" in have else ""
-    # A wheel from the default PyPI index carries no local tag and is the CUDA
-    # build on Linux, the CPU build on Windows — it cannot be matched against
-    # a tag, so it is left alone rather than reinstalled on a guess.
-    if not current or current == wanted:
-        return False
-    log(f"Installed torch is {have}, but the {wanted} build was asked for — "
-        "removing it first, because pip counts the old one as good enough.")
-    try:
-        _run([str(python), "-m", "pip", "uninstall", "-y",
-              "torch", "torchaudio", "torchvision"], timeout=900)
-    except Exception as exc:  # noqa: BLE001
-        log(f"Could not remove the old torch ({exc}) — carrying on.")
-        return False
+    log(f"Installed torch is {have['version']} (the {torch_kind(have)} "
+        f"build), but the {wanted} build was asked for — removing it first, "
+        "because pip counts the old one as good enough.")
+    _refuse_without_replacement(python, index, f"torch {have['version']}",
+                                on_detail)
+    remove_torch(python, f"torch {have['version']} (the "
+                         f"{torch_kind(have)} build)", log, on_detail)
     return True
+
+
+def install_requested_torch(python: str, cfg: dict, log, on_detail=None) -> None:
+    """Install the selected PyTorch build *after* every requirements file.
+
+    Requirements belonging to ComfyUI or a custom node may name ``torch``.
+    On Windows, resolving those files from PyPI can replace a CUDA wheel with
+    the CPU wheel.  Installing CUDA first therefore does not guarantee that it
+    is still installed when ComfyUI starts.  This final pass is intentionally
+    shared by setup and the repair buttons so every installation route leaves
+    the requested build in place.
+
+    And it checks that it did. "PyTorch installed" over a build pip left
+    alone is the report that sent someone to restart an engine that could
+    only ever stop as it started.
+
+    A torch of the right build can still be damaged — files of two versions
+    mixed by an install that was cut off — and pip calls that satisfied too,
+    so Reinstall did nothing to it at all. Damage is read first, and a
+    damaged torch goes out completely before it goes back in.
+    """
+    index = torch_index(cfg)
+    gpu = nvidia_gpu()
+    log(f"Graphics: {gpu['name'] or 'no NVIDIA GPU found'}")
+    if not drop_mismatched_torch(python, index, log, on_detail):
+        damage = torch_damage_summary(torch_damage(python))
+        if damage:
+            have = installed_torch(python)
+            what = f"torch {have['version']}" if have else "torch"
+            log(f"{what} is damaged — {damage}. Taking it out completely "
+                "before installing it again.")
+            _refuse_without_replacement(python, index, f"the damaged {what}",
+                                        on_detail)
+            remove_torch(python, f"the damaged {what}", log, on_detail)
+    # torchvision rides along: ComfyUI's requirements name it, the drop above
+    # takes it out with the other two, and it has to come back from the same
+    # index as the torch it is built against.
+    args = ["torch", "torchvision", "torchaudio"]
+    if index:
+        args += ["--index-url", index]
+    pip_install(python, args, log, on_detail)
+    wanted = torch_build(index)
+    have = installed_torch(python)
+    if wanted and torch_mismatch(have, wanted):
+        raise RuntimeError(
+            f"torch {have['version']} (the {torch_kind(have)} build) is still "
+            f"the one installed after asking for the {wanted} build — see the "
+            "log for what pip said.")
+    damage = torch_damage_summary(torch_damage(python))
+    if damage:
+        raise RuntimeError(f"PyTorch went in, but it is still damaged — "
+                           f"{damage}. See the log for what pip said.")
+    if have:
+        log(f"PyTorch is torch {have['version']} (the {torch_kind(have)} "
+            "build).")
+
+
+def torch_launch(python: str, cfg: dict, engine: str = "") \
+        -> tuple[list[str], str]:
+    """Extra ComfyUI flags for the torch it will run on, or why it cannot start.
+
+    ComfyUI asks CUDA for a device while it is still importing
+    (`get_torch_device` → `torch.cuda.current_device()`), so anywhere but a
+    Mac a torch with no GPU support in it stops as it starts — "AssertionError:
+    Torch not compiled with CUDA enabled", every time — unless it was told
+    `--cpu`. Two different machines produce that trace:
+
+      no NVIDIA card, or the CPU build chosen on purpose: `--cpu`, and it runs;
+      an NVIDIA card and the CUDA build selected: the CPU build is the fault.
+        Running it on the CPU would hide that behind takes many times slower,
+        so it is refused, in a sentence that names the button that swaps it.
+
+    A torch that cannot be read is left to ComfyUI: its own error says more
+    than a guess from here would.
+
+    A damaged torch is refused on every platform: files of two versions mixed
+    together read as the right build to every other check here, and ComfyUI
+    then dies inside torch itself.
+    """
+    label = ENGINES[engine]["label"] if engine in ENGINES else "This engine"
+    damage = torch_damage_summary(torch_damage(python))
+    if damage:
+        return [], (f"{label}'s PyTorch is damaged — {damage}. That is what an "
+                    "install cut off partway leaves behind, and ComfyUI stops "
+                    f"as it starts on it. Press Reinstall on PyTorch · {label} "
+                    "on the Engine page: it takes torch out completely and "
+                    "puts it back.")
+    if platform.system() == "Darwin":
+        return [], ""
+    info = installed_torch(python)
+    if torch_kind(info) != "cpu":
+        return [], ""
+    gpu = nvidia_gpu()
+    if gpu["name"] and build_kind(torch_build(torch_index(cfg))) == "cuda":
+        return [], (f"{label}'s PyTorch is the CPU-only build (torch "
+                    f"{info['version']}), and ComfyUI stops as it starts on "
+                    f"it — that build cannot use the {gpu['name']}. Press "
+                    f"Reinstall on PyTorch · {label} on the Engine page, or "
+                    "Install everything missing: it swaps in the CUDA build, "
+                    "about 3 GB.")
+    return ["--cpu"], ""
 
 
 # Loaded exactly the way ComfyUI loads a custom node pack: under the folder's
@@ -1631,18 +2651,17 @@ def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
                     raise RuntimeError("venv creation failed: " +
                                        (res.stderr or res.stdout)[-600:])
             target = vpy
-            prog.detail("deps", f"Installing PyTorch for {label} — the long "
-                                "one…")
             pip_install(str(target), ["--upgrade", "pip", "wheel"],
                         prog.log, say)
-            idx = torch_index(cfg)
-            gpu = nvidia_gpu()
-            prog.log(f"Graphics: {gpu['name'] or 'no NVIDIA GPU found'}")
-            drop_mismatched_torch(str(target), idx, prog.log)
-            args = ["torch", "torchaudio"]
-            if idx:
-                args += ["--index-url", idx]
-            pip_install(str(target), args, prog.log, say)
+            # The build asked for goes in first, so ComfyUI's requirements find
+            # torch already satisfied. Left to them, pip fetched PyPI's torch —
+            # the CPU wheel on Windows, 3 GB of CUDA wheels on a Linux machine
+            # with no NVIDIA card — only for the pass below to uninstall it and
+            # download the right one. That pass stays: a requirement that pins
+            # torch can still replace it, and it is what checks the result.
+            prog.detail("deps", f"Installing PyTorch for {label} — the long "
+                                "one…")
+            install_requested_torch(str(target), cfg, prog.log, say)
             prog.detail("deps", f"Installing {label}'s ComfyUI requirements…")
             pip_install(str(target), ["-r", str(comfy_dir / "requirements.txt")],
                         prog.log, say)
@@ -1653,6 +2672,10 @@ def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
             pip_install(str(target), ["-r", str(reqs)], prog.log, say)
         else:
             prog.log(f"No requirements.txt in {eng['node_dir']} — skipping.")
+        if slot.get("managed") and not portable_python(comfy_dir):
+            prog.detail("deps", f"Checking {label}'s PyTorch is still the "
+                                "build asked for…")
+            install_requested_torch(str(target), cfg, prog.log, say)
         return
 
     if step == "launch":
@@ -1680,8 +2703,10 @@ def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
         prog.detail("launch", f"Starting {label}'s ComfyUI — the first start "
                               "is slow…")
         proc.start(slot["python"], Path(slot["comfy_dir"]), comfy_port(url),
-                   prog)
-        if not wait_for_comfy(url, timeout=900):
+                   prog, cfg=cfg, engine=engine)
+        if not wait_for_comfy(url, timeout=900, alive=proc.alive):
+            if proc.crashed():
+                raise RuntimeError(crash_reason(proc.tail(120), engine))
             raise RuntimeError(f"{label}'s ComfyUI did not start within 15 "
                                "minutes.\n" + "\n".join(proc.tail(25)))
 
@@ -1741,6 +2766,9 @@ def run_setup(cfg: dict, prog: Progress, comfy, chosen_dir: str = "",
 
         # 5. models --------------------------------------------------------- #
         prog.begin("models")
+        # Folders an earlier version put in the <Org>/<Name> shape are moved
+        # before anything is counted missing, or they are fetched again.
+        migrate_qwen_layout(engine_models_dir(cfg, "qwen"), prog.log)
         todo = [(eid, m) for eid in engines for m in engine_missing(cfg, eid)]
         if not todo:
             prog.finish("models", "Everything is already downloaded")

@@ -27,6 +27,20 @@
    `/object_info` and matches inputs through candidate-name lists. The
    Qwen-TTS node renames inputs between releases; a schema read turns that into
    a clear message instead of a wrong value.
+2c. **A node is asked for by the name ComfyUI registered, never its Python
+   class name.** ComfyUI keys `/object_info` and the prompt's `class_type` by
+   `NODE_CLASS_MAPPINGS`, and the Qwen pack maps `FB_Qwen3TTSCustomVoice` to
+   `CustomVoiceNode`. This app asked for `CustomVoiceNode` from its first
+   version, the stand-in ComfyUI answered to it, and the suite passed — while
+   on every real install the Qwen engine read "nodes not loaded" and no line
+   could be built. The class names are roles now; `ComfyClient.real()` resolves
+   each through `QWEN_CLASS_NAMES` against the schema, and the stand-in
+   registers the real keys. Transcribe a node pack from its `__init__.py`, not
+   from `nodes.py`.
+2d. **Every Python child talks UTF-8 on its pipe, both ends** (`PY_TEXT`,
+   `py_env`). Windows gives a piped child the ANSI code page with strict
+   errors, ComfyUI's log interceptor keeps it, and the Qwen pack prints an
+   emoji as it imports — IMPORT FAILED, only when this app started ComfyUI.
 3. **Preset voices, models and attention modes are read from the node, never
    typed into the source.** `CustomVoiceNode.speaker` is the only truth about
    which voices exist.
@@ -47,12 +61,74 @@
    driver puts it, and falls back to the display-adapter list, which tells a
    missing driver apart from a missing card. The two get different sentences.
 5c. **A build already installed satisfies pip, so Reinstall must uninstall
-   first.** pip counts torch 2.14.0+cpu as satisfying `torch`; pointing it at
-   the CUDA index and asking again changes nothing, which is why pressing
-   Reinstall on the CPU build left the CPU build in place.
-   `drop_mismatched_torch` compares the `+tag` against the index and removes
-   the old one — and does nothing when they agree, or when the wheel carries
-   no tag and there is nothing to compare.
+   first — and the build is read from the wheel, not its tag.** pip counts
+   torch 2.14.0+cpu as satisfying `torch`; pointing it at the CUDA index and
+   asking again changes nothing, which is why pressing Reinstall on the CPU
+   build left the CPU build in place. `drop_mismatched_torch` compares the
+   build against the index and removes the old one. A tagged wheel is
+   compared tag for tag. PyPI's wheels carry no tag, and on Windows the
+   untagged one is the CPU build: "no tag, nothing to compare" is how an RTX
+   4060 kept it through every Reinstall. `installed_torch` reads
+   `torch/version.py` through the environment's own interpreter — never
+   `import torch`, which costs seconds — and an untagged wheel is compared by
+   what it was built for: kind, not CUDA minor version, so PyPI's Linux CUDA
+   wheel is not 3 GB reinstalled over cu126. An uninstall that fails raises
+   rather than carrying on, and `install_requested_torch` reads the build back
+   afterwards: "PyTorch installed" over the build pip left alone is not a
+   report. torchvision rides along from the same index, because the drop takes
+   it out and ComfyUI's requirements name it. Nothing is removed until
+   `index_lacks_torch` has confirmed a replacement — `pip index versions` reads
+   the listing against this Python's own tags and downloads nothing — because
+   uninstalling first and finding out at the download left no torch at all.
+   And a requirement of ComfyUI's that will not install is reported after the
+   swap, never instead of it: stopping there left the row reading exactly as
+   it had before Reinstall was pressed.
+5e. **A torch can be the right build and still be broken, so its files are
+   checked against pip's own record.** An install cut off partway — the app
+   closed mid-install, two installs at once — leaves a torch folder holding
+   two versions: version.py reads as the build asked for, so the row said ok,
+   Start launched it, and ComfyUI died inside torch itself ("cannot import
+   name 'is_fake_tensor'"). Reinstall did nothing, because builds agreeing is
+   what pip calls satisfied. `torch_damage` reads each torch dist's RECORD in
+   the environment's own interpreter and reports `.py` files that belong to
+   no installed version, recorded ones missing or changed, two versions
+   installed over each other, and a torch folder pip has no record of. A dist
+   with no RECORD (conda) is not judged: calling a working torch damaged is
+   the worse error. Damage is a `repair` row, a refused start, and on
+   Reinstall `remove_torch` — pip uninstall until no torch dist is left, then
+   the torch folders it left behind, in the one directory the interpreter
+   loads torch from — never before `index_lacks_torch` says a replacement
+   exists.
+5f. **The Engine page reads torch's files only when pip has changed them.**
+   `torch_damage` hashes every `.py` torch ships, twice over when two versions
+   are installed over each other, and the report used to run it on every visit,
+   engine after engine. The dependency list sat empty under "Checking what is
+   missing…" for all of that, while the engine console above it pointed at a
+   Reinstall button in that same list. `torch_damage_cached` keeps the answer
+   until `_torch_fingerprint` changes: site-packages itself, the torch folders
+   at its top (pip's `~orch` stash included) and each torch RECORD, all of
+   which pip touches when it installs or uninstalls torch. An answer that
+   names no folder is never kept. Recheck (`fresh`), Start
+   (`torch_launch`) and Reinstall still read afresh, and any pip install task
+   clears the cache however it ends. The two engines are checked side by side
+   (`_engine_rows` on a thread each), the page says it is checking instead of
+   showing an empty list, and callers that ask at the same moment share one
+   request (`fetchDeps`).
+5d. **ComfyUI is never launched on a torch it will die on.** It asks CUDA for
+   a device while it imports, so a CPU-only torch without `--cpu` stops as it
+   starts — "AssertionError: Torch not compiled with CUDA enabled", a stack
+   trace for every Start and every Restart. `torch_launch` reads the build
+   before `ComfyProcess.start` runs anything. No NVIDIA card, or the CPU build
+   picked on purpose: `--cpu`, and it runs. A card with the CUDA build
+   selected: refused in a sentence that names Reinstall, because running it on
+   the CPU would hide the fault behind takes many times slower. Restart and the
+   boot takeover ask *before* touching a port (rule 33a). The PyTorch row marks
+   that state `repair`, which raises the Engine badge and puts it in Install
+   everything missing — as a plain "warn" that button said nothing was
+   missing. Never `--cpu` for a CUDA build: nvidia-smi not answering is not a
+   missing GPU (rule 5b). And an install that runs pip in an engine's
+   environment stops that engine first — Windows will not replace a DLL a
+   running ComfyUI holds, and torch is nothing but DLLs.
 6. **Downloads are resumable, and nothing is renamed until it is whole.** Stream
    to `<name>.part`, `Range` on retry, atomic `replace()` — but only once what
    arrived accounts for the size the listing gave. A dropped connection ends the
@@ -60,7 +136,9 @@
    look complete for good: the `.part` to resume from was gone, and the folder
    counted as installed with truncated weights in it. `model_installed()` also
    returns False while any `.part` remains, or a repo whose config.json landed
-   first reports installed while its weights are still arriving. Whole-repo
+   first reports installed while its weights are still arriving — and it needs
+   weight files, not a config: a weights request that failed before its `.part`
+   opened left config.json alone, and that counted as installed for good. Whole-repo
    downloads skip `.bin` duplicates of safetensors and repo furniture.
 7. **One line of dialogue is one graph.** Do not switch to
    `DialogueInferenceNode` — see below.
@@ -168,6 +246,37 @@
    ends in one of three named states: up, stopped while starting, or five
    minutes with no answer. A second press says it is already starting rather
    than firing again.
+18h. **An install is watched where it was started, and its failure stays
+   there.** Reinstall on a 3 GB PyTorch said "Working…" on its button and
+   nothing else for as long as it took: the progress, and worse the failure,
+   went to the Activity panel a screen below, and the toast that lasted
+   seconds said "check the log". It read as a button that did nothing, so it
+   was pressed again, and the one below it too. `paintDepTasks` puts every
+   running install's detail on its own row and its percentage on the button,
+   painted from the task list so it survives a redraw and a reload; the
+   latest attempt's failure stays on the row, in red, until the next one; and
+   the failure's text is pip's own last `ERROR:` line. One pip at a time per
+   environment: `install_dependency` refuses a second with `InstallBusy`
+   (409) naming the one running, because two pips writing one site-packages —
+   one of them uninstalling torch — break each other.
+18i. **An engine that dies while starting is noticed at once and said in a
+   sentence.** `wait_for_comfy` takes the process's `alive`, because Restart
+   sat on "Restarting…" for fifteen minutes over an engine that had died in
+   two seconds. `crash_reason` reads the console for the shapes worth naming —
+   the CPU build, no torch, an import error raised inside torch (damage, rule
+   5e), no driver, a taken port, out of memory — each with the control that
+   clears it, and anything else is its own last exception line, never
+   nothing. `/api/status` and `/api/comfy/log` carry it as `stopped`.
+18j. **The Engine badge has two witnesses, and either raises it.** The
+   status poll (engine up, nodes loaded) and the dependency list (anything
+   missing or `repair`) each used to set it alone, and the poll runs every six
+   seconds, so it put the badge down over a PyTorch the list had just marked
+   for repair whenever any engine answered. `paintEngineTag` combines them.
+18k. **The engine console is plain text.** ComfyUI colours its log even
+   into a pipe, so every line arrived wrapped in `\x1b[32m…\x1b[0m` and the
+   page printed the escapes. `plain()` strips them where lines are read —
+   `ComfyProcess._pump` and `manager.stream` — so `crash_reason` and the
+   Activity log see the same text a person does.
 18d. **`already` is not `started`.** `/api/comfy/start` returns `already` when
    something answers the address, and the page used to toast "Starting…"
    regardless: pressed, claims to work, changes nothing. It now says what is
@@ -246,13 +355,29 @@
    themselves, and every model entry `wanted_models` returns carries its own
    `engine` because the caller downloading it has to know which layout to use.
 20. **The two engines do not agree on where a model folder goes, and neither
-   layout is a preference.** Qwen nests `models/qwen-tts/<Org>/<Name>`, which
-   is where its node searches. MOSS flattens to `models/moss-tts/<Org>--<Name>`,
-   because its loader builds that path from `repo_id.replace("/", "--")`. Put a
-   MOSS folder in the Qwen shape and the node does not see it — it downloads a
-   second copy of a model already on disk. Same trap in reverse in
-   `local_models`: walking the nested shape over a flat folder lists nothing,
-   so a downloaded MOSS model reads as never downloaded.
+   layout is a preference.** Qwen keeps `models/qwen-tts/<Name>` with no org
+   folder: `load_qwen_model` lists `models/qwen-tts` one level deep for a
+   folder whose name holds the size and the kind, and
+   `download_model_if_needed` builds `<qwen_root>/<repo.split("/")[-1]>`. MOSS
+   flattens to `models/moss-tts/<Org>--<Name>`, because its loader builds that
+   path from `repo_id.replace("/", "--")`. Put a folder in any other shape and
+   the node does not see it — it downloads a second copy of a model already
+   on disk, and offline the line fails. Same trap in `local_models`: the Qwen
+   folder name has lost its org, so the table puts it back, and `voices/` (the
+   node's saved voices) is not a model.
+20b. **The Qwen layout came from the node's README, and the README is wrong.**
+   It draws `models/qwen-tts/Qwen/<Name>`; the code has never looked there.
+   This app downloaded into that shape from its first version, nothing it could see
+   failed, and every first take quietly fetched its model a second time — or,
+   offline, failed with the weights sitting one folder over. Rule 25's lesson,
+   a second time: read the node's code, and `TheQwenNodeFindsWhatWeDownload`
+   replays its search against what `model_dir` returns. `migrate_qwen_layout`
+   moves the old folders into place at launch and before setup counts what is
+   missing. When the node has already fetched its own copy, ours is gigabytes
+   nothing can reach and it goes; when the node's copy was cut off — it loads
+   from any folder that exists, whole or not — the whole one takes its place.
+   That is also why `model_installed` treats huggingface_hub's `.incomplete`
+   like our own `.part`.
 21. **MOSS is two nodes, and `local_model_path` is only ever a folder that is
    really there.** `MossTTSModelLoader` holds the weights and hands a
    `MOSS_TTS_PIPE` to `MossTTSGenerate` or `MossTTSVoiceDesign`. Its
@@ -273,6 +398,37 @@
    entry means that model is read off the node by substring
    (`MOSS_VARIANT_HINTS`), because the repo id each display name maps to lives
    in the node's constants and never reaches `/object_info`.
+23b. **MOSS lines sample the way OpenMOSS tuned the checkpoint, never at the
+   schema defaults.** Every `MossTTSGenerate` input defaults to the Delay 8B's
+   numbers (temperature 1.7, top_p 0.8, top_k 25, repetition_penalty 1.0)
+   whatever the loader holds, and the node's own `DEFAULT_PARAMS` table is
+   published and never applied. Left to them, the Local 1.7B — the default
+   model — ran with no repetition penalty and half its top_k, which the
+   node's README says to change for that model. `MOSS_SAMPLING` is that table, kept in step
+   with the node's `utils/constants.py` like `MOSS_MODEL_REPOS`. The
+   Expressiveness slider rests at 0.9, Qwen's temperature, so on MOSS it
+   scales the model's own temperature by `value / 0.9` rather than replacing
+   it: passed through as it was, it cooled the 8B from 1.7 and VoiceGenerator
+   from 1.5.
+23c. **A Qwen clone with no transcript asks for `x_vector_only`.** The node's
+   default mode is ICL, which raises "ref_text is required when
+   x_vector_only_mode=False" — and the page never marked the box required.
+   The speaker embedding alone still copies the voice, less closely, and the
+   page says so under the box. `tests/mock_comfy.py` raises the same message
+   at run time, because ComfyUI's validation passes the graph and only the
+   node objects.
+
+23d. **The Design panel says whether its model is here, and every voice
+   source can be heard.** It said "Needs the 1.7B VoiceDesign model — one
+   button on the Models page" to everyone, with that model installed and no
+   button in sight, and only Preset had Hear it — so a designed voice had no
+   way to begin short of reading the whole script. `/api/voices` carries
+   `design_model` (repo, `installed` — None where there is no models folder
+   to look in — and `fits`), the note offers Download it where it is
+   missing, and `hearIt()` puts Hear it under Clone and Design too, naming
+   what is still to do (a clip, a description, the download) instead of
+   sending a line that will fail.
+
 24. **Readiness is per engine.** With MOSS selected, a missing Qwen folder is
    not what stands between the script and a take; reporting it as one sends
    people to download a model they are not about to use. `/api/status` takes an
@@ -350,14 +506,123 @@
    `/api/speak` and the self-test both go through it before a single line is
    queued, under `engine_lock` so two takes started together cannot leave both
    resident. `run_both_engines` turns it off where there is memory to spare.
+   Choosing an engine on the Create page starts it, and `activate` asks
+   everything that can refuse — `torch_launch` included — *before* it stops
+   the other: switching to an engine that could not start used to take the
+   working one down with it and leave nothing running.
 31b. **`wait_for_prompt` is told which engine queued the line.** There are two
    clients now, and reading the selected one inside the wait loop polls the
    wrong ComfyUI the moment someone switches engines mid-take.
+31c. **A take loads each checkpoint once, and frees the card once.** Both
+   node packs hold a single model: Qwen's `load_qwen_model` clears its cache
+   before loading a different one, and the MOSS loader moves the last model off
+   the card. Spoken in script order, a preset speaker answering a cloned one
+   swapped CustomVoice for Base on every line — a read from disk each time, and
+   on an 8 GB card most of the take. `generation_order` groups lines by
+   `ComfyClient.line_weights` (which must mirror what the builders load), keeps
+   script order within a group, and the take is joined in script order. And
+   `unload` rides only the take's last line: sent with every line, "Free GPU
+   memory after each run" dropped the weights after each one and read them back
+   for the next. MOSS keeps its model in a module global no graph can release,
+   so the switch is hidden there rather than promising what it cannot do.
+   `result()` reads the history once and calls a prompt ComfyUI finished with
+   no audio an error, instead of waiting fifteen minutes for nothing.
+31e. **The Qwen node is asked for attention by the name it will keep.** It
+   caches the model under the attention it *resolved* ("sdpa") and, before
+   every line, compares that with the one it was *asked for* — so "auto"
+   never matched, and every line after the first logged "Attention changed
+   from 'sdpa' to 'auto', clearing cache…" and read the model back from disk.
+   `qwen_attention` mirrors the node's `get_attention_implementation`
+   (pre-Ampere is eager whatever is asked; then sage_attn, flash_attn, sdpa by
+   what really imports, read once per interpreter by `attention_support`), and
+   `run_job` sends that name. Unknown hardware gets "sdpa", never "auto".
+31f. **A finished job stays listed by when it finished.** `/api/jobs` kept
+   a job for 180 seconds from `created`, so a take longer than three minutes
+   left the list the instant it ended: the page never saw it finish, the Read
+   button stayed disabled, and the library was never reloaded over a take
+   that was on disk. `set_state` stamps `finished`, the page asks with `?id=`
+   for the job it is waiting on, and a job that is gone altogether (the app
+   restarted under it) gives the button back and says so.
+31d. **A job keeps to its own engine, prompt and clips.** `activate` refuses
+   (`busy_elsewhere`) while another engine is reading a take, and `/api/speak`
+   registers the job before bringing its engine up: switching engines mid-take
+   stopped the take's engine under it. Cancel acts only on a running job, by its
+   own `prompt_id` — the player's Stop sends the last job's id, and used to
+   interrupt a self-test. Reference clips live in `data/references` under a
+   content hash and `ensure_reference` sends one to whichever engine speaks the
+   line: each ComfyUI has its own input folder, and uploads by file name made
+   two speakers' `recording.wav` one voice.
 32. **The dependency report is per engine, and so are the install ids.**
    `comfyui_moss`, `torch_qwen`, `node_reqs_moss` — Python and Git are the only
    rows left that both engines share. `install_dependency` reads the engine off
    the suffix, and a bare id means the default engine, which is what a page
    written before the split would send.
+
+33. **A ComfyUI this app did not start is taken over, not declared
+   unreachable.** Start said "already running", Restart said "not started by
+   this app", and the only advice left was to find a windowless python in Task
+   Manager — an orphan from a previous launch, a ComfyUI Desktop or a
+   hand-started one was a dead end. `take_over_port` tries ComfyUI-Manager's
+   own `POST /manager/reboot` first (a dropped connection *is* the reboot),
+   then finds the process on the port and closes it. `/api/comfy/restart`
+   returns a distinct `how` — `managed`, `started`, `takeover`,
+   `manager-reboot` — because "Restarting ComfyUI" over a takeover hides the
+   part that matters.
+33a. **Nothing is closed unless it looks like a ComfyUI, and no port is taken
+   that cannot be filled.** The port belongs to an engine only by convention:
+   `pid_cmdline` is read and anything without `python`, `main.py` or `comfy` in
+   it is named in the refusal and left running. And an engine with no install
+   of its own is refused *before* the takeover — taking a port from someone and
+   having nothing to start in its place is a hole, not a restart. External mode
+   (`managed` False with no `comfy_dir`) is never touched at all.
+33b. **A refusal names the obstacle it actually hit.** "It would not close"
+   covers a process owned by an administrator, a supervisor respawning it and a
+   database that was never ComfyUI, and all three need different sentences.
+   `kill_pid` therefore returns what the system *said* — "stopped", "already
+   gone", "access denied", "sent SIGKILL" — rather than a guess, and a refusal
+   reaches the page as **409 with the advice as `error`**.
+33c. **`settled_free()` sleeps 2 seconds, and that is the whole point of it.**
+   A supervisor — ComfyUI Desktop, a launcher `.bat` — respawns in well under a
+   second, so a port that has gone quiet is only free once it has *stayed*
+   quiet. Without the wait the respawn lands between the check and the start,
+   and the app reports success over a port it never took. Three rounds, and
+   pids that differ from the first round's are how "something is supervising
+   it" is told apart from "it would not close".
+33d. **`_refresh_schema_when_up` exists because the schema cache lasts two
+   minutes.** The reason anyone starts or restarts an engine is that something
+   just changed, so without it the fresh read hides behind the stale one for
+   exactly the two minutes that matter. Restart's own task already forces a
+   read; this is for the paths with no task to hang it on — Start, the
+   manager-reboot route, and the boot path.
+33e. **`stale_models` here is about the nodes, not a model scan.** The usual
+   meaning of a flag by that name is a startup model scan: ComfyUI lists its
+   model folders once, at launch, so weights that land afterwards are invisible
+   until a restart. Neither of this app's node packs works that way — both
+   resolve a checkpoint folder per call (`load_qwen_model` walks
+   `models/qwen-tts` on every generate; MOSS is handed a path by `moss_dirs()`)
+   — so a voice downloaded behind a running engine is found with no restart,
+   and a literal port of that flag would be a lie. What does go stale is rule
+   17's half of the same disease: `stale_engine()` is true when every wanted
+   model is on disk and whole, the node pack's marker file is on disk, and the
+   engine answering has none of its classes. Complete install, nothing that can
+   speak, and Restart is the cure. MOSS carries the model-list half as well,
+   because `MossTTSModelLoader.model_variant` is the one enum either pack
+   publishes that names checkpoints; Qwen's name sizes ("0.6B") and preset
+   speakers ("Ryan") and never a model, which is why `ENGINES["qwen"]` declares
+   an empty `model_marker` and is judged on its nodes alone.
+33f. **A launch ends with a working engine, and says which of the four things
+   it did.** `ensure_engine_at_boot` runs on a daemon thread from `main()` —
+   the page has to open while a takeover is happening, because the console it
+   narrates into is on that page. Offline: start it. Online and healthy:
+   **adopt** it, and say so — a ComfyUI somebody left running is not a problem
+   to be solved. Online and useless: replace it, through the same guard Restart
+   uses. Somebody else's: leave it, and say what is wrong with it. Only the
+   engine a launch opens on (rule 18g), and only ever one at a time (rule 31).
+33g. **`note()` puts the app's own half of the story in the engine's console.**
+   What the app did *to* an engine belongs next to what the engine said about
+   itself, in one window and in order; split across two panels it reads as two
+   unrelated stories. `/api/comfy/log` is that window — `n` clamped to 1..400,
+   and never `int()` on raw input, which is rule 9 in a smaller place.
 
 ## Why line-by-line, not DialogueInferenceNode
 
@@ -372,8 +637,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 162 unit tests, standard library only
-npm test                 # 94 checks driving the real page in headless Chromium
+npm run test:units       # 305 unit tests, standard library only
+npm test                 # 123 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script
@@ -389,6 +654,16 @@ because that is the shape the app installs — and a MOSS graph arriving at
 Qwen's ComfyUI is a failure the single-stand-in version could not have seen.
 `tests/mock_hf.py` answers for HuggingFace, with
 `Range` support and switches to cut a transfer off mid-file or ignore a resume.
+
+The engine-kit tests run **real processes on real ports**, because mocking a
+takeover only proves the mock returns what it was told to. `fake_install()`
+writes a pretend ComfyUI checkout whose `main.py` serves `mock_comfy.py`, so
+the engine the app ends up managing is a genuine child of it; the supervision
+test wraps a stand-in in a parent that respawns it, which is the only way
+"something is supervising it" is proved rather than asserted; and the
+not-a-ComfyUI test launches an HTTP server through a symlink named something
+else, so the command-line guard is read the way it is in the wild. They are
+the slow part of `test:units` (about thirty seconds) and worth it.
 
 `SCRIPT_BUILDER_DATA` moves `data/`, and the suite points it at a temporary
 directory. Without that, running the tests would overwrite a real library.
@@ -407,8 +682,9 @@ hand on purpose: the gate has to keep running with nothing installed.
 
 ## Version floor
 
-Node classes used: `CustomVoiceNode`, `VoiceCloneNode`, `VoiceDesignNode`,
-`LoadAudio`, `SaveAudioAdvanced` (falls back to `SaveAudio`), and from
+Node classes used: `CustomVoiceNode`, `VoiceCloneNode`, `VoiceDesignNode`
+(registered as `FB_Qwen3TTSCustomVoice`, `FB_Qwen3TTSVoiceClone`,
+`FB_Qwen3TTSVoiceDesign` — rule 2c), `LoadAudio`, `SaveAudioAdvanced` (falls back to `SaveAudio`), and from
 MOSS `MossTTSModelLoader`, `MossTTSGenerate`, `MossTTSVoiceDesign`. Qwen3-TTS
 needs `transformers==4.57.3` or `>=5.0` — the Engine panel checks this
 explicitly because it is the usual cause of IMPORT FAILED. MOSS asks only for
@@ -439,7 +715,7 @@ same way `MODEL_REPOS` tracks the Qwen node's `HF_MODEL_MAP`.
 
 Models: `Qwen/Qwen3-TTS-12Hz-0.6B-Base` and `Qwen/Qwen3-TTS-Tokenizer-12Hz` are
 required; the 1.7B Base and 1.7B VoiceDesign folders are optional. They live in
-`ComfyUI/models/qwen-tts/Qwen/<name>/`, which is where the node searches. The
+`ComfyUI/models/qwen-tts/<name>/`, which is where the node searches (rule 20). The
 repo names in `MODEL_REPOS` are the ones in the node's own `HF_MODEL_MAP` — keep
 them in step with it, not with the node's README, which lists fewer.
 
@@ -448,6 +724,14 @@ them in step with it, not with the node's README, which lists fewer.
 whatever the model picker says, because the picker offers 0.6B for cloning.
 
 ## Stitching
+
+Current ComfyUI saves flac, mp3 or opus — never wav — and publishes the choice
+as a DynamicCombo (`["COMFY_DYNAMICCOMBO_V3", {"options": [{"key": …}]}]`),
+which `_enum` reads by its keys. Flac is chosen, and `to_wav` turns the clips
+back into wav **in the engine's own interpreter** with PyAV: the interpreter
+that wrote the flac can always read it, and this app still imports nothing
+beyond `wave`. Where that interpreter is unknown (someone else's ComfyUI) the
+clips stay as they are and the take is zipped.
 
 `stitch_wavs` joins clips with `wave` only — no ffmpeg. It refuses when channel
 count, sample width or rate differ between clips, and the caller falls back to a

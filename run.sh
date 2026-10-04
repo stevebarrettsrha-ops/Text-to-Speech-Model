@@ -61,14 +61,20 @@ echo "  Using: $("$PY" -c 'import sys;print(sys.executable)')"
 # where pip would allow it, putting Flask into the system Python is not our
 # business. ComfyUI's own packages are a separate matter: those go into the
 # interpreter ComfyUI runs on, which bootstrap.py works out.
+#
+# Healthy means pip runs, not merely python: without python3-venv, `-m venv`
+# makes .venv/bin/python and then fails at ensurepip, and a check of `import
+# sys` kept that pip-less folder for good — every later run died on "No
+# module named pip", even after the package the message asks for was in.
 VENV=".venv"
-if [ -e "$VENV" ] && ! "$VENV/bin/python" -c 'import sys' >/dev/null 2>&1; then
-  echo "  The existing environment no longer runs. Building it again."
+if [ -e "$VENV" ] && ! "$VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+  echo "  The existing environment is incomplete. Building it again."
   rm -rf "$VENV"
 fi
 if [ ! -x "$VENV/bin/python" ]; then
   echo "  Setting up Script Builder's packages (first run only)..."
   if ! "$PY" -m venv "$VENV"; then
+    rm -rf "$VENV"
     echo "  Could not create the environment. On Debian and Ubuntu the venv" >&2
     echo "  module ships separately:  sudo apt-get install -y python3-venv" >&2
     echo "  Install it, then run this again." >&2
