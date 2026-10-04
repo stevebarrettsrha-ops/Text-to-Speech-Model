@@ -634,6 +634,76 @@ class DeadEngine(unittest.TestCase):
         self.assertNotIn("HTTPConnectionPool", message)
 
 
+class HowBigTheCardIsForTheStatusPoll(unittest.TestCase):
+    """Rule 27's gap, in the one place that cannot afford a round trip. The
+    page polls /api/status every few seconds, so it reads the cached
+    nvidia-smi answer — but a portable ComfyUI carries its own CUDA where
+    nvidia-smi is not on PATH, and reporting 0 there turned the small-card
+    default off on exactly the installs that needed it."""
+
+    def setUp(self):
+        server._COMFY_VRAM.update({"mb": 0, "asked": 0.0})
+
+    def tearDown(self):
+        server._COMFY_VRAM.update({"mb": 0, "asked": 0.0})
+
+    def test_nvidia_smi_is_used_without_asking_anyone(self):
+        with mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "RTX 4060", "driver": True,
+                                             "vram_mb": 8188}), \
+             mock.patch.object(server, "engine_online",
+                               side_effect=AssertionError("asked ComfyUI")):
+            self.assertEqual(server.known_vram(), 8188)
+
+    def test_comfyui_answers_where_nvidia_smi_cannot(self):
+        asked = []
+
+        class Portable:
+            def vram_mb(self):
+                asked.append(1)
+                return 8188
+
+        with mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "", "driver": False,
+                                             "vram_mb": 0}), \
+             mock.patch.object(server, "engine_online", return_value=True), \
+             mock.patch.object(server, "for_engine", return_value=Portable()):
+            self.assertEqual(server.known_vram(), 8188)
+            # And only once: this is read on every poll.
+            self.assertEqual(server.known_vram(), 8188)
+        self.assertEqual(len(asked), 1)
+
+    def test_an_engine_that_is_down_is_not_asked_every_poll(self):
+        calls = []
+
+        with mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "", "driver": False,
+                                             "vram_mb": 0}), \
+             mock.patch.object(server, "engine_online",
+                               side_effect=lambda e="": calls.append(e) or False):
+            self.assertEqual(server.known_vram(), 0)
+            self.assertEqual(server.known_vram(), 0)
+        self.assertEqual(len(calls), 1, "retried before the back-off elapsed")
+
+    def test_it_tries_again_once_the_back_off_has_passed(self):
+        class Portable:
+            def vram_mb(self): return 8188
+
+        with mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "", "driver": False,
+                                             "vram_mb": 0}), \
+             mock.patch.object(server, "engine_online", return_value=False):
+            self.assertEqual(server.known_vram(), 0)
+        # An engine that was not up at boot is up now.
+        server._COMFY_VRAM["asked"] -= server._COMFY_VRAM_RETRY + 1
+        with mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "", "driver": False,
+                                             "vram_mb": 0}), \
+             mock.patch.object(server, "engine_online", return_value=True), \
+             mock.patch.object(server, "for_engine", return_value=Portable()):
+            self.assertEqual(server.known_vram(), 8188)
+
+
 class WhenTheCardIsFull(unittest.TestCase):
     """Reported from an 8 GB card mid-clone: "Allocation on device 0 would
     exceed allowed memory ... Currently allocated : 2.95 GiB ... Free

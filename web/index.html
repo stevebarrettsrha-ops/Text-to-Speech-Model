@@ -983,7 +983,13 @@ function saveDraft() {
   store("sb.draft", { mode: S.mode, style: $("style-input").value, blocks: S.blocks,
     speakers: S.speakers, pause: $("pause-sl").value, temp: $("temp-sl").value,
     engine: S.engine,
-    unload: $("segUnload").querySelector("button.on").dataset.v });
+    unload: $("segUnload").querySelector("button.on").dataset.v,
+    // Whether that value was *chosen*, stored separately from the value
+    // itself. Boot saves the draft before the first status answers —
+    // loadDraft calls setMode, which saves — so the value on disk at that
+    // moment is the markup's "off", and reading it back as a choice would
+    // switch the small-card default off for good on the next load.
+    unloadChosen: !!S.unloadChosen });
 }
 function loadDraft() {
   var d = store("sb.draft");
@@ -997,7 +1003,9 @@ function loadDraft() {
   if (d.temp) { $("temp-sl").value = d.temp;
     $("temp-v").textContent = Number(d.temp).toFixed(2); }
   if (d.unload === "on" || d.unload === "off") setUnload(d.unload);
-  S.unloadChosen = d.unload === "on" || d.unload === "off";
+  // Only a press counts as a choice. A value saved before the card was known
+  // is just the last state, and the card gets to decide again.
+  S.unloadChosen = !!d.unloadChosen;
   setMode(d.mode || "multi");
 }
 function setUnload(v) {

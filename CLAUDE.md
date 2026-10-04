@@ -346,6 +346,21 @@
    the allocation that fails. `defaultUnloadForCard` turns it on at 8.5 GB and
    below, never overrides a choice made by hand, and Reset restores the
    default for *this* card rather than "off".
+15d. **The draft stores whether the toggle was chosen, not just where it
+   sits.** Boot writes the draft before the first `/api/status` answers —
+   `loadDraft` calls `setMode`, which saves — so the value on disk at that
+   moment is the markup's "off". Read back as a choice, that switched the
+   small-card default off for good from the second launch on, which is the
+   setting the default exists to prevent. `unloadChosen` is persisted beside
+   it and only a press sets it.
+15e. **A card nvidia-smi cannot see is not a card that is not there.** The
+   status poll runs every few seconds, so it must not pay for a round trip —
+   but reading only the cached nvidia-smi answer reports 0 on a portable
+   ComfyUI carrying its own CUDA, which is rule 27's gap, and every
+   card-sized decision then behaves as though there were no card.
+   `known_vram()` asks the engine once, keeps the answer for the life of the
+   process, and retries at most every two minutes while it is unknown — an
+   engine that was down at boot comes up later.
 
 19. **Two engines, and everything that differs between them lives in
    `ENGINES`.** Node repo, node folder, the file that proves it is installed,
@@ -637,8 +652,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 305 unit tests, standard library only
-npm test                 # 123 checks driving the real page in headless Chromium
+npm run test:units       # 309 unit tests, standard library only
+npm test                 # 124 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script

@@ -514,6 +514,13 @@ def wait_for_prompt(prompt_id: str, job_id: str, engine: str,
                              "ComfyUI console.")
 
 
+# What ComfyUI said the card holds, and when it was last asked. A card does
+# not change while the app runs, so once is enough — but the engine may not
+# have been up the first time, so an empty answer is retried, slowly.
+_COMFY_VRAM = {"mb": 0, "asked": 0.0}
+_COMFY_VRAM_RETRY = 120.0
+
+
 def gpu_vram(live=None) -> int:
     """The card's memory in MB, nvidia-smi first, ComfyUI second, 0 if unknown."""
     mb = bootstrap.nvidia_gpu().get("vram_mb") or 0
@@ -522,7 +529,33 @@ def gpu_vram(live=None) -> int:
             mb = live.vram_mb()
         except Exception:  # noqa: BLE001
             mb = 0
+    if mb:
+        _COMFY_VRAM["mb"] = mb
     return mb
+
+
+def known_vram() -> int:
+    """The card's memory for a caller that must not pay for an HTTP round trip.
+
+    nvidia-smi is cached and free. Where it found nothing — a portable ComfyUI
+    carrying its own CUDA, which is the gap rule 27 exists for — ComfyUI is
+    asked once and the answer kept, rather than reporting 0 and leaving every
+    card-sized decision to behave as though there were no card. Reporting 0
+    here switched the small-card default off on exactly the installs that
+    needed it.
+    """
+    mb = bootstrap.nvidia_gpu().get("vram_mb") or 0
+    if mb:
+        return mb
+    if _COMFY_VRAM["mb"]:
+        return _COMFY_VRAM["mb"]
+    if time.time() - _COMFY_VRAM["asked"] < _COMFY_VRAM_RETRY:
+        return 0
+    _COMFY_VRAM["asked"] = time.time()
+    engine = current_engine()
+    if engine_online(engine):
+        gpu_vram(for_engine(engine))
+    return _COMFY_VRAM["mb"]
 
 
 def moss_dirs() -> dict:
@@ -825,11 +858,11 @@ def api_status():
                      "enabled": bootstrap.engine_enabled(cfg, e["id"])}
                     for e in bootstrap.ENGINES.values()],
         "primary_engine": bootstrap.start_engine(cfg),
-        # Read from the cached nvidia-smi answer, never a live call: the page
-        # polls this every few seconds. It is here so the Create page can
-        # default "Free GPU memory after each run" on a card where keeping two
+        # Cached: the page polls this every few seconds, and a card does not
+        # change while the app runs. It is here so the Create page can default
+        # "Free GPU memory after each run" on a card where keeping two
         # checkpoints resident is what makes a clone fail.
-        "vram_mb": bootstrap.nvidia_gpu().get("vram_mb") or 0,
+        "vram_mb": known_vram(),
         "setup_complete": bool(cfg.get("setup_complete")),
         # So the Create page can say "Setting up…" rather than offer a setup
         # that is already running.

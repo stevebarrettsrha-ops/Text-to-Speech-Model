@@ -817,6 +817,28 @@ try {
      'freeing after each run defaults on for a small card, and never overrides a choice',
      JSON.stringify(unloadDefaults));
 
+  // Boot saves the draft before the first status answers — loadDraft calls
+  // setMode, which saves — so the value on disk at that moment is the
+  // markup's "off". Read back as a choice, it switched the small-card
+  // default off for good on the next load.
+  const acrossReload = await page.evaluate(() => {
+    const read = () => document.querySelector('#segUnload button.on').dataset.v;
+    const out = {};
+    S.unloadChosen = false; setUnload('off');
+    saveDraft();                       // what boot writes before it knows
+    loadDraft();                       // the next launch reads it back
+    defaultUnloadForCard(8188);        // and then the status arrives
+    out.afterBoot = read();
+    setUnload('off'); S.unloadChosen = true; saveDraft();   // a real press
+    loadDraft();
+    defaultUnloadForCard(8188);
+    out.afterChoice = read();
+    return out;
+  });
+  is(acrossReload.afterBoot === 'on' && acrossReload.afterChoice === 'off',
+     'a value saved before the card was known is not mistaken for a choice',
+     JSON.stringify(acrossReload));
+
   /* ------------------------------------- the buttons say what they are doing */
   // Pressed while something already answers, Start used to toast "Starting…"
   // and change nothing — the button that looked broken because it was lying.
