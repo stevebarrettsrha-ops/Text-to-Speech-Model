@@ -157,6 +157,21 @@ def _reach(fn, url: str):
         raise ComfyError(OFFLINE.format(url=url)) from exc
 
 
+# Torch says this several ways depending on the allocator and the version, and
+# the node packs wrap it in their own prefix on top — "FB_Qwen3TTSVoiceClone:
+# Generation failed: Allocation on device 0 would exceed allowed memory" is one
+# real example. Match on what every one of them carries rather than on any one
+# wording.
+OOM_MARKS = ("out of memory", "outofmemoryerror", "exceed allowed memory",
+             "cuda error: out of memory", "allocation on device")
+
+
+def is_out_of_memory(text: str) -> bool:
+    """Is this failure the card running out of room, rather than a bad graph?"""
+    low = (text or "").lower()
+    return any(mark in low for mark in OOM_MARKS)
+
+
 class ComfyClient:
     def __init__(self, url: str = "http://127.0.0.1:8188") -> None:
         self.url = url.rstrip("/")
@@ -669,6 +684,27 @@ class ComfyClient:
             except ValueError:
                 raise ComfyError(r.text[:400])
         return r.json()["prompt_id"]
+
+    def free_memory(self, unload_models: bool = True) -> bool:
+        """Ask this ComfyUI to drop what it is holding on the card.
+
+        ComfyUI keeps a model resident after a run, and a script that uses a
+        preset voice on one line and a cloned one on the next loads two
+        different checkpoints — on 8 GB the second allocation is the one that
+        fails. /free is ComfyUI's own endpoint for this and it answers whoever
+        asks, which matters: a ComfyUI we did not start cannot be stopped from
+        here, but it can still be asked to let go of its models.
+
+        Never raises. Freeing memory is a recovery attempt, and an engine that
+        will not answer is the caller's problem to report, not this one's.
+        """
+        try:
+            r = requests.post(f"{self.url}/free", timeout=30,
+                              json={"unload_models": bool(unload_models),
+                                    "free_memory": True})
+            return r.status_code < 400
+        except Exception:  # noqa: BLE001
+            return False
 
     def interrupt(self, prompt_id: str = "") -> None:
         """Stop a prompt. Given its id, only that one — ComfyUI skips the

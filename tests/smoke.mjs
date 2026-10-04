@@ -764,6 +764,81 @@ try {
   is(back.state === 'ok' && !/warn/.test(back.state),
      'and goes green again once ours is the one answering', back.detail);
 
+  /* --------------------------------------------- when the card is full */
+  // Reported from an 8 GB card mid-clone: "Allocation on device 0 would
+  // exceed allowed memory ... Free (according to CUDA): 0 bytes". ComfyUI
+  // keeps the last checkpoint resident, so a preset voice followed by a clone
+  // is two models on a card with room for one.
+  const cloneTake = (title) => app.runTake({
+    mode: 'multi', style: '', title,
+    lines: [{ speaker: 1, text: 'Does the card have room for this?' }],
+    speakers: { 1: { name: 'A', kind: 'preset', speaker: 'Eric' } },
+    model: '0.6B', attention: 'auto', unload: false, pause: 0.2,
+    temperature: 0.9, engine: 'qwen',
+  });
+
+  await app.comfyApi('/mock/oom/until_free', { method: 'POST' }, 'qwen');
+  const recovered = await cloneTake('Out of memory, once');
+  is(recovered && recovered.status === 'done',
+     'a take that runs out of memory frees the card and finishes',
+     recovered && (recovered.status + ' ' + (recovered.error || '')));
+  const freedLog = await app.comfyApi('/mock/log', undefined, 'qwen');
+  is((freedLog.log || []).some(l => /FREE unload_models=True/.test(l)),
+     'and it got there by asking ComfyUI to let go of its models');
+
+  await app.comfyApi('/mock/oom/always', { method: 'POST' }, 'qwen');
+  const stuck = await cloneTake('Out of memory, still');
+  const said = (stuck && stuck.error) || '';
+  is(stuck && stuck.status === 'error' && /ran out of video memory/.test(said)
+       && /Free GPU memory after each run/.test(said)
+       && !/Currently allocated/.test(said),
+     'and one that stays full says what to do instead of allocator numbers',
+     said.slice(0, 120));
+  await app.comfyApi('/mock/oom/off', { method: 'POST' }, 'qwen');
+
+  // And the setting that prevents it in the first place defaults to on where
+  // the card cannot hold two checkpoints, while a choice made by hand stands.
+  const unloadDefaults = await page.evaluate(() => {
+    const read = () => document.querySelector('#segUnload button.on').dataset.v;
+    const out = {};
+    S.unloadChosen = false; setUnload('off');
+    defaultUnloadForCard(8188); out.small = read();
+    S.unloadChosen = false; setUnload('off');
+    defaultUnloadForCard(24564); out.big = read();
+    S.unloadChosen = false; setUnload('off');
+    defaultUnloadForCard(0); out.unknown = read();
+    setUnload('off'); S.unloadChosen = true;
+    defaultUnloadForCard(8188); out.chosen = read();
+    S.unloadChosen = false;
+    return out;
+  });
+  is(unloadDefaults.small === 'on' && unloadDefaults.big === 'off'
+       && unloadDefaults.unknown === 'off' && unloadDefaults.chosen === 'off',
+     'freeing after each run defaults on for a small card, and never overrides a choice',
+     JSON.stringify(unloadDefaults));
+
+  // Boot saves the draft before the first status answers — loadDraft calls
+  // setMode, which saves — so the value on disk at that moment is the
+  // markup's "off". Read back as a choice, it switched the small-card
+  // default off for good on the next load.
+  const acrossReload = await page.evaluate(() => {
+    const read = () => document.querySelector('#segUnload button.on').dataset.v;
+    const out = {};
+    S.unloadChosen = false; setUnload('off');
+    saveDraft();                       // what boot writes before it knows
+    loadDraft();                       // the next launch reads it back
+    defaultUnloadForCard(8188);        // and then the status arrives
+    out.afterBoot = read();
+    setUnload('off'); S.unloadChosen = true; saveDraft();   // a real press
+    loadDraft();
+    defaultUnloadForCard(8188);
+    out.afterChoice = read();
+    return out;
+  });
+  is(acrossReload.afterBoot === 'on' && acrossReload.afterChoice === 'off',
+     'a value saved before the card was known is not mistaken for a choice',
+     JSON.stringify(acrossReload));
+
   /* ------------------------------------- the buttons say what they are doing */
   // Pressed while something already answers, Start used to toast "Starting…"
   // and change nothing — the button that looked broken because it was lying.

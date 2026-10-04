@@ -982,7 +982,14 @@ function loadExample(i) {
 function saveDraft() {
   store("sb.draft", { mode: S.mode, style: $("style-input").value, blocks: S.blocks,
     speakers: S.speakers, pause: $("pause-sl").value, temp: $("temp-sl").value,
-    engine: S.engine });
+    engine: S.engine,
+    unload: $("segUnload").querySelector("button.on").dataset.v,
+    // Whether that value was *chosen*, stored separately from the value
+    // itself. Boot saves the draft before the first status answers —
+    // loadDraft calls setMode, which saves — so the value on disk at that
+    // moment is the markup's "off", and reading it back as a choice would
+    // switch the small-card default off for good on the next load.
+    unloadChosen: !!S.unloadChosen });
 }
 function loadDraft() {
   var d = store("sb.draft");
@@ -995,7 +1002,25 @@ function loadDraft() {
     $("pause-v").textContent = Number(d.pause).toFixed(2) + "s"; }
   if (d.temp) { $("temp-sl").value = d.temp;
     $("temp-v").textContent = Number(d.temp).toFixed(2); }
+  if (d.unload === "on" || d.unload === "off") setUnload(d.unload);
+  // Only a press counts as a choice. A value saved before the card was known
+  // is just the last state, and the card gets to decide again.
+  S.unloadChosen = !!d.unloadChosen;
   setMode(d.mode || "multi");
+}
+function setUnload(v) {
+  $("segUnload").querySelectorAll("button").forEach(function (x) {
+    x.classList.toggle("on", x.dataset.v === v); });
+}
+/* A small card cannot hold two checkpoints, and a script that uses a preset
+   voice on one line and a clone on the next loads two. ComfyUI keeps the last
+   one resident, so the clone is the allocation that fails — which is how an
+   8 GB card reported "Allocation on device 0 would exceed allowed memory"
+   with 2.95 GiB in use and nothing free. Default the toggle on for cards that
+   small, and leave it alone once the person has set it themselves. */
+function defaultUnloadForCard(vramMb) {
+  if (S.unloadChosen || !vramMb) return;
+  if (vramMb <= 8704) setUnload("on");
 }
 
 /* ========================= speakers ========================= */
@@ -2415,6 +2440,7 @@ async function refreshStatus() {
   var was = S.status && S.status.ready;
   var wasEngine = S.status && S.status.engine;
   S.status = st;
+  defaultUnloadForCard(st.vram_mb);
   if (st.engine) S.engine = st.engine;
   fillEngines(st.engines, S.engine);
   // The engine's own name, so "Nodes not loaded" says whose.
@@ -2467,6 +2493,9 @@ function wire() {
     b.addEventListener("click", function () {
       $("segUnload").querySelectorAll("button").forEach(function (x) {
         x.classList.toggle("on", x === b); });
+      // Set by hand: the card-size default must not come back and undo it.
+      S.unloadChosen = true;
+      saveDraft();
     });
   });
   $("btnAdd").addEventListener("click", function () { addBlock(); });
@@ -2492,8 +2521,12 @@ function wire() {
     $("pause-sl").value = 0.5; $("pause-v").textContent = "0.50s";
     $("temp-sl").value = 0.9; $("temp-v").textContent = "0.90";
     $("attn-sel").value = "auto";
-    $("segUnload").querySelectorAll("button").forEach(function (x) {
-      x.classList.toggle("on", x.dataset.v === "off"); });
+    // Back to the default for this card, not to "off": on 8 GB the default
+    // is on, and Reset handing back the setting that makes a clone fail is
+    // not a default.
+    S.unloadChosen = false;
+    setUnload("off");
+    defaultUnloadForCard(S.status && S.status.vram_mb);
     saveDraft(); toast("Back to defaults.");
   });
   $("pause-sl").addEventListener("input", function (e) {
