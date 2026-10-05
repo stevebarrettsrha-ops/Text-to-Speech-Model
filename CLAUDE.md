@@ -558,6 +558,42 @@
    that was on disk. `set_state` stamps `finished`, the page asks with `?id=`
    for the job it is waiting on, and a job that is gone altogether (the app
    restarted under it) gives the button back and says so.
+31g. **A line in flight shows a clock and a moving bar, never 0%.** The
+   percentage counts finished lines and the node reports nothing between
+   loading and saved, so a script written as one block — "line 1 of 1" — sat
+   at 0% under a dimmed Read for the whole take and read as nothing
+   happening. `/api/jobs` adds `elapsed` and `line_elapsed`, counted by the
+   server so a skewed browser clock cannot run backwards; the job card shows
+   an indeterminate bar until a line has finished, and Read (`paintRun`)
+   holds a spinner with the stage and the clock. No estimated percentage:
+   rule 16's reasoning, there is no real number inside a line.
+31h. **What was being spoken is named when the card fills.** A whole script
+   pasted as one block, or the script pasted as the clone's transcript, is
+   the usual reason 0.6B runs out of memory on 8 GB, and the advice read as
+   though the card were simply too small. `out_of_memory_advice` names a line
+   over `LONG_LINE_WORDS` and a reference clip over `LONG_CLIP_SECONDS`, and
+   the Voices card warns (`refWarning`) when a transcript runs past what its
+   clip can hold — the clip's length is read by the browser at upload.
+31i. **The card's other tenants are named, not alluded to.** "Free
+   (according to CUDA): 0 bytes" with three of eight gigabytes ours meant
+   something else held the rest. `bootstrap.gpu_processes` reads
+   `nvidia-smi --query-compute-apps` (split on the first and last comma — a
+   path can hold one), `others_on_the_card` drops this engine's own pids (the
+   process we started and whatever answers its port) and marks a python that
+   looks like a ComfyUI; the generic sentence is only for when nobody can be
+   named.
+31j. **A line holds `MAX_LINE` characters, and writing past it carries on in
+   a new line.** `fitLines` runs in `renderBlocks`, so typing, Paste, Home, a
+   draft and a take loaded back all pass through it; `lineCut` cuts after a
+   sentence end, else a comma, else a space, never leaving a stub under 40%.
+   Typing over the limit moves the cursor with the words that moved. Never a
+   bare `maxlength`: text that silently stops arriving reads as a broken box.
+31k. **A reference clip over `MAX_REF_SECONDS` is cut in the browser.**
+   `trimClip` decodes whatever the browser plays and writes 16-bit WAV with
+   `wavBytes`, so the server still imports nothing beyond `wave`; the cut is
+   the quietest 20 ms of the last three seconds, so it falls between words.
+   A clip the browser cannot decode goes up as it is. The toast says the
+   transcript must now match only the part kept.
 31d. **A job keeps to its own engine, prompt and clips.** `activate` refuses
    (`busy_elsewhere`) while another engine is reading a take, and `/api/speak`
    registers the job before bringing its engine up: switching engines mid-take
@@ -652,8 +688,8 @@ join are done in `server.py`, not in the node.
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 309 unit tests, standard library only
-npm test                 # 124 checks driving the real page in headless Chromium
+npm run test:units       # 315 unit tests, standard library only
+npm test                 # 138 checks driving the real page in headless Chromium
 ```
 
 The gate is not optional: a missing function declaration in the inline script

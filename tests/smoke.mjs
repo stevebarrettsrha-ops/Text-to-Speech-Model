@@ -722,6 +722,155 @@ try {
     await page.evaluate(() => { S.job = null; });
   }
 
+  /* ------------------------------------------------ a line still being read */
+  // A script written as one block is "line 1 of 1", and the node reports
+  // nothing between loading and saved, so the card sat at 0% and Read sat
+  // dimmed for the whole take: nothing on the page said it was working.
+  {
+    let state = 'running';
+    await page.route(u => u.pathname === '/api/jobs', r => r.fulfill({ json: [{
+      id: 'slow', status: state, pct: 0, total: 1, title: 'One long block',
+      stage: 'Line 1 of 1 · Rasta Man', created: 0, elapsed: 72,
+      line_elapsed: 70 }] }));
+    await page.evaluate(() => {
+      S.job = 'slow'; S.stopAsked = null;
+      document.getElementById('btnRun').disabled = true;
+      document.getElementById('btnStop').hidden = false;
+      pollJob(false);
+    });
+    await sleep(600);
+    const card = await page.evaluate(() => {
+      const j = document.querySelector('#jobList .job');
+      return j && { text: j.textContent, busy: !!j.querySelector('.bar.busy'),
+                    hint: !!j.querySelector('.hint') };
+    });
+    is(card && card.busy, 'a line with no percentage of its own moves its bar anyway');
+    is(card && /1:12/.test(card.text) && !/0%/.test(card.text),
+       'and the card counts the time instead of reading 0%', card && card.text);
+    is(card && card.hint, 'a long single block says why there is no halfway point');
+    const run = await page.evaluate(() => ({
+      working: document.getElementById('btnRun').classList.contains('working'),
+      label: document.getElementById('runLabel').textContent }));
+    is(run.working && /Line 1 of 1/.test(run.label) && /1:12/.test(run.label),
+       'Read says which line it is on and for how long', run.label);
+    state = 'cancelled';
+    await page.waitForFunction(
+      () => !document.getElementById('btnRun').classList.contains('working'),
+      null, { timeout: 8000 }).catch(() => {});
+    const after = await page.evaluate(() => ({
+      working: document.getElementById('btnRun').classList.contains('working'),
+      disabled: document.getElementById('btnRun').disabled,
+      label: document.getElementById('runLabel').textContent }));
+    is(!after.working && !after.disabled && !/1:12/.test(after.label),
+       'and gives the button back when the take ends', after.label);
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await page.evaluate(() => { S.job = null; });
+  }
+
+  /* ------------------------------------------------------ a line that is full */
+  // A whole script in one block filled an 8 GB card and showed "line 1 of 1,
+  // 0%" while it did. A line now holds MAX_LINE, and writing past it carries
+  // on in a new line rather than stopping dead.
+  {
+    const got = await page.evaluate(async () => {
+      const keep = { blocks: JSON.parse(JSON.stringify(S.blocks)), mode: S.mode,
+                     view: S.view };
+      const para = 'I waited, waited for HWHY; And He inclined to me and heard my cry. '
+        + 'And He drew me out of the pit of destruction, out of the muddy clay, '
+        + 'And He set my feet upon a rock, He is establishing my steps. ';
+      S.blocks = [{ spk: 1, text: (para + para + para).trim() }];
+      renderBlocks();
+      const pasted = S.blocks.map(b => b.text);
+      // Typing over the limit in the last line moves the rest on.
+      show('create');
+      S.blocks = [{ spk: 2, text: 'x '.repeat(140).trim() }];
+      renderBlocks();
+      const ta = document.querySelector('#blk-0 textarea');
+      const near = !document.querySelector('#blk-0 .left').hidden;
+      ta.value += ' and a little more. And then more words';
+      ta.dispatchEvent(new Event('input'));
+      await new Promise(r => setTimeout(r, 50));
+      const typed = { n: S.blocks.length, spk: S.blocks.map(b => b.spk),
+        tail: S.blocks[S.blocks.length - 1].text,
+        focused: document.activeElement === document.querySelector(
+          '#blk-' + (S.blocks.length - 1) + ' textarea') };
+      S.blocks = keep.blocks; setMode(keep.mode); show(keep.view);
+      return { pasted, near, typed, max: MAX_LINE };
+    });
+    is(got.pasted.length > 1 && got.pasted.every(t => t.length <= got.max),
+       'a block longer than a line holds is split into lines that fit',
+       got.pasted.map(t => t.length).join(', '));
+    is(got.pasted.slice(0, -1).every(t => /[.;!?]$/.test(t)),
+       'and each cut falls where a sentence ends', got.pasted.join(' | '));
+    is(got.near, 'a line close to full says how much is left');
+    is(got.typed.n === 2 && got.typed.spk.every(n => n === 2)
+       && /And then more words$/.test(got.typed.tail) && got.typed.focused,
+       'typing past the limit carries on in a new line for the same speaker',
+       JSON.stringify(got.typed));
+  }
+
+  /* --------------------------------------------- a reference clip that is long */
+  // The clip goes into every line it speaks, so a long one slows each line
+  // and helps fill an 8 GB card. Past MAX_REF_SECONDS it is cut in the
+  // browser, between words rather than through one.
+  {
+    const got = await page.evaluate(async () => {
+      const make = (secs, gap) => {
+        const rate = 16000, buf = new AudioBuffer(
+          { length: secs * rate, sampleRate: rate, numberOfChannels: 2 });
+        for (let c = 0; c < 2; c++) {
+          const d = buf.getChannelData(c);
+          for (let i = 0; i < d.length; i++) {
+            const t = i / rate;
+            d[i] = gap && t >= gap[0] && t < gap[1] ? 0
+              : 0.5 * Math.sin(2 * Math.PI * 220 * t);
+          }
+        }
+        return new File([wavBytes(buf, buf.length)], 'voice.mp3',
+                        { type: 'audio/wav' });
+      };
+      const long = await trimClip(make(40, [13.0, 13.3]));
+      const back = await new AudioContext().decodeAudioData(
+        await long.file.arrayBuffer());
+      const shortFile = make(6);
+      const short = await trimClip(shortFile);
+      return { trimmed: long.trimmed, secs: long.secs, was: long.was,
+               name: long.file.name, decoded: back.duration,
+               chans: back.numberOfChannels,
+               shortSame: short.file === shortFile && !short.trimmed };
+    });
+    is(got.trimmed && got.secs <= 15 && got.secs >= 13.0 && got.secs <= 13.3,
+       'a clip over 15 seconds is cut in the quiet before the limit',
+       `${got.secs.toFixed(2)}s of ${got.was}`);
+    is(Math.abs(got.decoded - got.secs) < 0.05 && got.chans === 2
+       && got.name === 'voice.wav',
+       'and what is kept is a WAV that plays for that long', JSON.stringify(got));
+    is(got.shortSame, 'a clip within the limit goes up untouched');
+  }
+
+  /* ----------------------------------------- the script pasted as a transcript */
+  // The transcript box sits under the script, and the script pasted into it
+  // is a mismatch the model pays for on every line.
+  {
+    const warned = await page.evaluate(() => {
+      const keep = JSON.parse(JSON.stringify(S.speakers[1]));
+      setSource(1, 'clone');
+      S.speakers[1].ref_text = Array(70).fill('word').join(' ');
+      renderSpeakerBody(1);
+      const w = document.querySelector('#spk-1 [data-refwarn]');
+      const long = { shown: !w.hidden, text: w.textContent };
+      S.speakers[1].ref_text = 'Hello there, this is me.';
+      renderSpeakerBody(1);
+      const short = !document.querySelector('#spk-1 [data-refwarn]').hidden;
+      S.speakers[1] = keep;
+      setSource(1, keep.kind);
+      return { long, short };
+    });
+    is(warned.long.shown && /70 words/.test(warned.long.text),
+       'a transcript far longer than a clip holds is called out', warned.long.text);
+    is(!warned.short, 'and a transcript that fits is left alone');
+  }
+
   /* ------------------------------------------------- whose ComfyUI is this */
   // 8188 is the port every ComfyUI picks by default, so the one answering is
   // quite often somebody else's — and that looks exactly like nodes that will
