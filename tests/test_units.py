@@ -794,6 +794,58 @@ class WhenTheCardIsFull(unittest.TestCase):
         self.assertIn("line per paragraph", long)
         self.assertNotIn("words", short)
 
+    def test_the_program_holding_the_rest_of_the_card_is_named(self):
+        # "Currently allocated: 2.95 GiB ... Free (according to CUDA): 0
+        # bytes" on an 8 GB card: something else had five gigabytes, and the
+        # advice said "anything else using the card" and left it at that.
+        smi = [{"pid": 4312, "name": r"D:\ComfyUI\python_embeded\python.exe",
+                "mb": 5120},
+               {"pid": 777, "name": "C:\\ours\\python.exe", "mb": 3000},
+               {"pid": 880, "name": "chrome.exe", "mb": None}]
+        with mock.patch.object(server, "engine_online", return_value=False), \
+             mock.patch.object(server, "gpu_vram", return_value=8188), \
+             mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "", "driver": False,
+                                             "vram_mb": 8188}), \
+             mock.patch.object(bootstrap, "gpu_processes", return_value=smi), \
+             mock.patch.object(bootstrap, "port_pids", return_value=[777]), \
+             mock.patch.object(bootstrap, "pid_cmdline",
+                               side_effect=lambda pid: "python.exe -s "
+                               "ComfyUI\\main.py" if pid == 4312 else ""):
+            text = server.out_of_memory_advice(
+                "qwen", [], {"unload": True, "model": "0.6B"})
+        self.assertIn("python.exe (process 4312, 5.0 GB, a ComfyUI)", text)
+        self.assertIn("chrome.exe (process 880)", text)
+        self.assertNotIn("777", text)          # the engine that ran the line
+        self.assertLess(text.index("4312"), text.index("880"))
+        self.assertNotIn("Anything else using the card", text)
+
+    def test_with_nobody_to_name_it_still_says_what_to_look_for(self):
+        with mock.patch.object(server, "engine_online", return_value=False), \
+             mock.patch.object(server, "gpu_vram", return_value=8188), \
+             mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "", "driver": False,
+                                             "vram_mb": 8188}), \
+             mock.patch.object(bootstrap, "gpu_processes", return_value=[]), \
+             mock.patch.object(bootstrap, "port_pids", return_value=[]):
+            text = server.out_of_memory_advice(
+                "qwen", [], {"unload": True, "model": "0.6B"})
+        self.assertIn("Anything else using the card", text)
+
+    def test_nvidia_smi_s_process_list_is_read_as_it_prints_it(self):
+        out = mock.Mock(returncode=0, stdout=(
+            "4312, D:\\Comfy, Portable\\python.exe, 5120\n"
+            "880, C:\\chrome.exe, [N/A]\n\n"))
+        with mock.patch.object(bootstrap, "_smi_candidates",
+                               return_value=["nvidia-smi"]), \
+             mock.patch.object(bootstrap, "_run", return_value=out):
+            got = bootstrap.gpu_processes()
+        self.assertEqual(got, [
+            {"pid": 4312, "name": "D:\\Comfy, Portable\\python.exe", "mb": 5120},
+            {"pid": 880, "name": "C:\\chrome.exe", "mb": None}])
+        with mock.patch.object(bootstrap, "_smi_candidates", return_value=[]):
+            self.assertEqual(bootstrap.gpu_processes(), [])
+
     def test_a_long_reference_clip_is_named_as_a_cause(self):
         with tempfile.TemporaryDirectory() as d:
             refs = Path(d)

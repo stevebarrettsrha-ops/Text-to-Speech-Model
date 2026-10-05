@@ -1757,6 +1757,39 @@ def _adapter_names() -> list[str]:
     return []
 
 
+def gpu_processes() -> list[dict]:
+    """Programs holding memory on the card: [{"pid", "name", "mb"}].
+
+    For the one moment it matters — a line that ran out of memory with
+    "Free (according to CUDA): 0 bytes" while this engine held three of the
+    card's eight gigabytes. Something else had the rest, and "anything else
+    using the card" left a person to guess what. nvidia-smi knows. `mb` is
+    None where the driver will not say (Windows reports N/A per process under
+    WDDM), and the list is empty when nvidia-smi does not answer. Never
+    raises; never cached — the answer is about this instant.
+    """
+    for smi in _smi_candidates():
+        try:
+            out = _run([smi, "--query-compute-apps=pid,process_name,used_memory",
+                        "--format=csv,noheader,nounits"], timeout=20)
+        except Exception:  # noqa: BLE001
+            continue
+        if out.returncode != 0:
+            continue
+        procs = []
+        for line in (out.stdout or "").splitlines():
+            # A path can hold a comma, so only the first and the last split.
+            pid, _, rest = line.partition(",")
+            name, _, mb = rest.rpartition(",")
+            pid, name, mb = pid.strip(), name.strip(), mb.strip()
+            if not pid.isdigit() or not name:
+                continue
+            procs.append({"pid": int(pid), "name": name,
+                          "mb": int(mb) if mb.isdigit() else None})
+        return procs
+    return []
+
+
 _GPU: dict = {}
 
 

@@ -631,6 +631,38 @@ LONG_LINE_WORDS = 60
 LONG_CLIP_SECONDS = 20
 
 
+def others_on_the_card(engine: str) -> list[str]:
+    """Who else holds memory on the card, by name, biggest first.
+
+    This engine's own process is left out — by the one we started and by
+    whatever answers its port, since an adopted ComfyUI is ours too. A python
+    whose command line looks like a ComfyUI says so: an orphan from an earlier
+    launch is the usual one, and it is invisible in Task Manager's Apps list.
+    """
+    ours: set[int] = set()
+    proc = PROCS[engine].proc
+    if proc is not None and proc.poll() is None:
+        ours.add(proc.pid)
+    try:
+        ours.update(bootstrap.port_pids(
+            comfy_port(bootstrap.engine_url(cfg, engine))))
+    except Exception:  # noqa: BLE001
+        pass
+    found = [p for p in bootstrap.gpu_processes() if p["pid"] not in ours]
+    found.sort(key=lambda p: p["mb"] or 0, reverse=True)
+    named = []
+    for p in found[:4]:
+        bits = [f"process {p['pid']}"]
+        if p["mb"]:
+            bits.append(f"{p['mb'] / 1024:.1f} GB")
+        cmd = bootstrap.pid_cmdline(p["pid"]).lower()
+        if "main.py" in cmd or "comfy" in cmd:
+            bits.append("a ComfyUI")
+        named.append(f"{Path(p['name'].replace(chr(92), '/')).name or 'unknown'}"
+                     f" ({', '.join(bits)})")
+    return named
+
+
 def out_of_memory_advice(engine: str, freed: list[str], opts: dict,
                          line: dict | None = None,
                          voice: dict | None = None) -> str:
@@ -676,8 +708,21 @@ def out_of_memory_advice(engine: str, freed: list[str], opts: dict,
     if (opts.get("model") or "").startswith("1.7"):
         lines.append("The 1.7B model is about twice the 0.6B. Switching to "
                      "0.6B leaves room for the clone.")
-    lines.append("Anything else using the card — a game, a browser playing "
-                 "video, another ComfyUI — is taking memory this needs.")
+    # Named where nvidia-smi can name them. "Anything else using the card"
+    # left a person with an allocator report saying 0 bytes free and no idea
+    # whose the other five gigabytes were.
+    try:
+        holders = others_on_the_card(engine)
+    except Exception:  # noqa: BLE001
+        holders = []
+    if holders:
+        lines.append("Also holding memory on the card: " + "; ".join(holders)
+                     + ". Close what you can and try again — Task Manager's "
+                       "Details tab finds a process by its number.")
+    else:
+        lines.append("Anything else using the card — a game, a browser "
+                     "playing video, another ComfyUI — is taking memory this "
+                     "needs.")
     return " ".join(lines)
 
 
