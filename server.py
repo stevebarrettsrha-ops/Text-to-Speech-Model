@@ -612,7 +612,28 @@ def free_the_card(engine: str) -> list[str]:
     return freed
 
 
-def out_of_memory_advice(engine: str, freed: list[str], opts: dict) -> str:
+def ref_seconds(name: str) -> float | None:
+    """How long a kept reference clip runs, or None where wave cannot read it."""
+    local = REFS_DIR / Path(name or "").name
+    if not name or not local.is_file():
+        return None
+    try:
+        with wave.open(str(local), "rb") as w:
+            return w.getnframes() / float(w.getframerate() or 1)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# Words in one line past which its length, not the model, is the likelier
+# reason a small card filled: the audio for a line is generated and decoded
+# whole, and a paragraph of seventy words is most of a minute of it.
+LONG_LINE_WORDS = 60
+LONG_CLIP_SECONDS = 20
+
+
+def out_of_memory_advice(engine: str, freed: list[str], opts: dict,
+                         line: dict | None = None,
+                         voice: dict | None = None) -> str:
     """What to do about a card that is full, in the order worth trying.
 
     The node's own message is a wall of allocator numbers — "Currently
@@ -638,6 +659,20 @@ def out_of_memory_advice(engine: str, freed: list[str], opts: dict) -> str:
         lines.append('Turn on "Free GPU memory after each run" in More '
                      "options: a preset voice and a cloned one are different "
                      "checkpoints, and both stay loaded without it.")
+    # What was being spoken, before what was loaded: on 0.6B a whole script
+    # pasted as one block is the usual reason, and nothing above said so —
+    # the advice read as though the card were simply too small.
+    words = len(str((line or {}).get("text", "")).split())
+    if words > LONG_LINE_WORDS:
+        lines.append(f"This line is {words} words, and a line is spoken and "
+                     "decoded in one piece. Split it into a line per "
+                     "paragraph — each then needs a fraction of the memory.")
+    if (voice or {}).get("kind") == "clone":
+        secs = ref_seconds(voice.get("ref_audio", ""))
+        if secs and secs > LONG_CLIP_SECONDS:
+            lines.append(f"The reference clip is {secs:.0f} seconds and goes "
+                         "into every line; 5 to 15 seconds copies the voice "
+                         "as well and needs less room.")
     if (opts.get("model") or "").startswith("1.7"):
         lines.append("The 1.7B model is about twice the 0.6B. Switching to "
                      "0.6B leaves room for the clone.")
@@ -716,10 +751,16 @@ def run_job(job_id: str, payload: dict) -> None:
 
         for done, i in enumerate(order):
             line, key, voice = lines[i], keys[i], voices[i]
+            # When this line began: the page counts it up, because a line
+            # gives no percentage of its own (the node reports nothing
+            # between "loading" and "saved"), and a script written as one
+            # block is "line 1 of 1" — a bar that sat at 0% for the whole
+            # take and read as nothing happening.
             set_state(stage=f"Line {i + 1} of {len(lines)} · "
                             f"{voice.get('name') or 'Speaker ' + key}",
                       pct=round(done / max(len(lines), 1) * 100, 1),
-                      line_index=i)
+                      line_index=i, lines_done=done,
+                      line_started=time.time())
 
             opts["unload"] = unload and done == len(order) - 1
             built = for_engine(engine).build_line(line, voice, opts)
@@ -745,8 +786,8 @@ def run_job(job_id: str, payload: dict) -> None:
                 except Exception as second:  # noqa: BLE001
                     if not comfy.is_out_of_memory(str(second)):
                         raise
-                    raise ComfyError(out_of_memory_advice(engine, freed,
-                                                          opts)) from second
+                    raise ComfyError(out_of_memory_advice(
+                        engine, freed, opts, line, voice)) from second
             item = outs[0]
             ext = Path(item["filename"]).suffix or ".wav"
             dest = folder / f"line_{i:03d}{ext}"
@@ -1597,6 +1638,13 @@ def api_jobs():
         active = [dict(j) for j in jobs.values()
                   if j["status"] == "running" or j["id"] == mine
                   or now - j.get("finished", j["created"]) < 180]
+    # Counted here rather than on the page, so a browser clock that disagrees
+    # with this machine's cannot make a running line read minus ten seconds.
+    for j in active:
+        if j["status"] == "running":
+            j["elapsed"] = round(now - j["created"], 1)
+            if j.get("line_started"):
+                j["line_elapsed"] = round(now - j["line_started"], 1)
     return jsonify(sorted(active, key=lambda j: j["created"], reverse=True))
 
 

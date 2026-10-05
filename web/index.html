@@ -182,6 +182,14 @@
            background:linear-gradient(100deg,var(--accent),var(--accent-2));color:#fff;
            box-shadow:0 8px 26px -14px rgba(124,77,255,.95)}
   .primary:disabled{opacity:.4;box-shadow:none;cursor:not-allowed}
+  /* Reading is disabled so it cannot be pressed twice, not because nothing
+     is happening — dimmed like a dead button, it said the opposite. */
+  .primary.working:disabled{opacity:.85;cursor:progress}
+  .primary.working>svg{display:none}
+  #runLabel{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .primary .spin{display:inline-block;width:13px;height:13px;border:2px solid currentColor;
+    border-right-color:transparent;border-radius:50%;margin-right:8px;
+    vertical-align:-2px;animation:rot .8s linear infinite}
   .stopbtn{padding:13px 18px;border-radius:12px;background:var(--panel);
            border:1px solid var(--line);color:var(--muted);font-size:13.5px}
   .stopbtn:hover{border-color:var(--err);color:#ff9a9a}
@@ -256,6 +264,12 @@
   .job .s{font-size:11.5px;color:var(--dim);margin-top:6px;display:flex;
           justify-content:space-between;gap:8px}
   .job.bad{border-color:rgba(255,90,90,.42)}
+  /* A line in flight has no percentage of its own, so its bar moves without
+     claiming one. Under reduced motion it holds still at full width, faint:
+     a stub frozen at the left would read as 0% again. */
+  .bar.busy i{width:32%!important;animation:slide 1.5s ease-in-out infinite}
+  @keyframes slide{from{transform:translateX(-100%)}to{transform:translateX(320%)}}
+  .job .hint{font-size:11.5px;color:var(--muted);margin-top:6px;line-height:1.5}
   .job.bad .s{color:#ff9a9a}
 
   /* player */
@@ -371,7 +385,8 @@
     .page,.chead,.createbar{padding-left:14px;padding-right:14px}
     .np{width:auto;flex:1}
   }
-  @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}
+    .bar.busy i{width:100%!important;opacity:.35}}
 </style>
 </head>
 <body>
@@ -1098,13 +1113,21 @@ function renderSpeakerBody(n) {
       '<div class="note">' + (isMoss()
         ? "MOSS clones from the sound alone and does not use this."
         : "Matching this text to the clip makes a large difference. Left empty, " +
-          "the voice is copied from its sound alone — less closely.") + "</div>";
+          "the voice is copied from its sound alone — less closely.") + "</div>" +
+      '<div class="note bad-text" data-refwarn hidden></div>';
+    var warn = body.querySelector("[data-refwarn]");
+    var paintWarn = function () {
+      var w = refWarning(S.speakers[n]);
+      warn.hidden = !w;
+      warn.textContent = w;
+    };
+    paintWarn();
     body.querySelector("[data-pick]").addEventListener("click", function () {
       body.querySelector("[data-file]").click(); });
     body.querySelector("[data-file]").addEventListener("change", function (e) {
       uploadRef(n, e.target); });
     body.querySelector("[data-reftext]").addEventListener("input", function (e) {
-      S.speakers[n].ref_text = e.target.value; saveDraft(); });
+      S.speakers[n].ref_text = e.target.value; paintWarn(); saveDraft(); });
     body.appendChild(hearIt(n));
   } else {
     // What the note says depends on whether the model is on disk. It used to
@@ -1142,6 +1165,46 @@ function renderSpeakerBody(n) {
       S.speakers[n].instruct = e.target.value; saveDraft(); });
     body.appendChild(hearIt(n));
   }
+}
+/* A transcript has to be what the clip says, and a 5 to 15 second clip
+   holds forty-odd words at most. The script pasted here instead is an easy
+   mistake — this box sits just under it — and Qwen lines the transcript up
+   against the audio, so the mismatch is paid on every line. A long clip is
+   paid on every line too: it goes into each one's prompt. */
+function refWarning(s) {
+  var secs = s.ref_secs || 0;
+  var words = (s.ref_text || "").trim().split(/\s+/).filter(Boolean).length;
+  var room = secs ? Math.ceil(secs * 3.5) + 4 : 45;
+  if (!isMoss() && words > room)
+    return "That is " + words + " words, more than "
+      + (secs ? "a " + Math.round(secs) + " second clip" : "a 5 to 15 second clip")
+      + " holds. Type only what is said in the clip: when the two do not "
+      + "match, the voice can say the wrong words or run on, and every line "
+      + "takes longer.";
+  if (secs > 20)
+    return "This clip is " + Math.round(secs) + " seconds long. It goes into "
+      + "every line, so a long one slows each of them — 5 to 15 seconds "
+      + "copies the voice just as well.";
+  return "";
+}
+/* How long a clip runs, read by the browser from the file itself — any
+   format it can play, and nothing for the server to decode. 0 when it
+   cannot tell, which the warning above treats as unknown. */
+function clipSeconds(file) {
+  return new Promise(function (ok) {
+    var url = "";
+    var done = function (v) { if (url) URL.revokeObjectURL(url); url = ""; ok(v); };
+    try {
+      var a = new Audio();
+      url = URL.createObjectURL(file);
+      a.preload = "metadata";
+      a.onloadedmetadata = function () {
+        done(isFinite(a.duration) && a.duration > 0 ? a.duration : 0); };
+      a.onerror = function () { done(0); };
+      setTimeout(function () { done(0); }, 4000);
+      a.src = url;
+    } catch (e) { done(0); }
+  });
 }
 /* Every voice source can be heard before a whole script is spent on it —
    only Preset could, so a designed voice had no way to begin at all short
@@ -1183,8 +1246,10 @@ async function uploadRef(n, input) {
   var fd = new FormData();
   fd.append("file", f);
   try {
+    var secs = await clipSeconds(f);
     var r = await api("/api/upload-reference", { method: "POST", body: fd });
     S.speakers[n].ref_audio = r.name;
+    S.speakers[n].ref_secs = secs;
     renderSpeakerBody(n);
     saveDraft();
     toast("Reference loaded for " + spkName(n) + ".");
@@ -1366,6 +1431,27 @@ async function runScript() {
     $("btnStop").hidden = true;
   }
 }
+/* What Read says. While a take runs: which line, and for how long. A
+   dimmed "Read the script" over minutes of silence read as nothing
+   happening, and one block of text is "line 1 of 1" — there is no bar to
+   move until it is finished, so the clock is what shows it is alive. */
+function paintRun() {
+  var j = S.reading;
+  $("btnRun").classList.toggle("working", !!j);
+  if (j) {
+    $("runLabel").innerHTML = '<span class="spin"></span>'
+      + esc((j.stage && j.stage !== "Starting" ? j.stage : "Starting the take")
+            + " · " + fmtTime(j.elapsed || 0));
+  } else {
+    $("runLabel").textContent = blocker(S.status).label;
+  }
+}
+function readingDone() {
+  S.reading = null;
+  $("btnRun").disabled = false;
+  $("btnStop").hidden = true;
+  paintRun();
+}
 async function previewVoice(n) {
   // The same blocker the Run button names: an engine that is merely offline
   // or missing a model was sent to the install dialog, which clears neither.
@@ -1405,8 +1491,7 @@ async function pollJob(isPreview) {
       return;
     }
     jobMisses = 0;
-    $("btnRun").disabled = false;
-    $("btnStop").hidden = true;
+    readingDone();
     highlight(-1);
     loadTakes();
     toast("Lost track of that take — Script Builder was restarted while it "
@@ -1418,11 +1503,17 @@ async function pollJob(isPreview) {
     // A voice sample is one line of its own, not a line of the script.
     highlight(!isPreview && typeof job.line_index === "number"
       ? job.line_index : -1);
-    jobTimer = setTimeout(function () { pollJob(isPreview); }, 1200);
+    // Not once Stop was pressed: the job reads "running" until ComfyUI lets
+    // go, and the clock coming back on a button just released said it had
+    // not stopped.
+    if (!isPreview && S.stopAsked !== job.id) { S.reading = job; paintRun(); }
+    jobTimer = setTimeout(function () { pollJob(isPreview); }, 1000);
     return;
   }
-  $("btnRun").disabled = false;
-  $("btnStop").hidden = true;
+  if (isPreview) {
+    $("btnRun").disabled = false;
+    $("btnStop").hidden = true;
+  } else readingDone();
   highlight(-1);
   if (job.status === "error") { toast(job.error || "Generation failed.", true); return; }
   if (job.status === "cancelled") { toast("Stopped."); return; }
@@ -1437,13 +1528,28 @@ function renderJobs() {
     return j.status === "running" || j.status === "error"; }).forEach(function (j) {
     var d = document.createElement("div");
     d.className = "job" + (j.status === "error" ? " bad" : "");
-    var pct = Math.round(j.pct || 0);
+    var pct = Math.round(j.pct || 0), run = j.status === "running";
+    // The percentage counts finished lines, and nothing finishes inside a
+    // line, so until one has the bar moves without a number and the clock
+    // says how long it has been going. "0%" for the length of a long line
+    // read as a run that never started.
+    var right = j.status === "error" ? "failed"
+      : run ? (pct > 0 ? pct + "% · " : "") + fmtTime(j.elapsed || 0)
+      : pct + "%";
+    var stage = j.error || j.stage || "";
+    if (run && j.total > 1 && j.line_elapsed >= 2)
+      stage += " · " + fmtTime(j.line_elapsed);
+    var hint = run && j.total === 1 && (j.line_elapsed || 0) >= 45
+      ? '<div class="hint">One block is read as one line, so there is no '
+        + "halfway point to show. Splitting it into a line per paragraph "
+        + "shows each one finish.</div>" : "";
     d.innerHTML = '<div class="t"><span>' + esc(j.title || "New take") + "</span><span>" +
-      (j.status === "error" ? "failed" : pct + "%") + "</span></div>" +
-      '<div class="bar"><i style="width:' + pct + '%"></i></div>' +
-      '<div class="s"><span>' + esc(j.error || j.stage || "") + "</span>" +
-      (j.status === "running" ? '<button data-cancel="' + j.id +
-        '" style="color:var(--dim)">Stop</button>' : "") + "</div>";
+      esc(right) + "</span></div>" +
+      '<div class="bar' + (run && pct <= 0 ? " busy" : "") + '"><i style="width:'
+        + pct + '%"></i></div>' +
+      '<div class="s"><span>' + esc(stage) + "</span>" +
+      (run ? '<button data-cancel="' + j.id +
+        '" style="color:var(--dim)">Stop</button>' : "") + "</div>" + hint;
     box.appendChild(d);
   });
   box.querySelectorAll("[data-cancel]").forEach(function (b) {
@@ -1536,9 +1642,9 @@ function stopAll() {
   highlight(-1);
   if (S.job) {
     api("/api/jobs/" + S.job + "/cancel", { method: "POST" }).catch(function () {});
+    S.stopAsked = S.job;
   }
-  $("btnStop").hidden = true;
-  $("btnRun").disabled = false;
+  readingDone();
 }
 function stepLine(d) {
   if (!S.take || !S.playing) return;
@@ -2021,7 +2127,7 @@ async function startEngine(ev) {
     ? ev.currentTarget : $("btnStartEngine");
   var b = busy(btn, "Starting…");
   engineStarting = true;
-  $("runLabel").textContent = blocker(S.status).label;
+  paintRun();
   try {
     var r = await api("/api/comfy/start?engine=" + encodeURIComponent(engine),
       { method: "POST" });
@@ -2456,7 +2562,7 @@ async function refreshStatus() {
     : st.models_known === false ? "No models folder" : "Engine loading";
   $("modelsTag").hidden = !(st.missing_models && st.missing_models.length);
   paintEngineTag();
-  $("runLabel").textContent = blocker(st).label;
+  paintRun();
   $("gpuMetric").querySelector("span").textContent =
     st.ready ? "ready" : st.comfy_online ? "loading" : "offline";
   // Only one engine is kept running, so its port is worth showing: two

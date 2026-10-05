@@ -775,6 +775,53 @@ class WhenTheCardIsFull(unittest.TestCase):
         self.assertIn("0.6B", big)
         self.assertNotIn("1.7B", small)
 
+    def test_a_whole_script_in_one_line_is_named_as_the_cause(self):
+        # A script pasted as one block filled an 8 GB card on 0.6B, and the
+        # advice read as though the card were simply too small: nothing said
+        # the line was most of a minute of audio spoken in one piece.
+        long_line = {"text": " ".join(["word"] * 70)}
+        with mock.patch.object(server, "engine_online", return_value=False), \
+             mock.patch.object(server, "gpu_vram", return_value=8188), \
+             mock.patch.object(bootstrap, "nvidia_gpu",
+                               return_value={"name": "", "driver": False,
+                                             "vram_mb": 8188}):
+            long = server.out_of_memory_advice(
+                "qwen", [], {"unload": True, "model": "0.6B"}, long_line)
+            short = server.out_of_memory_advice(
+                "qwen", [], {"unload": True, "model": "0.6B"},
+                {"text": "Hello there."})
+        self.assertIn("70 words", long)
+        self.assertIn("line per paragraph", long)
+        self.assertNotIn("words", short)
+
+    def test_a_long_reference_clip_is_named_as_a_cause(self):
+        with tempfile.TemporaryDirectory() as d:
+            refs = Path(d)
+            for name, secs in (("sb-ref-long.wav", 30), ("sb-ref-ok.wav", 8)):
+                with wave.open(str(refs / name), "wb") as w:
+                    w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000)
+                    w.writeframes(b"\0\0" * 8000 * secs)
+            with mock.patch.object(server, "REFS_DIR", refs), \
+                 mock.patch.object(server, "engine_online", return_value=False), \
+                 mock.patch.object(server, "gpu_vram", return_value=8188), \
+                 mock.patch.object(bootstrap, "nvidia_gpu",
+                                   return_value={"name": "", "driver": False,
+                                                 "vram_mb": 8188}):
+                opts = {"unload": True, "model": "0.6B"}
+                line = {"text": "Hello there."}
+                long = server.out_of_memory_advice(
+                    "qwen", [], opts, line,
+                    {"kind": "clone", "ref_audio": "sb-ref-long.wav"})
+                fine = server.out_of_memory_advice(
+                    "qwen", [], opts, line,
+                    {"kind": "clone", "ref_audio": "sb-ref-ok.wav"})
+                gone = server.out_of_memory_advice(
+                    "qwen", [], opts, line,
+                    {"kind": "clone", "ref_audio": "sb-ref-missing.mp3"})
+        self.assertIn("30 seconds", long)
+        self.assertNotIn("reference clip", fine)
+        self.assertNotIn("reference clip", gone)
+
     def test_freeing_asks_every_engine_that_is_answering(self):
         asked = []
 
@@ -1182,6 +1229,23 @@ class JobsKeepToThemselves(unittest.TestCase):
         mine = {j["id"] for j in
                 self.app.get("/api/jobs?id=stale").get_json()}
         self.assertEqual(mine, {"long", "stale"})
+
+    def test_a_line_in_flight_says_how_long_it_has_been_going(self):
+        # A script written as one block is "line 1 of 1", and the node reports
+        # nothing between loading and saved, so the bar sat at 0% for the
+        # whole take and read as nothing happening. The clock is what shows
+        # it is alive — counted by the server, so a browser clock that
+        # disagrees cannot make a line read minus ten seconds.
+        now = time.time()
+        server.jobs["run"] = {"id": "run", "status": "running", "pct": 0,
+                              "created": now - 75, "line_started": now - 40}
+        server.jobs["done"] = {"id": "done", "status": "done",
+                               "created": now - 90, "finished": now - 1}
+        got = {j["id"]: j for j in self.app.get("/api/jobs").get_json()}
+        self.assertAlmostEqual(got["run"]["elapsed"], 75, delta=2)
+        self.assertAlmostEqual(got["run"]["line_elapsed"], 40, delta=2)
+        self.assertNotIn("elapsed", got["done"])
+        self.assertNotIn("elapsed", server.jobs["run"])
 
     def test_stop_after_a_take_has_finished_interrupts_nothing(self):
         # The player's Stop sends the last job's id, and this used to stop

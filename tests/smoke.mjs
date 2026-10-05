@@ -722,6 +722,74 @@ try {
     await page.evaluate(() => { S.job = null; });
   }
 
+  /* ------------------------------------------------ a line still being read */
+  // A script written as one block is "line 1 of 1", and the node reports
+  // nothing between loading and saved, so the card sat at 0% and Read sat
+  // dimmed for the whole take: nothing on the page said it was working.
+  {
+    let state = 'running';
+    await page.route(u => u.pathname === '/api/jobs', r => r.fulfill({ json: [{
+      id: 'slow', status: state, pct: 0, total: 1, title: 'One long block',
+      stage: 'Line 1 of 1 · Rasta Man', created: 0, elapsed: 72,
+      line_elapsed: 70 }] }));
+    await page.evaluate(() => {
+      S.job = 'slow'; S.stopAsked = null;
+      document.getElementById('btnRun').disabled = true;
+      document.getElementById('btnStop').hidden = false;
+      pollJob(false);
+    });
+    await sleep(600);
+    const card = await page.evaluate(() => {
+      const j = document.querySelector('#jobList .job');
+      return j && { text: j.textContent, busy: !!j.querySelector('.bar.busy'),
+                    hint: !!j.querySelector('.hint') };
+    });
+    is(card && card.busy, 'a line with no percentage of its own moves its bar anyway');
+    is(card && /1:12/.test(card.text) && !/0%/.test(card.text),
+       'and the card counts the time instead of reading 0%', card && card.text);
+    is(card && card.hint, 'a long single block says why there is no halfway point');
+    const run = await page.evaluate(() => ({
+      working: document.getElementById('btnRun').classList.contains('working'),
+      label: document.getElementById('runLabel').textContent }));
+    is(run.working && /Line 1 of 1/.test(run.label) && /1:12/.test(run.label),
+       'Read says which line it is on and for how long', run.label);
+    state = 'cancelled';
+    await page.waitForFunction(
+      () => !document.getElementById('btnRun').classList.contains('working'),
+      null, { timeout: 8000 }).catch(() => {});
+    const after = await page.evaluate(() => ({
+      working: document.getElementById('btnRun').classList.contains('working'),
+      disabled: document.getElementById('btnRun').disabled,
+      label: document.getElementById('runLabel').textContent }));
+    is(!after.working && !after.disabled && !/1:12/.test(after.label),
+       'and gives the button back when the take ends', after.label);
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await page.evaluate(() => { S.job = null; });
+  }
+
+  /* ----------------------------------------- the script pasted as a transcript */
+  // The transcript box sits under the script, and the script pasted into it
+  // is a mismatch the model pays for on every line.
+  {
+    const warned = await page.evaluate(() => {
+      const keep = JSON.parse(JSON.stringify(S.speakers[1]));
+      setSource(1, 'clone');
+      S.speakers[1].ref_text = Array(70).fill('word').join(' ');
+      renderSpeakerBody(1);
+      const w = document.querySelector('#spk-1 [data-refwarn]');
+      const long = { shown: !w.hidden, text: w.textContent };
+      S.speakers[1].ref_text = 'Hello there, this is me.';
+      renderSpeakerBody(1);
+      const short = !document.querySelector('#spk-1 [data-refwarn]').hidden;
+      S.speakers[1] = keep;
+      setSource(1, keep.kind);
+      return { long, short };
+    });
+    is(warned.long.shown && /70 words/.test(warned.long.text),
+       'a transcript far longer than a clip holds is called out', warned.long.text);
+    is(!warned.short, 'and a transcript that fits is left alone');
+  }
+
   /* ------------------------------------------------- whose ComfyUI is this */
   // 8188 is the port every ComfyUI picks by default, so the one answering is
   // quite often somebody else's — and that looks exactly like nodes that will
