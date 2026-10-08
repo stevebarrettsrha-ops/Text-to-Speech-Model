@@ -31,6 +31,9 @@ sys.path.insert(0, str(REPO))
 # importing it — otherwise running the tests would adopt the real library.
 _SANDBOX = tempfile.mkdtemp(prefix="sb-tests-")
 os.environ["SCRIPT_BUILDER_DATA"] = _SANDBOX
+# and never let it adopt a real ComfyUI it finds on this machine: test
+# configs name made-up folders on purpose
+os.environ["SCRIPT_BUILDER_NO_SEARCH"] = "1"
 
 import bootstrap  # noqa: E402
 import comfy  # noqa: E402
@@ -1377,6 +1380,224 @@ class JobsKeepToThemselves(unittest.TestCase):
         self.assertEqual(take["pause"], 0.0)
         with wave.open(str(self.dir / "takes" / take["id"] / "take.wav")) as w:
             self.assertEqual(w.getnframes(), 4000)
+
+
+def comfy_at(path: Path, engine: str = "", weights_cfg: dict | None = None) \
+        -> Path:
+    """A folder that passes for a ComfyUI checkout: main.py, folder_paths.py
+    and a models folder. `engine` adds that engine's node pack; `weights_cfg`
+    puts every model that config asks of it on disk, whole."""
+    (path / "models").mkdir(parents=True, exist_ok=True)
+    (path / "main.py").write_text("")
+    (path / "folder_paths.py").write_text("")
+    if engine:
+        eng = bootstrap.ENGINES[engine]
+        pack = path / "custom_nodes" / eng["node_dir"]
+        pack.mkdir(parents=True, exist_ok=True)
+        (pack / eng["node_marker"]).write_text("")
+    if weights_cfg is not None:
+        for m in bootstrap.wanted_models(weights_cfg, engine or "qwen"):
+            d = bootstrap.model_dir(path / "models", m["repo"], m["engine"])
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "model.safetensors").write_bytes(b"")
+    return path
+
+
+class SavedLocationsAreVerified(unittest.TestCase):
+    """The config keeps absolute paths. Moving, renaming or re-extracting the
+    app folder (Text-to-Speech-Model -> Text-to-Speech-Model-main) left every
+    one pointing nowhere, and the Engine page marked ComfyUI, the nodes and
+    PyTorch missing with all of it sitting on disk."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="sb-moved-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        # Renamed on the way, as a GitHub zip does: the old name is gone.
+        self.app = self.root / "Text-to-Speech-Model-main"
+        self.app.mkdir()
+        for p in (mock.patch.object(bootstrap, "APP_DIR", self.app),
+                  mock.patch.object(bootstrap, "detect_comfy_dirs",
+                                    lambda: [])):
+            p.start()
+            self.addCleanup(p.stop)
+        self.qwen = comfy_at(self.app / "ComfyUI-Qwen3-TTS", "qwen")
+        self.moss = comfy_at(self.app / "ComfyUI-MOSS-TTS", "moss")
+
+    def stale(self, old_app: str) -> dict:
+        cfg = copy.deepcopy(bootstrap.DEFAULT_CONFIG)
+        cfg["setup_complete"] = True
+        cfg["engines"] = {}
+        for eid, eng in bootstrap.ENGINES.items():
+            old = old_app + "\\" + eng["dir_name"]
+            cfg["engines"][eid] = dict(
+                bootstrap.engine_defaults(eid), comfy_dir=old,
+                models_dir=old + "\\models",
+                python="C:\\gone\\python.exe")
+        return cfg
+
+    def test_a_renamed_app_folder_is_found_again(self):
+        cfg = self.stale("C:\\AI\\Text-to-Speech-Model")
+        notes = bootstrap.heal_paths(cfg)
+        for eid, where in (("qwen", self.qwen), ("moss", self.moss)):
+            slot = cfg["engines"][eid]
+            with self.subTest(engine=eid):
+                self.assertEqual(slot["comfy_dir"], str(where))
+                self.assertEqual(slot["models_dir"], str(where / "models"))
+                # A path that is gone is cleared, not kept: comfy_python
+                # finds the interpreter beside the install instead.
+                self.assertEqual(slot["python"], "")
+        self.assertEqual(len(notes), 6, "each repair is reported")
+        self.assertEqual(bootstrap.heal_paths(cfg), [],
+                         "a config that checks out is left alone")
+
+    def test_a_folder_moved_under_its_own_name_is_found_again(self):
+        cfg = self.stale("D:\\Old\\Place\\" + self.app.name)
+        venv = bootstrap.venv_python(self.qwen)
+        venv.parent.mkdir(parents=True)
+        venv.write_text("")
+        cfg["engines"]["qwen"]["python"] = (
+            "D:\\Old\\Place\\" + self.app.name + "\\"
+            + str(venv.relative_to(self.app)).replace("/", "\\"))
+        bootstrap.heal_paths(cfg)
+        self.assertEqual(cfg["engines"]["qwen"]["comfy_dir"], str(self.qwen))
+        self.assertEqual(cfg["engines"]["qwen"]["python"], str(venv),
+                         "an interpreter that moved with the app follows it")
+
+    def test_an_empty_config_adopts_the_installs_inside_the_app(self):
+        cfg = copy.deepcopy(bootstrap.DEFAULT_CONFIG)
+        bootstrap.heal_paths(cfg)
+        self.assertEqual(cfg["engines"]["qwen"]["comfy_dir"], str(self.qwen))
+        self.assertEqual(cfg["engines"]["moss"]["comfy_dir"], str(self.moss))
+
+    def test_one_comfyui_is_never_handed_to_both_engines(self):
+        # Rule 30: a plain ComfyUI beside the app can be the primary engine's
+        # (a config from before the split ran Qwen on exactly that), but it
+        # is not MOSS's as well.
+        shutil.rmtree(self.qwen)
+        shutil.rmtree(self.moss)
+        plain = comfy_at(self.app / "ComfyUI")
+        with mock.patch.object(bootstrap, "detect_comfy_dirs",
+                               lambda: [str(plain)]):
+            cfg = copy.deepcopy(bootstrap.DEFAULT_CONFIG)
+            bootstrap.heal_paths(cfg)
+        self.assertEqual(cfg["engines"]["qwen"]["comfy_dir"], str(plain))
+        self.assertEqual(cfg["engines"]["moss"]["comfy_dir"], "")
+        self.assertEqual(bootstrap.comfy_lost(cfg), ["moss"])
+
+    def test_an_engine_run_elsewhere_is_never_lost(self):
+        cfg = copy.deepcopy(bootstrap.DEFAULT_CONFIG)
+        cfg["engines"] = {e: dict(bootstrap.engine_defaults(e), managed=False)
+                          for e in bootstrap.ENGINES}
+        self.assertEqual(bootstrap.heal_paths(cfg), [])
+        self.assertEqual(bootstrap.comfy_lost(cfg), [])
+
+
+class TheSearchForAComfyUIThatMoved(unittest.TestCase):
+    """When the quick repair finds nothing, the drives are walked — but
+    breadth-first, inside a budget, and never into the trees that cannot hold
+    one, so the engine is not held up behind a slow disk."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="sb-search-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.cfg = copy.deepcopy(bootstrap.DEFAULT_CONFIG)
+        self.bare = comfy_at(self.root / "a" / "ComfyUI")
+        self.rich = comfy_at(self.root / "x" / "y" / "z" / "w" / "ComfyUI",
+                             "qwen", self.cfg)
+        # Inside a ComfyUI, and inside a system folder: never walked into.
+        comfy_at(self.bare / "custom_nodes" / "inner" / "ComfyUI")
+        comfy_at(self.root / "Windows" / "ComfyUI")
+
+    def test_every_comfyui_is_found_shallowest_first(self):
+        found = bootstrap.find_comfy_installs([self.root], max_depth=6,
+                                              budget=10)
+        self.assertEqual(found, [self.bare, self.rich])
+
+    def test_the_search_stops_at_the_depth_limit(self):
+        self.assertEqual(bootstrap.find_comfy_installs(
+            [self.root], max_depth=3, budget=10), [self.bare])
+
+    def test_the_install_holding_the_weights_is_the_one_chosen(self):
+        self.assertEqual(bootstrap.pick_comfy([self.bare, self.rich],
+                                              self.cfg, "qwen"), self.rich)
+
+    def test_a_plain_comfyui_is_not_taken_for_the_secondary_engine(self):
+        self.assertIsNone(bootstrap.pick_comfy([self.bare], self.cfg, "moss"))
+        moss = comfy_at(self.root / "m" / "ComfyUI", "moss")
+        self.assertEqual(bootstrap.pick_comfy([self.bare, moss], self.cfg,
+                                              "moss"), moss)
+
+    def test_verify_locations_finds_a_lost_comfyui(self):
+        lost = copy.deepcopy(self.cfg)
+        lost["want_moss"] = False
+        bootstrap.engine_cfg(lost, "qwen")["comfy_dir"] = str(self.root / "gone")
+        with mock.patch.object(bootstrap, "find_comfy_installs",
+                               lambda: [self.bare, self.rich]), \
+                mock.patch.object(bootstrap, "detect_comfy_dirs", lambda: []):
+            bootstrap.verify_locations(lost)
+            slot = lost["engines"]["qwen"]
+            self.assertEqual(slot["comfy_dir"], str(self.rich))
+            self.assertEqual(slot["models_dir"], str(self.rich / "models"))
+            self.assertTrue(all("not found" not in line for line in
+                                bootstrap.location_report(lost)))
+
+    def test_no_search_when_asked_not_to(self):
+        quiet = copy.deepcopy(self.cfg)
+        bootstrap.engine_cfg(quiet, "qwen")["comfy_dir"] = str(self.root / "gone")
+        walked = []
+        with mock.patch.object(bootstrap, "find_comfy_installs",
+                               lambda: walked.append(1) or [self.rich]), \
+                mock.patch.object(bootstrap, "detect_comfy_dirs", lambda: []):
+            bootstrap.verify_locations(quiet, search=False)
+        self.assertEqual(quiet["engines"]["qwen"]["comfy_dir"],
+                         str(self.root / "gone"))
+        self.assertEqual(walked, [])
+
+    def test_a_row_being_searched_for_says_so_rather_than_missing(self):
+        items = manager.dependencies(dict(bootstrap.DEFAULT_CONFIG), None,
+                                     searching=True)
+        row = next(i for i in items if i["id"] == "comfyui_qwen")
+        self.assertEqual(row["state"], "warn")
+        self.assertIn("Searching this computer", row["detail"])
+        self.assertIsNone(row["action"], "no Install over one being found")
+        items = manager.dependencies(dict(bootstrap.DEFAULT_CONFIG), None)
+        row = next(i for i in items if i["id"] == "comfyui_qwen")
+        self.assertEqual(row["state"], "missing")
+        self.assertIn("Not found on this computer", row["detail"])
+
+    def test_recheck_searches_in_the_background_and_reports_it(self):
+        # /api/deps is what Recheck calls: with ComfyUI still nowhere after
+        # the quick repair, it answers "searching" at once and the walk runs
+        # behind it; the next ask finds what the walk found.
+        cfg = copy.deepcopy(self.cfg)
+        cfg["want_moss"] = False
+        bootstrap.engine_cfg(cfg, "qwen")["comfy_dir"] = str(self.root / "gone")
+        gate = threading.Event()
+
+        def walk():
+            gate.wait(10)
+            return [self.rich]
+
+        env = {k: v for k, v in os.environ.items()
+               if k != "SCRIPT_BUILDER_NO_SEARCH"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(server, "cfg", cfg), \
+                mock.patch.object(bootstrap, "find_comfy_installs", walk), \
+                mock.patch.object(bootstrap, "detect_comfy_dirs", lambda: []):
+            web = server.app.test_client()
+            first = web.get("/api/deps").get_json()
+            self.assertTrue(first["searching"])
+            row = next(i for i in first["items"] if i["id"] == "comfyui_qwen")
+            self.assertEqual(row["state"], "warn")
+            gate.set()
+            deadline = time.time() + 10
+            while server.locating.is_set() and time.time() < deadline:
+                time.sleep(0.05)
+            second = web.get("/api/deps").get_json()
+        self.assertFalse(second["searching"])
+        row = next(i for i in second["items"] if i["id"] == "comfyui_qwen")
+        self.assertEqual((row["state"], row["detail"]),
+                         ("ok", str(self.rich)))
 
 
 class EngineHousekeeping(unittest.TestCase):

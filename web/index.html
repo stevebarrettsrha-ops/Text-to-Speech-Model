@@ -1977,6 +1977,9 @@ async function loadDeps(fresh) {
     S.depsBad = bad;
     paintEngineTag();
     paintDepTasks(S.tasks || []);
+    // The server is searching the drives for a ComfyUI that moved: look
+    // again shortly, so the row turns from "searching" into what was found.
+    if (d.searching) setTimeout(loadDeps, 3000);
   } catch (e) {
     box.innerHTML = '<div class="empty bad-text">' + esc(e.message) + "</div>";
   }

@@ -43,6 +43,68 @@ app = Flask(__name__, static_folder=None)
 
 cfg = load_config()
 progress = Progress()
+
+# Set while a search walks the drives for a ComfyUI that moved, so the Engine
+# page says "searching" instead of "missing" and Recheck does not start a
+# second walk.
+locating = threading.Event()
+# When the last search ended. The page re-polls while "searching"; a poll
+# right after a fruitless search must show "not found" (and Install), not
+# start the next walk of the drives — so Recheck searches again only after
+# this rest.
+_search_done = [float("-inf")]
+SEARCH_REST = 30.0
+_locate_lock = threading.Lock()
+
+
+def _heal(search: bool = False) -> None:
+    """Verify the saved locations; repair any that moved.
+
+    Without `search` only the quick repair runs (a moved or renamed app
+    folder). With it, an engine whose ComfyUI is still nowhere is searched
+    for across the drives. SCRIPT_BUILDER_NO_SEARCH=1 turns all of it off:
+    the tests' configs point at made-up folders on purpose, and must not
+    adopt a real install.
+    """
+    if os.environ.get("SCRIPT_BUILDER_NO_SEARCH") == "1":
+        locating.clear()            # never leave "searching" stuck on
+        return
+    # A requested search waits its turn rather than being dropped; the quick
+    # repair skips while anything else holds the lock.
+    if not _locate_lock.acquire(blocking=search):
+        return
+    try:
+        if search:
+            locating.set()
+        notes = bootstrap.verify_locations(cfg, search=search,
+                                           log=progress.log)
+        if notes:
+            save_config(cfg)
+            for n in notes:
+                progress.log(n)
+        if search:
+            for line in bootstrap.location_report(cfg):
+                progress.log("Verified " + line)
+    except Exception as exc:  # noqa: BLE001
+        progress.log(f"Could not verify the saved folders: {exc}")
+    finally:
+        if search:
+            _search_done[0] = time.monotonic()
+            # only the search owns the flag: a quick repair finishing ahead
+            # of a queued search must not read as "search done"
+            locating.clear()
+        _locate_lock.release()
+
+
+def _needs_search() -> bool:
+    return bool(bootstrap.comfy_lost(cfg))
+
+
+def _rested() -> bool:
+    return time.monotonic() - _search_done[0] > SEARCH_REST
+
+
+_heal()
 # One ComfyUI per engine, each its own process on its own port with its own
 # environment — the whole point of the split. Two of them that have both
 # generated will each be holding models in their own VRAM, and neither can free
@@ -1476,6 +1538,17 @@ def api_config():
 # --------------------------------------------------------------------------- #
 @app.get("/api/deps")
 def api_deps():
+    # Recheck is where someone lands after moving the app folder: repair the
+    # saved paths first, and if an engine's ComfyUI is still nowhere, search
+    # the drives in the background — the row says "searching" meanwhile and
+    # the page asks again until it is done.
+    if not locating.is_set():
+        _heal()
+        if _needs_search() and _rested() \
+                and os.environ.get("SCRIPT_BUILDER_NO_SEARCH") != "1":
+            locating.set()
+            threading.Thread(target=_heal, args=(True,), daemon=True).start()
+    searching = locating.is_set()
     # Every engine that is answering, so each row is judged against its own
     # ComfyUI rather than the selected one's.
     live = {e: for_engine(e) for e in bootstrap.ENGINES if engine_online(e)}
@@ -1493,7 +1566,8 @@ def api_deps():
     # kept since pip last touched them: it is pressed because something is
     # suspected, and that is the one time a kept answer is the wrong one.
     return jsonify({"items": manager.dependencies(cfg, live, current_engine(),
-                                                  fresh),
+                                                  fresh, searching),
+                    "searching": searching,
                     "torch_index": cfg.get("torch_index", ""),
                     "gpu": gpu,
                     "torch_auto": bootstrap.torch_index({})})
@@ -1921,6 +1995,22 @@ def ensure_engine_at_boot() -> None:
         _refresh_schema_when_up(engine)
 
 
+def boot() -> None:
+    """Verify every saved location, then bring the engine up.
+
+    A search for a lost ComfyUI can take most of a minute, so it only runs
+    ahead of the engine when the engine this launch opens on is the one that
+    is lost; a lost secondary engine is searched for after the primary is up,
+    rather than holding it back.
+    """
+    first = current_engine() in bootstrap.comfy_lost(cfg)
+    if first:
+        _heal(search=True)
+    ensure_engine_at_boot()
+    if not first:
+        _heal(search=True)
+
+
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     TAKES_DIR.mkdir(parents=True, exist_ok=True)
@@ -1947,9 +2037,10 @@ def main() -> None:
                          f"the primary engine — the last session ended on "
                          f"{bootstrap.ENGINES.get(was, {}).get('label', was)}.")
     # On its own thread: taking a port off an orphan can take half a minute,
-    # and the page has to be openable while it happens — the console it
-    # narrates into is on that page.
-    threading.Thread(target=ensure_engine_at_boot, daemon=True).start()
+    # and so can searching the drives for a ComfyUI that moved, and the page
+    # has to be openable while it happens — the console it narrates into is
+    # on that page.
+    threading.Thread(target=boot, daemon=True).start()
     url = f"http://127.0.0.1:{PORT}"
     print(f"\n  Script Builder  →  {url}\n")
     if os.environ.get("SCRIPT_BUILDER_NO_BROWSER") != "1":

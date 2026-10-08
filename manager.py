@@ -327,7 +327,7 @@ def engine_row(label: str, suffix: str, url: str, online: bool,
 
 
 def dependencies(cfg: dict, clients=None, engine: str = "",
-                 fresh: bool = False) -> list[dict]:
+                 fresh: bool = False, searching: bool = False) -> list[dict]:
     """What each engine needs, engine by engine.
 
     They no longer share anything below ComfyUI — separate clones, separate
@@ -336,7 +336,10 @@ def dependencies(cfg: dict, clients=None, engine: str = "",
 
     `clients` is {engine id: ComfyClient} for the engines that are answering;
     a bare client is taken as the selected engine's, which is what callers
-    written before the split still pass.
+    written before the split still pass. `searching` is True while the server
+    walks the drives for a ComfyUI that moved: a lost one then reads
+    "searching", not "missing", and offers no Install over an install that
+    may well be found.
     """
     if clients is not None and not isinstance(clients, dict):
         clients = {engine or bootstrap.DEFAULT_ENGINE: clients}
@@ -364,13 +367,14 @@ def dependencies(cfg: dict, clients=None, engine: str = "",
     engines = list(ENGINES)
     with ThreadPoolExecutor(max_workers=len(engines)) as pool:
         for rows in pool.map(lambda e: _engine_rows(cfg, e, clients.get(e),
-                                                     fresh), engines):
+                                                     fresh, searching),
+                             engines):
             items.extend(rows)
     return items
 
 
-def _engine_rows(cfg: dict, eid: str, client, fresh: bool = False) \
-        -> list[dict]:
+def _engine_rows(cfg: dict, eid: str, client, fresh: bool = False,
+                 searching: bool = False) -> list[dict]:
     """One engine's rows of the dependency report, in the order shown."""
     eng = ENGINES[eid]
     label, suffix = eng["label"], "_" + eid
@@ -387,11 +391,17 @@ def _engine_rows(cfg: dict, eid: str, client, fresh: bool = False) \
         items.append({"id": "comfyui" + suffix,
                       "label": f"ComfyUI · {label}", "state": "ok",
                       "detail": str(comfy_dir), "action": "update"})
+    elif searching:
+        items.append({"id": "comfyui" + suffix,
+                      "label": f"ComfyUI · {label}", "state": "warn",
+                      "detail": "Searching this computer for it — this "
+                                "list updates when the search is done.",
+                      "action": None})
     else:
         items.append({"id": "comfyui" + suffix,
                       "label": f"ComfyUI · {label}", "state": "missing",
-                      "detail": f"{label} has no ComfyUI of its own yet — "
-                                f"it would go in {APP_DIR / eng['dir_name']}.",
+                      "detail": "Not found on this computer. Install puts "
+                                f"it in {APP_DIR / eng['dir_name']}.",
                       "action": "install"})
 
     # Its own nodes ---------------------------------------------------- #
