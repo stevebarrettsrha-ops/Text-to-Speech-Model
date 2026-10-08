@@ -48,6 +48,12 @@ progress = Progress()
 # page says "searching" instead of "missing" and Recheck does not start a
 # second walk.
 locating = threading.Event()
+# When the last search ended. The page re-polls while "searching"; a poll
+# right after a fruitless search must show "not found" (and Install), not
+# start the next walk of the drives — so Recheck searches again only after
+# this rest.
+_search_done = [float("-inf")]
+SEARCH_REST = 30.0
 _locate_lock = threading.Lock()
 
 
@@ -83,6 +89,7 @@ def _heal(search: bool = False) -> None:
         progress.log(f"Could not verify the saved folders: {exc}")
     finally:
         if search:
+            _search_done[0] = time.monotonic()
             # only the search owns the flag: a quick repair finishing ahead
             # of a queued search must not read as "search done"
             locating.clear()
@@ -91,6 +98,10 @@ def _heal(search: bool = False) -> None:
 
 def _needs_search() -> bool:
     return bool(bootstrap.comfy_lost(cfg))
+
+
+def _rested() -> bool:
+    return time.monotonic() - _search_done[0] > SEARCH_REST
 
 
 _heal()
@@ -1533,7 +1544,7 @@ def api_deps():
     # the page asks again until it is done.
     if not locating.is_set():
         _heal()
-        if _needs_search() \
+        if _needs_search() and _rested() \
                 and os.environ.get("SCRIPT_BUILDER_NO_SEARCH") != "1":
             locating.set()
             threading.Thread(target=_heal, args=(True,), daemon=True).start()
