@@ -185,6 +185,8 @@ export async function boot({ log = console.log } = {}) {
     SCRIPT_BUILDER_DATA: dataDir,
     SCRIPT_BUILDER_PORT: String(appPort),
     SCRIPT_BUILDER_NO_BROWSER: '1',
+    // test configs name made-up folders on purpose: never search for them
+    SCRIPT_BUILDER_NO_SEARCH: '1',
   });
   const base = `http://127.0.0.1:${appPort}`;
   await waitFor(base + '/', 'Script Builder', 120, procs);

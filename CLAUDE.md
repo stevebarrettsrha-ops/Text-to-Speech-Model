@@ -684,11 +684,33 @@ designed voices interchangeable, lets one line be retried without redoing the
 script, and gives the per-block highlight during playback. The pause and the
 join are done in `server.py`, not in the node.
 
+## Saved locations are verified, never trusted
+
+The config keeps absolute paths per engine (`comfy_dir`, `models_dir`,
+`python`), and they go stale the moment the app folder is moved, renamed or
+re-extracted (Text-to-Speech-Model -> Text-to-Speech-Model-main) — then every
+row on the Engine page reads "missing" though all of it is on disk.
+`bootstrap.heal_paths()` runs at import and on every Recheck (`/api/deps`):
+`rebase_path()` grafts the saved path's tail onto the app's current folder —
+after the app's own name where the path still holds it, otherwise each tail
+tried longest first, because the root itself may be the part renamed. If an
+engine's ComfyUI is still nowhere, `verify_locations()` walks the drives
+(`find_comfy_installs`: breadth-first, a skip list, depth 6, 45 s) and
+`pick_comfy()` prefers the install holding that engine's weights and node
+pack, then the one inside the app. One ComfyUI is never handed to both
+engines (rule 30), and only the primary takes a plain ComfyUI. `boot()` runs
+the search before the engine starts only when the engine this launch opens on
+is the lost one; otherwise afterwards, so a lost MOSS never delays Qwen.
+While it walks, `/api/deps` reports `searching`, the row says so instead of
+offering Install, and the page asks again every 3 s.
+`SCRIPT_BUILDER_NO_SEARCH=1` (set by both test harnesses) turns all of it
+off: test configs name made-up folders on purpose.
+
 ## Tests — run after any edit
 
 ```bash
 node tests/check.mjs     # the gate: everything compiles, the inline script parses
-npm run test:units       # 315 unit tests, standard library only
+npm run test:units       # 328 unit tests, standard library only
 npm test                 # 138 checks driving the real page in headless Chromium
 ```
 
