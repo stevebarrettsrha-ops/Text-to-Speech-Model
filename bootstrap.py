@@ -31,6 +31,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import requests
+import model_reuse
 
 APP_DIR = Path(__file__).resolve().parent
 # Config, the library and the finished takes. SCRIPT_BUILDER_DATA moves the
@@ -320,7 +321,7 @@ def _migrate(cfg: dict) -> dict:
     legacy = {k: cfg.get(k) for k in
               ("comfy_url", "comfy_dir", "models_dir", "python", "managed")}
     qwen = engine_defaults("qwen")
-    if cfg.get("setup_complete") and legacy.get("comfy_dir"):
+    if legacy.get("comfy_dir") or legacy.get("models_dir"):
         qwen.update({k: v for k, v in legacy.items() if v not in (None, "")})
         qwen["auto_start"] = bool(cfg.get("auto_start_comfy", True))
     cfg["engines"] = {"qwen": qwen, "moss": engine_defaults("moss")}
@@ -755,7 +756,7 @@ def _fits_engine(c: Path, cfg: dict, engine: str) -> bool:
         return False
 
 
-def heal_paths(cfg: dict) -> list[str]:
+def heal_paths(cfg: dict, engines: list[str] | None = None) -> list[str]:
     """Repair each engine's saved paths that no longer exist.
 
     Returns one sentence per change. Only the quick repairs: a moved app
@@ -765,6 +766,8 @@ def heal_paths(cfg: dict) -> list[str]:
     """
     notes: list[str] = []
     for eid, eng in ENGINES.items():
+        if engines is not None and eid not in engines:
+            continue
         slot = engine_cfg(cfg, eid)
         if slot.get("managed") is False and not slot.get("comfy_dir"):
             continue                # external: the person's own, no folder
@@ -775,7 +778,9 @@ def heal_paths(cfg: dict) -> list[str]:
             taken = _claimed(cfg, eid)
             cands = [rebase_path(old_comfy), APP_DIR / eng["dir_name"],
                      APP_DIR.parent / eng["dir_name"]]
-            cands += [Path(d) for d in detect_comfy_dirs()
+            detected = detect_comfy_dirs()
+            cfg["_comfy_candidates"] = detected
+            cands += [Path(d) for d in detected
                       if _fits_engine(Path(d), cfg, eid)]
             for c in cands:
                 if c and _has_main(c) and os.path.normcase(
@@ -907,35 +912,55 @@ def pick_comfy(installs: list[Path], cfg: dict, engine: str = PRIMARY_ENGINE,
     return min(pool, key=score) if pool else None
 
 
-def verify_locations(cfg: dict, search: bool = True, log=None) -> list[str]:
-    """Check every saved location; repair what moved. Returns what changed.
+def location_signature(cfg: dict, eid: str) -> list:
+    slot = engine_cfg(cfg, eid)
+    paths = [slot.get(k) or "" for k in ("comfy_dir", "models_dir", "python")]
+    return [str(APP_DIR), *paths, _has_main(paths[0]),
+            bool(paths[1] and Path(paths[1]).is_dir()),
+            bool(paths[2] and Path(paths[2]).is_file())]
 
-    The quick repair (`heal_paths`) handles a moved app folder. When an
-    engine's ComfyUI is still nowhere and `search` is on, the drives are
-    walked once and each lost engine is offered the best install found.
+
+def locations_need_search(cfg: dict) -> bool:
+    return any(engine_cfg(cfg, e).get('_location_search') != location_signature(cfg, e)
+               for e in comfy_lost(cfg))
+
+
+def verify_locations(cfg: dict, search: bool = True, log=None,
+                     force: bool = False) -> list[str]:
+    """Use verified paths; attempt each broken location once until Recheck.
+
+    Both successful paths and negative search attempts are saved in config.
+    A changed path/existence state or explicit Recheck permits another search.
     """
     say = log or (lambda _m: None)
-    notes = heal_paths(cfg)
-    lost = comfy_lost(cfg)
+    pending = [e for e in ENGINES if engine_enabled(cfg, e) and
+               (force or engine_cfg(cfg, e).get('_location_quick') != location_signature(cfg, e))]
+    notes = heal_paths(cfg, pending) if pending else []
+    for eid in pending:
+        engine_cfg(cfg, eid)['_location_quick'] = location_signature(cfg, eid)
+    lost = [e for e in comfy_lost(cfg) if force or
+            engine_cfg(cfg, e).get('_location_search') != location_signature(cfg, e)]
     if not lost or not search:
         return notes
     say("Searching this computer for ComfyUI…")
     installs = find_comfy_installs()
+    cfg['_comfy_candidates'] = [str(p) for p in installs]
     for eid in lost:
-        label = ENGINES[eid]["label"]
-        hit = pick_comfy(installs, cfg, eid, _claimed(cfg, eid))
-        if not hit:
-            say(f"No ComfyUI for {label} found on this computer — install it "
-                "from the Engine page, or set its folder in Settings.")
-            continue
         slot = engine_cfg(cfg, eid)
-        slot["comfy_dir"] = str(hit)
-        notes.append(f"{label}: ComfyUI found at {hit}")
-        models = slot.get("models_dir") or ""
-        if not (models and Path(models).is_dir()) and (hit / "models").is_dir():
-            slot["models_dir"] = str(hit / "models")
-            notes.append(f"{label}: models folder found at "
-                         f"{slot['models_dir']}")
+        label = ENGINES[eid]['label']
+        hit = pick_comfy(installs, cfg, eid, _claimed(cfg, eid))
+        if hit:
+            slot['comfy_dir'] = str(hit)
+            notes.append(f"{label}: ComfyUI found at {hit}")
+            models = slot.get('models_dir') or ''
+            if not (models and Path(models).is_dir()) and (hit / 'models').is_dir():
+                slot['models_dir'] = str(hit / 'models')
+                notes.append(f"{label}: models folder found at {slot['models_dir']}")
+        else:
+            say(f"No ComfyUI for {label} found. Saved locations were kept. "
+                "Set its folder in Settings, or press Recheck to search again.")
+        slot['_location_search'] = location_signature(cfg, eid)
+        slot['_location_quick'] = location_signature(cfg, eid)
     return notes
 
 
@@ -1002,35 +1027,85 @@ def partial_download(d: Path) -> bool:
 
 
 def model_installed(models_dir: Path, repo: str, engine: str = "") -> bool:
-    d = model_dir(models_dir, repo, engine)
-    if not d.is_dir():
-        return False
-    # A .part is a download that stopped part way through. The config.json
-    # beside it arrived first and is perfectly good, which is exactly why this
-    # has to be checked: without it a folder whose weights are still half here
-    # reports as installed, and the engine reports ready. The .incomplete is
-    # the same thing left by a download the node started itself — and the
-    # node treats any folder that exists as finished, so it will load from it
-    # and fail on every line until the folder is whole.
-    if partial_download(d):
-        return False
-    # And a config is not a model. download_repo fetches the small files
-    # first, so a request for the weights that fails before its .part is
-    # opened — a 503, a dropped DNS lookup — left config.json alone in the
-    # folder, which counted as installed: setup never fetched it again, and
-    # the first take failed inside the node. Every repo either engine uses
-    # carries its weights as one of these files.
-    return any(f.suffix in WEIGHT_SUFFIXES for f in d.rglob("*"))
+    return folder_whole(model_dir(models_dir, repo, engine))
 
 
 def folder_whole(d: Path) -> bool:
-    """Weights on disk and nothing still arriving: the bar one copy of a
-    folder has to clear before it is kept over another copy of itself."""
-    if not d.is_dir():
-        return False
-    files = list(d.rglob("*"))
-    return (not any(f.suffix in PARTIAL_SUFFIXES for f in files)
-            and any(f.suffix in WEIGHT_SUFFIXES for f in files))
+    return model_reuse.whole(d)
+
+
+def reuse_downloaded_models(cfg: dict, engine: str = "", log=None,
+                           force: bool = False) -> None:
+    """Search once per broken location; link existing weights without copying.
+
+    Saved attempts, including blocked links, survive restarts. Only a changed
+    location state or an explicit Recheck permits another discovery attempt.
+    """
+    say = log or (lambda _m: None)
+    for eid, eng in ENGINES.items():
+        if (engine and eid != engine) or not engine_enabled(cfg, eid):
+            continue
+        slot = engine_cfg(cfg, eid)
+        base = engine_models_dir(cfg, eid)
+        if base is None:
+            continue
+        local = Path(slot['comfy_dir']) if slot.get('comfy_dir') else None
+
+        def signature():
+            # A missing model, a broken alias or a changed configured root is
+            # a new failure. These checks stay within known model folders.
+            known = [model_dir(base, m['repo'], eid) for m in eng['models']]
+            if eid == 'qwen' and local:
+                known += [model_dir(local / 'models', m['repo'], eid)
+                          for m in eng['models']]
+            return [str(base), str(local or ''), str(APP_DIR),
+                    str(model_reuse.hub_cache()),
+                    [[os.path.lexists(p), folder_whole(p)] for p in known]]
+
+        state = slot.get('_model_reuse', {})
+        stamp = signature()
+        if not force and state.get('attempt') == stamp:
+            if state.get('error'):
+                raise RuntimeError(state['error'])
+            continue
+        slot['_model_reuse'] = {'attempt': stamp}
+        try:
+            roots = [base / eng['subdir']]
+            if local:
+                roots.append(local / 'models' / eng['subdir'])
+                roots.extend(model_reuse.extra_roots(local, eid))
+            # Optional checkpoints are adopted if present, never downloaded.
+            for m in eng['models']:
+                repo = m['repo']
+                target = model_dir(base, repo, eid)
+                if folder_whole(target):
+                    continue
+                org, name = repo.split('/', 1)
+                candidates = [p for root in roots for p in
+                              (root / name, root / (org + '--' + name), root / org / name)]
+                source = next((p for p in candidates if folder_whole(p)), None)
+                if source is None:
+                    source = model_reuse.cached_snapshot(repo)
+                if source is not None:
+                    model_reuse.link_directory(source, target)
+                    say(f"Reusing {repo}: {source.resolve()} (linked at {target})")
+            # Qwen's tokenizer check ignores extra_model_paths.yaml. Its
+            # hardcoded ComfyUI folder also needs the links for shared roots.
+            if eid == 'qwen' and local and (local / 'main.py').is_file():
+                for m in eng['models']:
+                    source = model_dir(base, m['repo'], eid)
+                    target = model_dir(local / 'models', m['repo'], eid)
+                    if folder_whole(source) and source.resolve() != target.resolve():
+                        if folder_whole(target):
+                            continue  # keep any usable checkpoint already here
+                        model_reuse.link_directory(source, target)
+                        say(f"Qwen loader uses existing {m['repo']}: {source.resolve()}")
+        except Exception as exc:
+            # Persist even partial progress or a blocked link. The caller saves
+            # config in finally, so a restart cannot silently retry discovery.
+            slot['_model_reuse'] = {'attempt': signature(), 'error': str(exc)}
+            raise RuntimeError(str(exc)) from exc
+        slot['_model_reuse'] = {'attempt': signature()}
 
 
 # Folders the Qwen node keeps under models/qwen-tts that are not models.
@@ -1275,6 +1350,10 @@ def download_repo(cfg: dict, repo: str, models_dir: Path,
                   on_detail=None, should_cancel=None, engine: str = "") -> None:
     """Pull a whole model folder into the layout its own node searches."""
     target = model_dir(models_dir, repo, engine)
+    if folder_whole(target):
+        if on_detail:
+            on_detail(f"Already downloaded: {target}", 100)
+        return
     files = wanted_files(hf_tree(cfg, repo))
     total_bytes = sum(f["size"] for f in files) or 1
     done_bytes = 0
@@ -1401,6 +1480,11 @@ class ComfyProcess:
             raise RuntimeError(
                 f"There is no ComfyUI at {comfy_dir} any more — the folder has "
                 "moved or been deleted. Run setup again from Settings.")
+        if cfg is not None:
+            try:
+                reuse_downloaded_models(cfg, engine, prog.log)
+            finally:
+                save_config(cfg)
         if not install_memory_compat(comfy_dir, prog.log):
             raise RuntimeError("Could not install speech memory cleanup. Check that "
                                "ComfyUI/custom_nodes is writable, then restart.")
@@ -2935,9 +3019,12 @@ def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
                     f"Set {label}'s models folder in Settings so its voices "
                     "land where that ComfyUI looks.")
             return
-        picked = chosen.get(engine) or ""
+        picked = chosen.get(engine) or (slot.get("comfy_dir") if _has_main(slot.get("comfy_dir")) else "") or ""
         target = Path(picked) if picked else APP_DIR / eng["dir_name"]
-        slot["managed"] = not picked
+        if chosen.get(engine):
+            slot["managed"] = False
+        elif not picked:
+            slot["managed"] = True
         if not (target / "main.py").exists():
             if not have_git():
                 raise RuntimeError(
@@ -2955,7 +3042,8 @@ def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
             raise RuntimeError(f"No main.py in {target} — that folder is not "
                                "a ComfyUI install.")
         slot["comfy_dir"] = str(target)
-        slot["models_dir"] = str(target / "models")
+        if not slot.get("models_dir"):
+            slot["models_dir"] = str(target / "models")
         return
 
     comfy_dir = Path(slot["comfy_dir"]) if slot.get("comfy_dir") else None
@@ -3126,6 +3214,10 @@ def run_setup(cfg: dict, prog: Progress, comfy, chosen_dir: str = "",
         # Folders an earlier version put in the <Org>/<Name> shape are moved
         # before anything is counted missing, or they are fetched again.
         migrate_qwen_layout(engine_models_dir(cfg, "qwen"), prog.log)
+        try:
+            reuse_downloaded_models(cfg, log=prog.log)
+        finally:
+            save_config(cfg)
         todo = [(eid, m) for eid in engines for m in engine_missing(cfg, eid)]
         if not todo:
             prog.finish("models", "Everything is already downloaded")

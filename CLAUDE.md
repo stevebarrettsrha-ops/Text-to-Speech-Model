@@ -702,7 +702,16 @@ engines (rule 30), and only the primary takes a plain ComfyUI. `boot()` runs
 the search before the engine starts only when the engine this launch opens on
 is the lost one; otherwise afterwards, so a lost MOSS never delays Qwen.
 While it walks, `/api/deps` reports `searching`, the row says so instead of
-offering Install, and the page asks again every 3 s.
+offering Install, and the page asks again every 3 s. Successful paths and
+negative attempts are persisted: a normal poll/restart uses the saved location,
+and only a changed or failed saved path gets one new search. Explicit Recheck
+(`/api/deps?fresh=1`) permits another attempt. `/api/status` lists cached choices
+and never runs discovery. `reuse_downloaded_models` follows the same rule for
+ComfyUI model roots, extra_model_paths.yaml and the local HuggingFace cache.
+It links whole existing folders into each loader's layout without copying
+weights; blocked links are reported and persisted, including Qwen's hardcoded
+tokenizer destination. A whole folder requires config.json, root weights and
+all indexed shards; zero-byte/LFS-placeholder/broken/partial weights do not count.
 `SCRIPT_BUILDER_NO_SEARCH=1` (set by both test harnesses) turns all of it
 off: test configs name made-up folders on purpose.
 

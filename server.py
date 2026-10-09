@@ -48,16 +48,10 @@ progress = Progress()
 # page says "searching" instead of "missing" and Recheck does not start a
 # second walk.
 locating = threading.Event()
-# When the last search ended. The page re-polls while "searching"; a poll
-# right after a fruitless search must show "not found" (and Install), not
-# start the next walk of the drives — so Recheck searches again only after
-# this rest.
-_search_done = [float("-inf")]
-SEARCH_REST = 30.0
 _locate_lock = threading.Lock()
 
 
-def _heal(search: bool = False) -> None:
+def _heal(search: bool = False, force: bool = False) -> None:
     """Verify the saved locations; repair any that moved.
 
     Without `search` only the quick repair runs (a moved or renamed app
@@ -73,23 +67,24 @@ def _heal(search: bool = False) -> None:
     # repair skips while anything else holds the lock.
     if not _locate_lock.acquire(blocking=search):
         return
+    before = json.dumps(cfg, sort_keys=True)
     try:
         if search:
             locating.set()
         notes = bootstrap.verify_locations(cfg, search=search,
-                                           log=progress.log)
-        if notes:
-            save_config(cfg)
-            for n in notes:
-                progress.log(n)
+                                           log=progress.log, force=force)
+        bootstrap.reuse_downloaded_models(cfg, log=progress.log, force=force)
+        for n in notes:
+            progress.log(n)
         if search:
             for line in bootstrap.location_report(cfg):
                 progress.log("Verified " + line)
     except Exception as exc:  # noqa: BLE001
         progress.log(f"Could not verify the saved folders: {exc}")
     finally:
+        if json.dumps(cfg, sort_keys=True) != before:
+            save_config(cfg)
         if search:
-            _search_done[0] = time.monotonic()
             # only the search owns the flag: a quick repair finishing ahead
             # of a queued search must not read as "search done"
             locating.clear()
@@ -97,11 +92,7 @@ def _heal(search: bool = False) -> None:
 
 
 def _needs_search() -> bool:
-    return bool(bootstrap.comfy_lost(cfg))
-
-
-def _rested() -> bool:
-    return time.monotonic() - _search_done[0] > SEARCH_REST
+    return bootstrap.locations_need_search(cfg)
 
 
 _heal()
@@ -1049,7 +1040,10 @@ def api_status():
         # that is already running.
         "setup_running": bool(progress.running),
         "models_known": models_known,
-        "detected": detect_comfy_dirs(),
+        "detected": list(dict.fromkeys([*cfg.get("_comfy_candidates", []),
+                      *(bootstrap.engine_cfg(cfg, e).get("comfy_dir")
+                        for e in bootstrap.ENGINES
+                        if bootstrap.engine_cfg(cfg, e).get("comfy_dir"))])),
         "config": dict({k: cfg.get(k) for k in
                         ("torch_index", "want_clone", "want_17b",
                          "want_voicedesign", "want_moss", "want_moss_8b",
@@ -1582,12 +1576,14 @@ def api_deps():
     # saved paths first, and if an engine's ComfyUI is still nowhere, search
     # the drives in the background — the row says "searching" meanwhile and
     # the page asks again until it is done.
+    fresh = request.args.get("fresh") == "1"
     if not locating.is_set():
         _heal()
-        if _needs_search() and _rested() \
+        if (fresh or _needs_search()) \
                 and os.environ.get("SCRIPT_BUILDER_NO_SEARCH") != "1":
             locating.set()
-            threading.Thread(target=_heal, args=(True,), daemon=True).start()
+            threading.Thread(target=_heal, args=(True,), kwargs={"force": fresh},
+                             daemon=True).start()
     searching = locating.is_set()
     # Every engine that is answering, so each row is judged against its own
     # ComfyUI rather than the selected one's.
@@ -1596,7 +1592,6 @@ def api_deps():
     # The GPU answer is cached — it costs a PowerShell query on Windows and
     # cannot change without a reboot. Recheck asks again anyway, because
     # installing the driver is exactly what someone does between two presses.
-    fresh = request.args.get("fresh") == "1"
     gpu = dict(bootstrap.nvidia_gpu(refresh=fresh))
     if not gpu.get("vram_mb") and any_live:
         # nvidia-smi missing but ComfyUI running: it carries its own CUDA and
