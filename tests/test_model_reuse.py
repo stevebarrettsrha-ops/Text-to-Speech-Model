@@ -78,6 +78,15 @@ class ReuseDownloadedModels(unittest.TestCase):
         bootstrap.reuse_downloaded_models(self.cfg, 'qwen')
         self.assertEqual(self.target().resolve(), source)
 
+    def test_a_broken_alias_is_repaired_without_moving_new_source_weights(self):
+        source = self.snapshot()
+        target = self.target()
+        target.parent.mkdir(parents=True)
+        target.symlink_to(self.root / 'old-location', target_is_directory=True)
+        bootstrap.reuse_downloaded_models(self.cfg, 'qwen')
+        self.assertEqual(target.resolve(), source)
+        self.assertTrue((source / 'model.safetensors').is_file())
+
     def test_a_missing_shard_or_zero_byte_weight_is_not_reused(self):
         source = self.snapshot()
         (source / 'model.safetensors.index.json').write_text(json.dumps({'weight_map': {'a': 'model.safetensors', 'b': 'second.safetensors'}}))

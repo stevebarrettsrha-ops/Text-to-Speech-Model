@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import stat
 
 WEIGHTS = {'.safetensors', '.bin', '.pt', '.pth'}
 PARTIAL = {'.part', '.incomplete'}
@@ -102,7 +103,16 @@ def link_directory(source: Path, target: Path) -> None:
     if os.path.lexists(target):
         if target.resolve() == source:
             return
-        raise RuntimeError(f'{target} already exists; it was left unchanged. Existing weights are at {source}.')
+        # A stale link has no checkpoint data to replace. Repair the link
+        # after its source moved; leave real partial folders untouched.
+        junction = (os.name == 'nt' and getattr(target.lstat(), 'st_reparse_tag', 0)
+                    == getattr(stat, 'IO_REPARSE_TAG_MOUNT_POINT', 0xA0000003))
+        if not target.exists() and target.is_symlink():
+            target.unlink()
+        elif not target.exists() and junction:
+            target.rmdir()
+        else:
+            raise RuntimeError(f'{target} already exists; it was left unchanged. Existing weights are at {source}.')
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
         target.symlink_to(source, target_is_directory=True)
