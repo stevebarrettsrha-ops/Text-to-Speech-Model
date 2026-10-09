@@ -29,14 +29,13 @@
 
 ## Validation
 
-Validation gate passed. Full Python suite: **326 of 330 tests passed**.
-Four external-process identification/takeover tests fail in this runner;
-the same four failed against unchanged code before these fixes. They are
-not reported as passes. GitHub Actions run **37992789923** subsequently
-passed both full Python suites (3.10 and 3.13), validation and browser smoke
-for the first-pass patch, confirming those local failures are runner-specific.
 The second-pass validation gate and **18 focused memory/lifecycle/readiness
-tests** pass locally; full CI must be rerun on the updated patch.
+tests** pass locally. The full **338-test suite passed on Python 3.10 and
+3.13 in GitHub Actions, with one intentional skip per version**
+([run 37993823099](https://github.com/stevebarrettsrha-ops/Text-to-Speech-Model/actions/runs/37993823099)).
+That run also passed validation and the browser smoke test. The four process-identification/
+takeover failures observed locally on both unchanged code and the first patch
+passed on the clean GitHub runners.
 
 No CUDA synthesis was run. MOSS offloading needs system RAM, and neither cache
 cleanup nor the published model-size estimates prove that an arbitrary long
