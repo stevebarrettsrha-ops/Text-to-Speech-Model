@@ -194,6 +194,10 @@ OBJECT_INFO = {
 
 # Which node sets /object_info admits to having, so a test can reproduce an
 # engine whose nodes ComfyUI never loaded.
+# Our installed shim registers this marker in addition to the upstream nodes.
+OBJECT_INFO["ScriptBuilderMemoryV2"] = {
+    "input": {"required": {}}, "output": [], "output_node": False,
+    "name": "ScriptBuilderMemoryV2", "category": "Script Builder"}
 HIDDEN = set()
 PREFIXES = {"qwen": ("FB_Qwen3TTS",),
             "moss": ("Moss",)}

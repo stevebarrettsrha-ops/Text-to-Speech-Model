@@ -1322,7 +1322,7 @@ def plain(line: str) -> str:
 
 
 def install_memory_compat(comfy_dir: Path, log=None) -> bool:
-    """Install the Qwen cache hook before this engine starts or restarts."""
+    """Install the speech cache hook before this engine starts or restarts."""
     src = APP_DIR / "compat" / "script_builder_memory" / "__init__.py"
     dest = Path(comfy_dir) / "custom_nodes" / "script_builder_memory" / "__init__.py"
     if not (Path(comfy_dir) / "main.py").is_file():
@@ -1337,7 +1337,7 @@ def install_memory_compat(comfy_dir: Path, log=None) -> bool:
         return True
     except OSError as exc:
         if log:
-            log(f"Could not install Qwen memory cleanup: {exc}")
+            log(f"Could not install speech memory cleanup: {exc}")
         return False
 
 
@@ -1401,8 +1401,8 @@ class ComfyProcess:
             raise RuntimeError(
                 f"There is no ComfyUI at {comfy_dir} any more — the folder has "
                 "moved or been deleted. Run setup again from Settings.")
-        if engine == "qwen" and not install_memory_compat(comfy_dir, prog.log):
-            raise RuntimeError("Could not install Qwen memory cleanup. Check that "
+        if not install_memory_compat(comfy_dir, prog.log):
+            raise RuntimeError("Could not install speech memory cleanup. Check that "
                                "ComfyUI/custom_nodes is writable, then restart.")
         if extra is None and cfg is not None:
             extra, refusal = torch_launch(python, cfg, engine)

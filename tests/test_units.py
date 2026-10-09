@@ -985,6 +985,28 @@ class TheQwenNodeKeepsItsModel(unittest.TestCase):
         self.assertEqual(bootstrap.attention_support(""), {})
 
 
+class MemoryCleanupReadiness(unittest.TestCase):
+    def test_a_running_engine_without_the_update_names_restart(self):
+        client = mock.Mock()
+        client.has.return_value = False
+        with mock.patch.object(server, "started_elsewhere", return_value=False):
+            warning = server.memory_cleanup_warning("qwen", client)
+        self.assertIn("Restart ComfyUI", warning)
+        self.assertIn("not active", warning)
+
+    def test_external_engine_gets_the_manual_install_instruction(self):
+        client = mock.Mock()
+        client.has.return_value = False
+        with mock.patch.object(server, "started_elsewhere", return_value=True):
+            warning = server.memory_cleanup_warning("moss", client)
+        self.assertIn("compat/script_builder_memory", warning)
+        self.assertIn("custom_nodes", warning)
+
+    def test_the_current_hook_clears_the_warning(self):
+        client = client_for({"ScriptBuilderMemoryV2": {}})
+        self.assertEqual(server.memory_cleanup_warning("moss", client), "")
+
+
 class OneModelLoadPerTake(unittest.TestCase):
     """Both node packs hold one checkpoint at a time, so on an 8 GB card the
     order lines are spoken in decides how many times a model is read from
@@ -1106,6 +1128,54 @@ class OneModelLoadPerTake(unittest.TestCase):
             job = self.run_take(self.MIXED, self.DIALOGUE, unload=False)
         self.assertEqual(job["status"], "error")
         self.assertEqual(self.client.frees, 1)
+
+    def test_moss_requests_cleanup_after_the_take_as_well(self):
+        job = self.run_take({"1": {"kind": "preset"}}, [("1", "Hello")],
+                            engine="moss", unload=True)
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertEqual(self.client.frees, 1)
+
+    def test_cancelling_between_lines_does_not_queue_another_line(self):
+        original = self.client.view
+
+        def cancel_during_download(item):
+            for job in server.jobs.values():
+                if job["status"] == "running":
+                    job["cancelled"] = True
+            return original(item)
+
+        with mock.patch.object(self.client, "view", side_effect=cancel_during_download):
+            job = self.run_take({"1": {"kind": "preset"}},
+                                [("1", "first"), ("1", "second")])
+        self.assertEqual(job["status"], "cancelled")
+        self.assertEqual(self.client.n, 1)
+        self.assertEqual(self.client.frees, 1)
+
+    def test_cancelling_during_final_download_does_not_publish_the_take(self):
+        original = self.client.view
+
+        def cancel_during_download(item):
+            for job in server.jobs.values():
+                if job["status"] == "running":
+                    job["cancelled"] = True
+            return original(item)
+
+        with mock.patch.object(self.client, "view", side_effect=cancel_during_download):
+            job = self.run_take({"1": {"kind": "preset"}}, [("1", "only")])
+        self.assertEqual(job["status"], "cancelled")
+        self.assertNotIn("take", job)
+        self.assertEqual(self.client.frees, 1)
+
+    def test_a_timed_out_line_interrupts_only_its_own_prompt(self):
+        server.jobs["timed-out"] = {"status": "running"}
+        self.addCleanup(server.jobs.pop, "timed-out", None)
+        with mock.patch.object(self.client, "result", return_value=([], None)), \
+                mock.patch.object(self.client, "interrupt", create=True) as interrupt, \
+                mock.patch.object(server.time, "sleep"), \
+                mock.patch.object(server.time, "time", side_effect=[0, 901]):
+            with self.assertRaisesRegex(comfy.ComfyError, "15 minutes"):
+                server.wait_for_prompt("only-this-prompt", "timed-out", "qwen")
+        interrupt.assert_called_once_with("only-this-prompt")
 
     def test_one_voice_keeps_script_order(self):
         both = {"1": self.MIXED["1"], "2": dict(self.MIXED["1"], name="Cy")}

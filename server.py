@@ -572,6 +572,7 @@ def wait_for_prompt(prompt_id: str, job_id: str, engine: str,
         if outs:
             return outs
         if time.time() - started > timeout:
+            for_engine(engine).interrupt(prompt_id)
             raise ComfyError("That line took more than 15 minutes. Check the "
                              "ComfyUI console.")
 
@@ -789,6 +790,11 @@ def out_of_memory_advice(engine: str, freed: list[str], opts: dict,
 
 
 def run_job(job_id: str, payload: dict) -> None:
+    def check_cancelled():
+        with jobs_lock:
+            if jobs[job_id].get("cancelled"):
+                raise ComfyError("Cancelled")
+
     def set_state(**kw):
         # When it ended, not when it began, is what /api/jobs keeps a finished
         # job listed by: a take that ran longer than that window used to drop
@@ -861,6 +867,7 @@ def run_job(job_id: str, payload: dict) -> None:
         made: dict[int, Path] = {}
 
         for done, i in enumerate(order):
+            check_cancelled()
             line, key, voice = lines[i], keys[i], voices[i]
             # When this line began: the page counts it up, because a line
             # gives no percentage of its own (the node reports nothing
@@ -876,6 +883,7 @@ def run_job(job_id: str, payload: dict) -> None:
             opts["unload"] = unload and done == len(order) - 1
             built = for_engine(engine).build_line(line, voice, opts)
             try:
+                check_cancelled()
                 prompt_id = for_engine(engine).queue(built["prompt"])
                 set_state(engine=engine, prompt_id=prompt_id)
                 outs = wait_for_prompt(prompt_id, job_id, engine)
@@ -891,6 +899,7 @@ def run_job(job_id: str, payload: dict) -> None:
                                 "full, freeing it and trying again")
                 freed = free_the_card(engine)
                 try:
+                    check_cancelled()
                     prompt_id = for_engine(engine).queue(built["prompt"])
                     set_state(engine=engine, prompt_id=prompt_id)
                     outs = wait_for_prompt(prompt_id, job_id, engine)
@@ -909,6 +918,7 @@ def run_job(job_id: str, payload: dict) -> None:
                         fh.write(chunk)
             made[i] = dest
 
+        check_cancelled()
         if made:
             set_state(stage="Joining the lines", pct=97)
         order = sorted(made)
@@ -970,7 +980,8 @@ def run_job(job_id: str, payload: dict) -> None:
     finally:
         # A cache hit in the Qwen node can ignore its final-line callback;
         # an error never reaches that callback at all. The installed shim
-        # makes /free reach Qwen's private cache on the execution thread.
+        # makes /free reach both speech packs' private caches on the execution
+        # thread, including MOSS's model and audio tokenizer.
         if engine and (release_after or not completed):
             for_engine(engine).free_memory()
 
@@ -991,6 +1002,17 @@ def web_asset(name: str):
 # --------------------------------------------------------------------------- #
 # status / setup
 # --------------------------------------------------------------------------- #
+def memory_cleanup_warning(engine: str, client) -> str:
+    if client.has("ScriptBuilderMemoryV2"):
+        return ""
+    slot = bootstrap.engine_cfg(cfg, engine)
+    if started_elsewhere(slot):
+        return ("GPU memory cleanup is not active. Copy compat/script_builder_memory "
+                "into this ComfyUI's custom_nodes directory and restart ComfyUI.")
+    return ("GPU memory cleanup is not active in the running engine. "
+            "Press Restart ComfyUI on the Engine page to load the update.")
+
+
 @app.get("/api/status")
 def api_status():
     engine = request.args.get("engine") or cfg.get("engine") \
@@ -1064,6 +1086,8 @@ def api_status():
         try:
             payload["nodes_ready"] = for_engine(engine).engine_ready(engine)
             payload["capabilities"] = for_engine(engine).capabilities(engine)
+            payload["memory_cleanup_warning"] = memory_cleanup_warning(
+                engine, for_engine(engine)) if payload["nodes_ready"] else ""
             payload["engine_nodes"] = {
                 e: (for_engine(e).engine_ready(e) if engine_online(e) else False)
                 for e in bootstrap.ENGINES}
@@ -1357,9 +1381,9 @@ def api_comfy_restart():
     url = slot["comfy_url"]
     port = comfy_port(url)
 
-    if engine == "qwen" and not bootstrap.install_memory_compat(
+    if not bootstrap.install_memory_compat(
             Path(slot["comfy_dir"]), progress.log):
-        return jsonify({"error": "Could not install Qwen memory cleanup; "
+        return jsonify({"error": "Could not install speech memory cleanup; "
                                  "check that ComfyUI/custom_nodes is writable."}), 409
 
     how = "managed"
