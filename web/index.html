@@ -1415,10 +1415,9 @@ async function loadVoices() {
     // attention itself from the card. An empty select reading "auto" is fine;
     // a stale Qwen list next to a MOSS take is not.
     $("rowAttn").hidden = isMoss();
-    // MOSS's loader keeps its model in a module global that nothing in a
-    // graph can release, so the switch would promise memory it cannot free.
-    // Qwen's node honours it — once, after a take's last line.
-    $("rowUnload").hidden = isMoss();
+    // The installed memory hook releases both engines' private caches once
+    // after the take, including MOSS's model and audio tokenizer.
+    $("rowUnload").hidden = false;
     renderSpeakers();
   } catch (e) { renderSpeakers(); }
 }
@@ -2234,6 +2233,8 @@ async function pollEngineLog() {
       + ((st.config || {}).comfy_url || "this address")
       + (st.engine_argv ? " (" + st.engine_argv + ")" : "")
       + ". Close it, or give this engine another address in Settings.";
+  } else if (st.memory_cleanup_warning && d.online) {
+    state = "⚠ " + st.memory_cleanup_warning;
   } else if (d.stopped && !d.online) {
     state = "⚠ " + d.stopped;
   } else if (d.running) {
@@ -2674,7 +2675,8 @@ async function pollSetup() {
 function paintEngineTag() {
   var st = S.status;
   var down = !!st && !(st.comfy_online && st.nodes_ready);
-  $("engineTag").hidden = !(down || S.depsBad > 0);
+  $("engineTag").hidden = !(down || S.depsBad > 0
+    || (st && st.memory_cleanup_warning));
 }
 /* ========================= status ========================= */
 async function refreshStatus() {
@@ -2716,7 +2718,7 @@ async function refreshStatus() {
     $("cfg-models").value = c.models_dir || "";
     $("cfg-auto").checked = !!c.auto_start_comfy;
   }
-  $("cfg-note").textContent = st.schema_error || "";
+  $("cfg-note").textContent = st.schema_error || st.memory_cleanup_warning || "";
   if ((st.ready && !was) || (wasEngine && wasEngine !== st.engine)) loadVoices();
   if (!st.setup_complete && !S.setupSeen) { S.setupSeen = true; openSetup(); }
 }

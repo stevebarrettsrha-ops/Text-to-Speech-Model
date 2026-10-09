@@ -53,10 +53,11 @@ Nothing goes into your system Python.
 
 - Python 3.10 or newer (on Debian and Ubuntu, `python3-venv` too)
 - Git
-- An NVIDIA GPU with 8 GB or more runs everything downloaded by default:
-  Qwen3-TTS, MOSS's 1.7B and MOSS-VoiceGenerator. Only the MOSS 8B is out of
-  reach through these nodes, and it is left un-ticked. Less works with **Free
-  GPU memory after each run** switched on. CPU works but is slow.
+- 8 GB VRAM is the target for the smaller models, not a guarantee for every
+  prompt. Start with Qwen 0.6B, a short line, and **Free GPU memory after each
+  run** on. MOSS 8B does not fit through these nodes and is left un-ticked.
+  Long audio and other GPU applications reduce the available headroom.
+  CPU works but is slow.
 
 ### Model folders
 
@@ -108,16 +109,18 @@ Pulled into `ComfyUI/models/moss-tts/`:
 | `OpenMOSS-Team--MOSS-VoiceGenerator` | 1.7B | ~5 GB | Voice from a description |
 | `OpenMOSS-Team--MOSS-TTS` | 8B | ~18 GB | Delay 8B — better, far slower |
 
-The codec, the 1.7B and VoiceGenerator are downloaded by default: all three run
-on an 8 GB card, and since MOSS has no preset speakers, describing a voice is
-one of only two ways to pin one down.
+The codec, the 1.7B and VoiceGenerator are downloaded by default and are the
+smaller-model choices for an 8 GB card. The figures above are estimates;
+long lines, reference clips and other GPU users can still cause an out-of-memory
+failure. MOSS has no preset speakers, so describing a voice is one of only two
+ways to pin one down.
 
 **Sizes come from [OpenMOSS's own model table](https://github.com/OpenMOSS/MOSS-TTS#released-models),
 not from the ComfyUI node's README**, which lists MOSS-VoiceGenerator as
 "Delay 8B, ~18 GB". `MossTTSDelay` is the *architecture*; OpenMOSS publishes
 VoiceGenerator at 1.7B. Taking the node README at its word had voice design
-hidden behind a warning that it would not run on 8 GB, when it fits about as
-comfortably as the base model.
+hidden behind an incorrect 8B warning. It is a smaller model, but its peak
+memory still depends on the input and runtime.
 
 The 8B is a tick rather than a default, and the reason is this node rather than
 the model: it loads bf16 weights through `AutoModel.from_pretrained`, so 8B
@@ -195,9 +198,10 @@ generation, this is where you will see it.
 Every model carries a VRAM figure, and the app reads what the card actually
 has — `nvidia-smi --query-gpu=memory.total`, or ComfyUI's `/system_stats` when
 nvidia-smi is not on PATH. A model larger than the card is shown but greyed in
-the picker, and the Models page asks before downloading it. On an 8 GB card
-everything fetched by default runs: Qwen3-TTS in full, MOSS speech, MOSS
-cloning and MOSS voice design. Only the MOSS 8B is out of reach.
+the picker, and the Models page asks before downloading it. These estimates
+cannot guarantee that a generation fits: attention, audio decoding, reference
+clips and other GPU users need memory too. Start with Qwen 0.6B and one short
+line on an 8 GB card. MOSS 8B is unsupported through this node on that card.
 
 Where the card cannot be read at all, nothing is hidden — an unknown card is
 not assumed to be a small one.
@@ -339,6 +343,20 @@ what is wrong with it and leaves it to you.
 ---
 
 ## Troubleshooting
+
+**Updating the 8 GB memory fix:** restart each engine's ComfyUI from the Engine
+page after updating the app. It installs `script_builder_memory` into
+`custom_nodes`. The Engine badge and console warn until the new hook is active.
+This connects ComfyUI's `/free` operation to Qwen's private model cache and
+MOSS's retained model and audio tokenizer, which ComfyUI's normal model registry
+cannot release. A cache
+hit in the Qwen node also bypassed the final line's unload callback; the app
+now sends an explicit release after a take when the switch is on, and after
+failed or cancelled takes. It still keeps models between successful lines.
+For a remote ComfyUI, copy `compat/script_builder_memory` into that engine's
+`custom_nodes` directory and restart it. **Free GPU memory after each run**
+is available for both engines. MOSS offloading also uses system RAM;
+switching engines still stops the managed old engine.
 
 **"Nodes not loaded"** — ComfyUI is running but has not imported the Qwen-TTS
 nodes. Restart ComfyUI. If it persists, look in the ComfyUI console for
