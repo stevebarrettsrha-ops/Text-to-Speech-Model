@@ -218,8 +218,9 @@ class ModelInstalled(unittest.TestCase):
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def test_weights_present_counts_as_installed(self):
+    def test_weights_and_config_present_count_as_installed(self):
         d = self._folder("Qwen/A")
+        (d / "config.json").write_text("{}")
         (d / "model.safetensors").write_text("w")
         self.assertTrue(bootstrap.model_installed(self.models, "Qwen/A"))
 
@@ -925,6 +926,7 @@ class TheDesignPanelSaysWhatIsThere(unittest.TestCase):
         base = bootstrap.engine_models_dir(server.cfg, engine)
         d = bootstrap.model_dir(base, repo, engine)
         d.mkdir(parents=True, exist_ok=True)
+        (d / "config.json").write_text("{}")
         (d / "model.safetensors").write_text("w")
 
     def test_each_engine_names_its_own_design_model(self):
@@ -1482,7 +1484,8 @@ def comfy_at(path: Path, engine: str = "", weights_cfg: dict | None = None) \
         for m in bootstrap.wanted_models(weights_cfg, engine or "qwen"):
             d = bootstrap.model_dir(path / "models", m["repo"], m["engine"])
             d.mkdir(parents=True, exist_ok=True)
-            (d / "model.safetensors").write_bytes(b"")
+            (d / "config.json").write_text("{}")
+            (d / "model.safetensors").write_bytes(b"weights")
     return path
 
 
@@ -3320,6 +3323,7 @@ class TheQwenNodeFindsWhatWeDownload(unittest.TestCase):
         for m in bootstrap.MODEL_REPOS:
             d = bootstrap.model_dir(self.models, m["repo"], "qwen")
             d.mkdir(parents=True)
+            (d / "config.json").write_text("{}")
             (d / "model.safetensors").write_text("w")
         (self.models / "qwen-tts" / "voices").mkdir()
 
@@ -3350,6 +3354,7 @@ class TheQwenNodeFindsWhatWeDownload(unittest.TestCase):
         self.addCleanup(shutil.rmtree, old, ignore_errors=True)
         d = old / "qwen-tts" / "Qwen" / "Qwen3-TTS-12Hz-0.6B-CustomVoice"
         d.mkdir(parents=True)
+        (d / "config.json").write_text("{}")
         (d / "model.safetensors").write_text("w")
         self.assertIsNone(qwen_node_finds(old, "CustomVoice", "0.6B"))
 

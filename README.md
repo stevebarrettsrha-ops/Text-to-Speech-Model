@@ -25,7 +25,7 @@ local model running through ComfyUI.
 **macOS / Linux** — `./run.sh`
 
 Either one finds a Python 3.10+, offers to install one if there is none, puts
-Script Builder's two packages into a `.venv` beside the script — never into the
+Script Builder's packages into a `.venv` beside the script — never into the
 Python it found — and starts the server. The browser opens at
 <http://127.0.0.1:7799>.
 
@@ -438,3 +438,37 @@ The file is in the repo because GitHub accepts a required check whose name
 matches no job and then silently gates nothing, so renaming a job would quietly
 switch the gate off. `node tests/check.mjs` compares the two and fails if they
 disagree.
+
+### Reusing models already on disk
+
+Setup keeps your saved ComfyUI and models folders. Before downloading, Script
+Builder checks the configured folder, that ComfyUI's model folder, its
+`extra_model_paths.yaml` entries (`qwen-tts`/`TTS` or `moss-tts`), and the local
+HuggingFace cache. `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME` and
+`XDG_CACHE_HOME` are respected. A cached `main` snapshot, or the sole complete
+snapshot when no `main` reference exists, can be reused offline.
+
+Existing model data is linked into the layout the node actually loads: Qwen's
+`qwen-tts/<Name>` (including its hardcoded tokenizer folder), and MOSS's
+`moss-tts/<Org>--<Name>`. Directory links share the original files; they do not
+copy gigabytes. Windows uses junctions when symbolic links are unavailable.
+Incomplete destination folders are left untouched and reported, so a failed
+link does not silently trigger another download. Keep the source folders and
+cached snapshots while those links are in use.
+
+Verified locations and unsuccessful discovery attempts are saved. Normal
+starts and status polls use those locations. A missing or changed saved path
+allows one new discovery attempt; **Engine → Recheck** explicitly allows
+another. A missing separately configured models folder is kept, including on
+a temporarily disconnected drive; an empty stock folder never replaces it,
+and startup does not create directories at that missing location. Reconnect
+the drive or set the new location in Settings. Explicit Setup can still create
+a newly chosen destination. If you download a model elsewhere after a failed lookup, press
+Recheck to adopt it. No drive search runs on every status poll.
+
+Checks require a config and root-level weights, and reject unfinished files,
+missing indexed shards, zero-byte weights,
+broken weight links and Git LFS pointer files. They do not replace a full
+checksum verification or an inference test. Unrelated model formats, arbitrary
+folders not named in Settings/ComfyUI's paths, other users' caches, and files
+on a remote ComfyUI computer are not automatically searched.
