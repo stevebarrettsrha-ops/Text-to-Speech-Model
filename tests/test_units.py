@@ -995,6 +995,11 @@ class OneModelLoadPerTake(unittest.TestCase):
 
         def __init__(self, root: Path):
             self.root, self.calls, self.n = root, [], 0
+            self.frees = 0
+
+        def free_memory(self, unload_models=True):
+            self.frees += 1
+            return True
 
         def build_line(self, line, voice, opts):
             self.calls.append({"text": line["text"],
@@ -1089,10 +1094,18 @@ class OneModelLoadPerTake(unittest.TestCase):
         self.run_take(self.MIXED, self.DIALOGUE, unload=True)
         self.assertEqual([c["unload"] for c in self.client.calls],
                          [False] * 4 + [True])
+        self.assertEqual(self.client.frees, 1)
 
     def test_with_the_switch_off_nothing_is_unloaded(self):
         self.run_take(self.MIXED, self.DIALOGUE, unload=False)
         self.assertFalse(any(c["unload"] for c in self.client.calls))
+        self.assertEqual(self.client.frees, 0)
+
+    def test_failed_generation_frees_models_even_with_the_switch_off(self):
+        with mock.patch.object(self.client, "queue", side_effect=RuntimeError("broken")):
+            job = self.run_take(self.MIXED, self.DIALOGUE, unload=False)
+        self.assertEqual(job["status"], "error")
+        self.assertEqual(self.client.frees, 1)
 
     def test_one_voice_keeps_script_order(self):
         both = {"1": self.MIXED["1"], "2": dict(self.MIXED["1"], name="Cy")}
@@ -2414,6 +2427,16 @@ class ADamagedTorch(unittest.TestCase):
         patch = mock.patch.dict(os.environ, {"PYTHONPATH": str(self.site)})
         patch.start()
         self.addCleanup(patch.stop)
+        # These tests construct fake distribution metadata. An unrelated
+        # torch in the test runner's site-packages is not another fake wheel.
+        real_run = bootstrap._run
+        def isolated(cmd, **kw):
+            if len(cmd) > 1 and cmd[1] == "-c":
+                cmd = [cmd[0], "-S", *cmd[1:]]
+            return real_run(cmd, **kw)
+        patch_run = mock.patch.object(bootstrap, "_run", side_effect=isolated)
+        patch_run.start()
+        self.addCleanup(patch_run.stop)
 
     def damage(self) -> str:
         return bootstrap.torch_damage_summary(
@@ -2692,7 +2715,12 @@ class ReadingTheTorchBuild(unittest.TestCase):
             "hip: Optional[str] = None\n")
 
     def _read(self) -> dict:
-        with mock.patch.dict(os.environ, {"PYTHONPATH": str(self.root)}):
+        # Isolate the synthetic wheel from torch installed in the test host.
+        real_run = bootstrap._run
+        def isolated(cmd, **kw):
+            return real_run([cmd[0], "-S", *cmd[1:]], **kw)
+        with mock.patch.dict(os.environ, {"PYTHONPATH": str(self.root)}), \
+             mock.patch.object(bootstrap, "_run", side_effect=isolated):
             return bootstrap.installed_torch(sys.executable)
 
     def test_pypis_windows_wheel_reads_as_the_cpu_build(self):

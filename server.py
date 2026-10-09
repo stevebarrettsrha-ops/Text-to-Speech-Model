@@ -800,6 +800,9 @@ def run_job(job_id: str, payload: dict) -> None:
 
     take_id = uuid.uuid4().hex[:12]
     folder = TAKES_DIR / take_id
+    engine = ""
+    release_after = False
+    completed = False
     try:
         lines = payload.get("lines") or []
         speakers = payload.get("speakers") or {}
@@ -818,6 +821,7 @@ def run_job(job_id: str, payload: dict) -> None:
             "language": payload.get("language", ""),
             "prefer_wav": True,
         }
+        release_after = opts["unload"]
         if engine == "moss":
             opts["moss_model"] = payload.get("moss_model") or ""
             opts["moss_dirs"] = moss_dirs()
@@ -947,6 +951,7 @@ def run_job(job_id: str, payload: dict) -> None:
             except Exception:
                 pass
         add_take(take)
+        completed = True
         set_state(status="done", pct=100, stage="Ready", take=take)
     # A job that does not finish records no take, so the clips it did fetch are
     # unreachable: nothing in the library lists them and no Delete can remove
@@ -962,6 +967,12 @@ def run_job(job_id: str, payload: dict) -> None:
         shutil.rmtree(folder, ignore_errors=True)
         set_state(status="error", error=f"{type(exc).__name__}: {exc}",
                   stage="Failed")
+    finally:
+        # A cache hit in the Qwen node can ignore its final-line callback;
+        # an error never reaches that callback at all. The installed shim
+        # makes /free reach Qwen's private cache on the execution thread.
+        if engine and (release_after or not completed):
+            for_engine(engine).free_memory()
 
 
 # --------------------------------------------------------------------------- #
@@ -1345,6 +1356,11 @@ def api_comfy_restart():
         return jsonify({"error": refusal}), 409
     url = slot["comfy_url"]
     port = comfy_port(url)
+
+    if engine == "qwen" and not bootstrap.install_memory_compat(
+            Path(slot["comfy_dir"]), progress.log):
+        return jsonify({"error": "Could not install Qwen memory cleanup; "
+                                 "check that ComfyUI/custom_nodes is writable."}), 409
 
     how = "managed"
     if not comfy_proc.alive():

@@ -53,10 +53,11 @@ Nothing goes into your system Python.
 
 - Python 3.10 or newer (on Debian and Ubuntu, `python3-venv` too)
 - Git
-- An NVIDIA GPU with 8 GB or more runs everything downloaded by default:
-  Qwen3-TTS, MOSS's 1.7B and MOSS-VoiceGenerator. Only the MOSS 8B is out of
-  reach through these nodes, and it is left un-ticked. Less works with **Free
-  GPU memory after each run** switched on. CPU works but is slow.
+- 8 GB VRAM is the target for the smaller models, not a guarantee for every
+  prompt. Start with Qwen 0.6B, a short line, and **Free GPU memory after each
+  run** on. MOSS 8B does not fit through these nodes and is left un-ticked.
+  Long audio and other GPU applications reduce the available headroom.
+  CPU works but is slow.
 
 ### Model folders
 
@@ -339,6 +340,17 @@ what is wrong with it and leaves it to you.
 ---
 
 ## Troubleshooting
+
+**Updating the 8 GB memory fix:** restart Qwen's ComfyUI from the Engine
+page after updating the app. It installs `script_builder_memory` into
+`custom_nodes`. This connects ComfyUI's `/free` operation to Qwen's private
+model cache, which ComfyUI's normal model registry cannot release. A cache
+hit in the Qwen node also bypassed the final line's unload callback; the app
+now sends an explicit release after a take when the switch is on, and after
+failed or cancelled takes. It still keeps models between successful lines.
+For a remote ComfyUI, copy `compat/script_builder_memory` into that engine's
+`custom_nodes` directory and restart it. The shim covers Qwen, not MOSS's
+separate private cache; switching engines still stops the managed old engine.
 
 **"Nodes not loaded"** — ComfyUI is running but has not imported the Qwen-TTS
 nodes. Restart ComfyUI. If it persists, look in the ComfyUI console for
