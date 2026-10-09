@@ -459,7 +459,11 @@ cached snapshots while those links are in use.
 Verified locations and unsuccessful discovery attempts are saved. Normal
 starts and status polls use those locations. A missing or changed saved path
 allows one new discovery attempt; **Engine → Recheck** explicitly allows
-another. If you download a model elsewhere after a failed lookup, press
+another. A missing separately configured models folder is kept, including on
+a temporarily disconnected drive; an empty stock folder never replaces it,
+and startup does not create directories at that missing location. Reconnect
+the drive or set the new location in Settings. Explicit Setup can still create
+a newly chosen destination. If you download a model elsewhere after a failed lookup, press
 Recheck to adopt it. No drive search runs on every status poll.
 
 Checks require a config and root-level weights, and reject unfinished files,

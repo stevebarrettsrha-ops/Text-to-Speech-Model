@@ -756,6 +756,37 @@ def _fits_engine(c: Path, cfg: dict, engine: str) -> bool:
         return False
 
 
+def _default_models_root(models: str, comfy: str) -> bool:
+    """Compare a saved engine-relative root without probing another drive.
+
+    Saved Windows paths must still compare structurally when config is read on
+    another platform. A similarly named suffix elsewhere is not a relocation.
+    """
+    def normalized(value):
+        value = re.sub(r"[\\/]+", "/", value or "").rstrip("/")
+        return value.casefold() if re.match(r"^[A-Za-z]:", value) or os.name == "nt" else value
+    return bool(comfy) and normalized(models) == normalized(comfy) + "/models"
+
+
+def _follow_engine_models(slot: dict, old_comfy: str, comfy: Path | None) -> bool:
+    """Only a blank/default root follows its relocated engine.
+
+    A separately configured root can be a temporarily disconnected drive. Keep
+    it even if the stock models folder exists; finding an empty folder with a
+    similar suffix is not evidence that the downloaded weights moved there.
+    """
+    old = slot.get('models_dir') or ''
+    if old and Path(old).is_dir():
+        return False
+    stock = comfy / 'models' if comfy else None
+    default_moved = (_default_models_root(old, old_comfy) and
+                     not _has_main(old_comfy) and comfy is not None)
+    if stock and stock.is_dir() and (not old or default_moved):
+        slot['models_dir'] = str(stock)
+        return slot['models_dir'] != old
+    return False
+
+
 def heal_paths(cfg: dict, engines: list[str] | None = None) -> list[str]:
     """Repair each engine's saved paths that no longer exist.
 
@@ -789,16 +820,8 @@ def heal_paths(cfg: dict, engines: list[str] | None = None) -> list[str]:
                     comfy = c
                     notes.append(f"{label}: ComfyUI found at {c}")
                     break
-        old_models = slot.get("models_dir") or ""
-        if not (old_models and Path(old_models).is_dir()):
-            moved = rebase_path(old_models)
-            if moved and moved.is_dir():
-                slot["models_dir"] = str(moved)
-            elif comfy and (comfy / "models").is_dir():
-                slot["models_dir"] = str(comfy / "models")
-            if slot.get("models_dir") != old_models:
-                notes.append(f"{label}: models folder found at "
-                             f"{slot['models_dir']}")
+        if _follow_engine_models(slot, old_comfy, comfy):
+            notes.append(f"{label}: models folder found at {slot['models_dir']}")
         py = slot.get("python") or ""
         if py and not Path(py).exists():
             moved = rebase_path(py)
@@ -950,11 +973,10 @@ def verify_locations(cfg: dict, search: bool = True, log=None,
         label = ENGINES[eid]['label']
         hit = pick_comfy(installs, cfg, eid, _claimed(cfg, eid))
         if hit:
+            old_comfy = slot.get('comfy_dir') or ''
             slot['comfy_dir'] = str(hit)
             notes.append(f"{label}: ComfyUI found at {hit}")
-            models = slot.get('models_dir') or ''
-            if not (models and Path(models).is_dir()) and (hit / 'models').is_dir():
-                slot['models_dir'] = str(hit / 'models')
+            if _follow_engine_models(slot, old_comfy, hit):
                 notes.append(f"{label}: models folder found at {slot['models_dir']}")
         else:
             say(f"No ComfyUI for {label} found. Saved locations were kept. "
@@ -1035,7 +1057,7 @@ def folder_whole(d: Path) -> bool:
 
 
 def reuse_downloaded_models(cfg: dict, engine: str = "", log=None,
-                           force: bool = False) -> None:
+                           force: bool = False, create_root: bool = False) -> None:
     """Search once per broken location; link existing weights without copying.
 
     Saved attempts, including blocked links, survive restarts. Only a changed
@@ -1050,6 +1072,10 @@ def reuse_downloaded_models(cfg: dict, engine: str = "", log=None,
         if base is None:
             continue
         local = Path(slot['comfy_dir']) if slot.get('comfy_dir') else None
+        if create_root:
+            # Only the explicit Setup install step may create a newly chosen
+            # destination. Boot, Start and Recheck preserve missing roots.
+            base.mkdir(parents=True, exist_ok=True)
 
         def signature():
             # A missing model, a broken alias or a changed configured root is
@@ -1058,7 +1084,7 @@ def reuse_downloaded_models(cfg: dict, engine: str = "", log=None,
             if eid == 'qwen' and local:
                 known += [model_dir(local / 'models', m['repo'], eid)
                           for m in eng['models']]
-            return [str(base), str(local or ''), str(APP_DIR),
+            return [str(base), base.is_dir(), str(local or ''), str(APP_DIR),
                     str(model_reuse.hub_cache()),
                     [[os.path.lexists(p), folder_whole(p)] for p in known]]
 
@@ -1070,6 +1096,12 @@ def reuse_downloaded_models(cfg: dict, engine: str = "", log=None,
             continue
         slot['_model_reuse'] = {'attempt': stamp}
         try:
+            if (slot.get('models_dir') and not base.is_dir() and
+                    not _default_models_root(str(base), slot.get('comfy_dir') or '')):
+                raise RuntimeError(
+                    f"Saved {eng['label']} models folder is unavailable: {base}. "
+                    "The location was kept; reconnect the drive or choose its new "
+                    "location in Settings, then Recheck. No folders were created.")
             roots = [base / eng['subdir']]
             if local:
                 roots.append(local / 'models' / eng['subdir'])
@@ -3215,7 +3247,7 @@ def run_setup(cfg: dict, prog: Progress, comfy, chosen_dir: str = "",
         # before anything is counted missing, or they are fetched again.
         migrate_qwen_layout(engine_models_dir(cfg, "qwen"), prog.log)
         try:
-            reuse_downloaded_models(cfg, log=prog.log)
+            reuse_downloaded_models(cfg, log=prog.log, create_root=True)
         finally:
             save_config(cfg)
         todo = [(eid, m) for eid in engines for m in engine_missing(cfg, eid)]
