@@ -464,6 +464,15 @@ def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
                           errors="replace", **kw)
 
 
+def _has_pip(vpy: Path) -> bool:
+    """Whether that interpreter runs and has pip. A venv made without
+    python3-venv on Debian/Ubuntu has the interpreter and no pip."""
+    try:
+        return _run([str(vpy), "-m", "pip", "--version"]).returncode == 0
+    except OSError:
+        return False
+
+
 def find_python(prog: Progress | None = None) -> str:
     """A real Python 3.10+. Windows Store stubs resolve on PATH and fail to
     run, so every candidate is tested by actually executing it."""
@@ -3122,8 +3131,7 @@ def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
             # A venv with no pip is a failed first attempt (no python3-venv on
             # Debian/Ubuntu writes the interpreter, then stops). Installing into
             # it fails the same way every time, so build it again instead.
-            if vpy.exists() and _run([str(vpy), "-m", "pip",
-                                     "--version"]).returncode != 0:
+            if vpy.exists() and not _has_pip(vpy):
                 prog.log("The engine's Python environment is incomplete "
                          "(no pip) — building it again.")
                 shutil.rmtree(vpy.parents[1], ignore_errors=True)
