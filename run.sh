@@ -2,6 +2,38 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Started from the file manager (right-click → Run as a Program) there is no
+# terminal: nothing this script says can be seen, and a failure just looks like
+# nothing happening. On a Linux desktop, open a terminal and run in it instead.
+if [ "$(uname)" = "Linux" ] && [ -z "${SCRIPT_BUILDER_IN_TERMINAL:-}" ] \
+   && [ ! -t 0 ] && [ ! -t 1 ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+  export SCRIPT_BUILDER_IN_TERMINAL=1
+  SELF="$(pwd)/$(basename "$0")"
+  for term in gnome-terminal ptyxis kgx konsole xfce4-terminal mate-terminal \
+              tilix x-terminal-emulator xterm; do
+    command -v "$term" >/dev/null 2>&1 || continue
+    case "$term" in
+      gnome-terminal|ptyxis|kgx) "$term" -- bash "$SELF" && exit 0 ;;
+      xfce4-terminal|mate-terminal) "$term" -x bash "$SELF" && exit 0 ;;
+      *) "$term" -e bash "$SELF" && exit 0 ;;
+    esac
+  done
+  # No terminal found: carry on without one. The page still opens.
+fi
+
+# In a window we opened, keep it open on failure so the reason can be read.
+# This is also why server.py is not started with `exec` below: exec would
+# replace this shell, and the trap with it.
+pause_on_error() {
+  local code=$?
+  if [ -n "${SCRIPT_BUILDER_IN_TERMINAL:-}" ] && [ "$code" -ne 0 ] \
+     && [ "$code" -ne 130 ] && [ -t 0 ]; then
+    printf "\n  Script Builder stopped (exit code %s). Press Enter to close." "$code"
+    read -r _ || true
+  fi
+}
+trap pause_on_error EXIT
+
 find_python() {
   PY=""
   for cand in python3.13 python3.12 python3.11 python3.10 python3 python; do
@@ -84,4 +116,4 @@ fi
 
 "$VENV/bin/python" -m pip install --disable-pip-version-check --quiet \
     -r requirements.txt
-exec "$VENV/bin/python" server.py
+"$VENV/bin/python" server.py
