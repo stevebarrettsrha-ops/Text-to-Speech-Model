@@ -1789,7 +1789,8 @@ class TorchIsDownloadedOnce(unittest.TestCase):
                                   side_effect=lambda *a, **k:
                                   order.append("TORCH")), \
                 mock.patch.object(bootstrap, "portable_python",
-                                  return_value=None):
+                                  return_value=None), \
+                mock.patch.object(bootstrap, "_has_pip", return_value=True):
             bootstrap._setup_one(cfg, bootstrap.Progress(), "qwen", "deps",
                                  {}, sys.executable, "managed", {})
         reqs = next(i for i, o in enumerate(order)
