@@ -3119,14 +3119,27 @@ def _setup_one(cfg: dict, prog: Progress, engine: str, step: str,
             prog.log(f"{label}: that install runs on {target} — using it")
         else:
             vpy = venv_python(comfy_dir)
+            # A venv with no pip is a failed first attempt (no python3-venv on
+            # Debian/Ubuntu writes the interpreter, then stops). Installing into
+            # it fails the same way every time, so build it again instead.
+            if vpy.exists() and _run([str(vpy), "-m", "pip",
+                                     "--version"]).returncode != 0:
+                prog.log("The engine's Python environment is incomplete "
+                         "(no pip) — building it again.")
+                shutil.rmtree(vpy.parents[1], ignore_errors=True)
             if not vpy.exists():
                 prog.detail("deps", f"Building {label}'s Python environment…")
                 # parents[1] is the environment root: <...>/comfy-venv-<name>,
                 # since vpy is <root>/bin/python or <root>/Scripts/python.exe.
                 res = _run([py, "-m", "venv", str(vpy.parents[1])])
                 if res.returncode != 0:
+                    shutil.rmtree(vpy.parents[1], ignore_errors=True)
                     raise RuntimeError("venv creation failed: " +
-                                       (res.stderr or res.stdout)[-600:])
+                                       (res.stderr or res.stdout)[-600:] +
+                                       (" On Debian/Ubuntu install python3-venv"
+                                        " (sudo apt-get install -y python3-venv),"
+                                        " then run setup again."
+                                        if platform.system() == "Linux" else ""))
             target = vpy
             pip_install(str(target), ["--upgrade", "pip", "wheel"],
                         prog.log, say)
