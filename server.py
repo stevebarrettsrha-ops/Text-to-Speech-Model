@@ -334,8 +334,9 @@ def activate(engine: str, prog=None, wait: bool = True) -> str:
                     f"answering at {url}. Start it, or change the address in "
                     "Settings.")
         if not slot.get("comfy_dir") or not py:
-            return (f"{bootstrap.ENGINES[engine]['label']} has no ComfyUI set "
-                    "up yet — run setup for it from the Engine panel.")
+            # Which button fixes it: no ComfyUI at all, or a ComfyUI whose
+            # environment was built on another operating system.
+            return bootstrap.no_python_reason(cfg, engine)
         if not slot.get("auto_start", True):
             return (f"{bootstrap.ENGINES[engine]['label']}'s ComfyUI is not "
                     f"running at {url}, and Script Builder is set not to "
@@ -1366,7 +1367,7 @@ def api_comfy_restart():
     if not slot.get("comfy_dir") or not py:
         # Same reason, one step earlier: taking a port from someone and having
         # no engine to start in its place is not a restart, it is a hole.
-        return jsonify({"error": "Run setup first."}), 400
+        return jsonify({"error": bootstrap.no_python_reason(cfg, engine)}), 400
     # Asked before anything is stopped or taken over: an engine whose PyTorch
     # cannot start is not one to swap for the one answering now (rule 33a).
     flags, refusal = bootstrap.torch_launch(py, cfg, engine)

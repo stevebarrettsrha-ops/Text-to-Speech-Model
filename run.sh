@@ -104,7 +104,16 @@ echo "  Using: $("$PY" -c 'import sys;print(sys.executable)')"
 # makes .venv/bin/python and then fails at ensurepip, and a check of `import
 # sys` kept that pip-less folder for good — every later run died on "No
 # module named pip", even after the package the message asks for was in.
+#
+# A folder first set up on Windows (a drive both systems share) carries a
+# Windows .venv — Scripts/python.exe and no bin/python. It can never run here,
+# and deleting or rebuilding it would break it for Windows, so this system
+# gets its own beside it (.venv-linux, .venv-darwin).
 VENV=".venv"
+if [ -e .venv/Scripts/python.exe ] && [ ! -e .venv/bin/python ]; then
+  VENV=".venv-$(uname -s | tr '[:upper:]' '[:lower:]')"
+  echo "  .venv was built on Windows; leaving it alone and using $VENV."
+fi
 if [ -e "$VENV" ] && ! "$VENV/bin/python" -m pip --version >/dev/null 2>&1; then
   echo "  The existing environment is incomplete. Building it again."
   rm -rf "$VENV"

@@ -1,8 +1,10 @@
 __pycache__/
 *.pyc
 .venv/
+.venv-*/
 data/
 ComfyUI/
 comfy-venv/
+comfy-venv-*/
 node_modules/
 .mock-comfy/
