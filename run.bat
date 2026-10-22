@@ -66,30 +66,35 @@ rem Script Builder's own packages go into a virtual environment beside this
 rem file, so the Python that was found is left as it was found. Healthy means
 rem pip runs: a venv cut off at ensurepip has a python.exe and no pip, and was
 rem kept for good. Rebuilt once, then the fallback below.
-if not exist ".venv\Scripts\python.exe" goto makevenv
-".venv\Scripts\python.exe" -m pip --version >nul 2>nul
+rem A folder first set up on Linux (a drive both systems share) carries a
+rem Linux .venv - bin\python and no Scripts\python.exe. Rebuilding or deleting
+rem it would break it for Linux, so Windows gets .venv-windows beside it.
+set "VENV=.venv"
+if exist ".venv\bin\python" if not exist ".venv\Scripts\python.exe" set "VENV=.venv-windows"
+if not exist "%VENV%\Scripts\python.exe" goto makevenv
+"%VENV%\Scripts\python.exe" -m pip --version >nul 2>nul
 if not errorlevel 1 goto hasvenv
 echo   The existing environment is incomplete. Building it again.
-rmdir /s /q ".venv"
+rmdir /s /q "%VENV%"
 
 :makevenv
 echo   Setting up Script Builder's packages (first run only)...
-%PY% -m venv .venv
+%PY% -m venv "%VENV%"
 if errorlevel 1 goto badvenv
-".venv\Scripts\python.exe" -m pip --version >nul 2>nul
+"%VENV%\Scripts\python.exe" -m pip --version >nul 2>nul
 if errorlevel 1 goto badvenv
 
 :hasvenv
-".venv\Scripts\python.exe" -m pip install --disable-pip-version-check --quiet -r requirements.txt
+"%VENV%\Scripts\python.exe" -m pip install --disable-pip-version-check --quiet -r requirements.txt
 if errorlevel 1 goto pipfail
-".venv\Scripts\python.exe" server.py
+"%VENV%\Scripts\python.exe" server.py
 pause
 exit /b 0
 
 rem No usable environment could be built. Windows Pythons are not marked
 rem externally managed, so installing into the one we found still works.
 :badvenv
-if exist ".venv" rmdir /s /q ".venv"
+if exist "%VENV%" rmdir /s /q "%VENV%"
 :novenv
 echo   Could not build a separate environment; using %PY% as it is.
 %PY% -m pip install --disable-pip-version-check --quiet -r requirements.txt

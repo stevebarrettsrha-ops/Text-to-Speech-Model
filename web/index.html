@@ -2090,6 +2090,7 @@ async function installAllMissing() {
       var row = d.items.filter(function (i) { return i.id === id; })[0];
       return (row && row.label) || id;
     };
+    var noGit = false;
     for (var i = 0; i < missing.length; i++) {
       // The row's own label, and how far down the list this is: an install
       // that runs for twenty minutes should say which of its parts is running.
@@ -2101,6 +2102,21 @@ async function installAllMissing() {
       S.taskId = r.task.id; S.taskCursor = 0; $("task-log").textContent = "";
       pollTasks();
       var ok = await waitForTask(r.task.id);
+      // Git only fetches ComfyUI and the node packs. With every ComfyUI
+      // already here (a folder set up on Windows, opened on Linux), a Git
+      // that would not install must not hold back PyTorch; the node packs
+      // need Git, so they wait for it. Git is always first in the list, so
+      // dropping it leaves the rest to start again from the top.
+      if (!ok && missing[i] === "git" && !missing.some(function (id) {
+            return id.indexOf("comfyui_") === 0; })) {
+        missing = missing.filter(function (id) {
+          return id !== "git" && !/^node_(?!reqs_)/.test(id); });
+        i = -1; noGit = true;
+        toast("Git did not install — carrying on with PyTorch; the node "
+              + "packs need Git, see the activity log.", true);
+        await loadDeps();
+        continue;
+      }
       if (!ok) {
         toast("Stopped at " + labelOf(missing[i]) + " — see the activity log.",
               true);
@@ -2110,6 +2126,11 @@ async function installAllMissing() {
     }
     // ComfyUI reads custom_nodes at startup, so whatever was just installed
     // is not loaded yet. The node row now carries the button that does it.
+    if (noGit) {
+      toast("Done, except Git and what needs it — install Git by hand (the "
+            + "activity log names the command), then press Recheck.", true);
+      return;
+    }
     toast("All set. Press Test on the Engine page to prove it works.");
   } catch (e) { toast(e.message, true); }
   finally { b.done(); }

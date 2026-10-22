@@ -715,6 +715,24 @@ all indexed shards; zero-byte/LFS-placeholder/broken/partial weights do not coun
 `SCRIPT_BUILDER_NO_SEARCH=1` (set by both test harnesses) turns all of it
 off: test configs name made-up folders on purpose.
 
+A saved path can also be *there* and still wrong: an app folder on a drive
+shared by Windows and Linux carries the Windows
+`comfy-venv-<install>/Scripts/python.exe` (or a portable build's
+`python_embeded/python.exe`), and every run of it is `[Errno 8] Exec format
+error`. `foreign_binary()` reads the first bytes (MZ, ELF, Mach-O; anything
+else counts as native); `heal_paths()` clears a foreign interpreter, also one a
+rebase lands on, and `comfy_python()`, `portable_python()` and
+`existing_python()` pass over one. The foreign venv is never rebuilt in place —
+that would break it for the other system — so `venv_dir()` gives this one a
+sibling that keeps rule 30's per-install name
+(`comfy-venv-ComfyUI-MOSS-TTS-linux`, `-windows`, `-darwin`); `run.sh` and
+`run.bat` do the same for the app's own `.venv`. The PyTorch and Speech
+packages rows then read `missing` with the reason (`foreign_python()`), so
+Install everything missing acts on them, and carries on past a Git that will
+not install when every ComfyUI is already there. `_elevate()` turns `sudo`
+into `sudo -n`, or `pkexec` on a desktop where sudo wants a password, because a
+task has no terminal to type one into.
+
 ## Tests — run after any edit
 
 ```bash

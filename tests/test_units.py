@@ -2086,6 +2086,152 @@ class Interpreters(unittest.TestCase):
         self.assertEqual(bootstrap.existing_python(comfy_dir), "")
 
 
+class AFolderSetUpOnWindowsOpenedOnLinux(unittest.TestCase):
+    """An app folder on a drive shared by Windows and Linux carries the
+    Windows comfy-venv-<install>/Scripts/python.exe and a portable build's
+    python_embeded/python.exe. Both exist, so both were trusted, and every
+    run of them was [Errno 8] Exec format error: the engine never started and
+    the Engine page had nothing to say about why."""
+
+    MZ = b"MZ\x90\x00" + b"\x00" * 60
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="sb-shared-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.app = self.root / "Text-to-Speech-Model-main"
+        self.app.mkdir()
+        for p in (mock.patch("platform.system", return_value="Linux"),
+                  mock.patch.object(bootstrap, "APP_DIR", self.app),
+                  mock.patch.object(bootstrap, "detect_comfy_dirs",
+                                    lambda: [])):
+            p.start()
+            self.addCleanup(p.stop)
+        self.moss = comfy_at(self.app / "ComfyUI-MOSS-TTS", "moss")
+        self.win_venv = self.app / "comfy-venv-ComfyUI-MOSS-TTS"
+        self.win_py = self.win_venv / "Scripts" / "python.exe"
+        self.win_py.parent.mkdir(parents=True)
+        self.win_py.write_bytes(self.MZ)
+
+    def cfg(self, **moss) -> dict:
+        cfg = copy.deepcopy(bootstrap.DEFAULT_CONFIG)
+        cfg["setup_complete"] = True
+        cfg["engines"] = {e: dict(bootstrap.engine_defaults(e),
+                                  comfy_url="http://127.0.0.1:1")
+                          for e in bootstrap.ENGINES}
+        cfg["engines"]["moss"].update(
+            dict(comfy_dir=str(self.moss), models_dir=str(self.moss / "models"),
+                 managed=True, python=str(self.win_py)), **moss)
+        cfg["engines"]["qwen"]["enabled"] = False
+        return cfg
+
+    def test_the_first_bytes_say_which_system_a_binary_is_for(self):
+        elf = self.root / "elf"
+        elf.write_bytes(b"\x7fELF\x02\x01")
+        self.assertTrue(bootstrap.foreign_binary(self.win_py))
+        self.assertFalse(bootstrap.foreign_binary(elf))
+        self.assertFalse(bootstrap.foreign_binary(self.moss / "main.py"),
+                         "a script is never called foreign")
+        self.assertFalse(bootstrap.foreign_binary(self.root / "nope"),
+                         "nor is a file that is not there")
+        with mock.patch("platform.system", return_value="Windows"):
+            self.assertTrue(bootstrap.foreign_binary(elf))
+            self.assertFalse(bootstrap.foreign_binary(self.win_py))
+
+    def test_a_saved_windows_interpreter_is_cleared_and_said_so(self):
+        cfg = self.cfg()
+        self.assertEqual(bootstrap.comfy_python(cfg, "moss"), "",
+                         "never handed out, even before it is healed")
+        notes = bootstrap.heal_paths(cfg)
+        self.assertEqual(cfg["engines"]["moss"]["python"], "")
+        self.assertTrue(any("another operating system" in n for n in notes),
+                        notes)
+
+    def test_a_windows_path_rebased_onto_the_windows_exe_is_cleared(self):
+        cfg = self.cfg(python="D:\\AI\\Text-to-Speech-Model-main\\"
+                              "comfy-venv-ComfyUI-MOSS-TTS\\Scripts\\python.exe")
+        bootstrap.heal_paths(cfg)
+        self.assertEqual(cfg["engines"]["moss"]["python"], "")
+
+    def test_the_windows_venv_is_left_alone_and_keeps_the_per_engine_name(self):
+        # Rule 30: still named after the install, or both engines would share
+        # one comfy-venv-linux.
+        self.assertEqual(bootstrap.venv_python(self.moss),
+                         self.app / "comfy-venv-ComfyUI-MOSS-TTS-linux"
+                         / "bin" / "python")
+        native = self.win_venv / "bin" / "python"
+        native.parent.mkdir()
+        native.write_bytes(b"\x7fELF")
+        self.assertEqual(bootstrap.venv_python(self.moss), native,
+                         "a venv that also holds this system's interpreter "
+                         "is used as it is")
+
+    def test_install_builds_the_sibling_and_never_over_the_windows_one(self):
+        cfg = self.cfg()
+        made = []
+        task = manager.Task("install", "t")
+        with mock.patch.object(bootstrap, "find_python",
+                               return_value=sys.executable), \
+                mock.patch.object(manager, "stream",
+                                  side_effect=lambda cmd, t: made.append(cmd)
+                                  or 1):
+            with self.assertRaises(RuntimeError) as err:
+                manager._install_torch(task, cfg, {"engine": "moss"})
+        self.assertEqual(made[0][-1], str(self.app /
+                                          "comfy-venv-ComfyUI-MOSS-TTS-linux"))
+        self.assertIn("python3-venv", str(err.exception))
+        self.assertTrue(self.win_py.exists())
+
+    def test_a_portable_windows_python_is_passed_over(self):
+        portable = self.root / "ComfyUI_windows_portable"
+        comfy = comfy_at(portable / "ComfyUI", "moss")
+        (portable / "python_embeded").mkdir()
+        (portable / "python_embeded" / "python.exe").write_bytes(self.MZ)
+        self.assertIsNone(bootstrap.portable_python(comfy))
+        cfg = self.cfg(comfy_dir=str(comfy), python="")
+        self.assertEqual(bootstrap.comfy_python(cfg, "moss"), "")
+        self.assertIn("python_embeded", bootstrap.foreign_python(cfg, "moss"))
+
+    def test_the_engine_page_says_why_and_install_everything_acts_on_it(self):
+        cfg = self.cfg()
+        rows = {r["id"]: r for r in manager._engine_rows(cfg, "moss", None)}
+        torch = rows["torch_moss"]
+        self.assertEqual(torch["state"], "missing")
+        self.assertEqual(torch["action"], "install")
+        self.assertIn("another operating system", torch["detail"])
+        self.assertIn("comfy-venv-ComfyUI-MOSS-TTS-linux", torch["detail"])
+        self.assertNotIn("Errno", torch["detail"])
+        reqs = rows["node_reqs_moss"]
+        self.assertEqual(reqs["state"], "missing")
+        self.assertIn("PyTorch first", reqs["detail"])
+
+    def test_start_names_the_button_instead_of_run_setup(self):
+        saved = copy.deepcopy(server.cfg)
+        self.addCleanup(lambda: (server.cfg.clear(), server.cfg.update(saved)))
+        server.cfg.clear()
+        server.cfg.update(self.cfg())
+        why = server.activate("moss")
+        self.assertIn("another operating system", why)
+        self.assertIn("PyTorch", why)
+        self.assertNotIn("run setup", why.lower())
+
+    def test_sudo_that_needs_a_password_becomes_pkexec_on_a_desktop(self):
+        task = manager.Task("install", "t")
+        no = subprocess.CompletedProcess([], 1)
+        cmd = ["sudo", "apt-get", "install", "-y", "git"]
+        with mock.patch.object(manager.subprocess, "run", return_value=no), \
+                mock.patch.object(manager.shutil, "which",
+                                  side_effect=lambda n: "/usr/bin/" + n), \
+                mock.patch.dict(os.environ, {"DISPLAY": ":0"}):
+            self.assertEqual(manager._elevate(cmd, task),
+                             ["pkexec", "apt-get", "install", "-y", "git"])
+        with mock.patch.object(manager.subprocess, "run", return_value=no), \
+                mock.patch.dict(os.environ, {"DISPLAY": "",
+                                             "WAYLAND_DISPLAY": ""}):
+            self.assertEqual(manager._elevate(cmd, task),
+                             ["sudo", "-n", "apt-get", "install", "-y", "git"],
+                             "without a desktop it fails fast, never waits")
+
+
 class DownloadFiltering(unittest.TestCase):
     """CLAUDE.md rule 6: .bin duplicates of safetensors and repo furniture."""
 
